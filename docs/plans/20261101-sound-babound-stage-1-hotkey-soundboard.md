@@ -113,24 +113,24 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
 **Files:**
 - Create: `crates/engine/src/mixer.rs`
 
-- [ ] Types:
+- [x] Types:
   - `Command` enum: `Play { sound: Sound, gain: f32 }`, `StopAll`, `SetMasterGain(f32)`.
   - `MixerShared`: holds the lock-free `ArrayQueue<Command>` (capacity 64), a garbage `ArrayQueue<Sound>` (capacity 128), atomics for `active_voices`, `commands_applied` and `callback_heartbeat`, and `drain_garbage()` (called by the supervisor thread, drops the queued `Sound`s off the realtime thread).
-- [ ] `Mixer` structure:
+- [x] `Mixer` structure:
   - fixed-capacity voice storage (`MAX_VOICES = 32`, preallocated)
   - voice fields: sound, gain, source position in source frames (`f64`), start sequence number
   - a fixed-size pending-release slot array `[Option<Sound>; PENDING_RELEASE]` with `PENDING_RELEASE = 2 * MAX_VOICES`, preallocated, never resized
   - master gain
   - output rate and channel count
   - a scratch buffer preallocated in `configure()`
-- [ ] `Mixer::configure(rate, channels)` runs outside the callback and may allocate. It keeps the voices and their source positions, so playback continues after a rebuild.
-- [ ] Release rule (an `Arc` is never dropped on the realtime thread):
+- [x] `Mixer::configure(rate, channels)` runs outside the callback and may allocate. It keeps the voices and their source positions, so playback continues after a rebuild.
+- [x] Release rule (an `Arc` is never dropped on the realtime thread):
   - Every `Sound` leaving a voice (finished, evicted, stopped) is pushed into the garbage queue.
   - If the garbage queue is full, the `Sound` is moved into a free pending-release slot instead (no allocation).
   - At the start of every `render`, pending-release slots are retried in order and pushed into the garbage queue while it has room.
   - Commands are popped only while at least `MAX_VOICES` pending-release slots are free (the worst case of one `StopAll` or eviction burst). Otherwise the remaining commands stay queued for the next render. This keeps a free slot available for every release, so no `Sound` is ever dropped in `render`.
   - Voices that finish while no slot is free stay in their voice slot, marked finished and silent, are not counted in `active_voices`, and are released on a later render.
-- [ ] `Mixer::render(&mut self, out: &mut [f32])`:
+- [x] `Mixer::render(&mut self, out: &mut [f32])`:
   - Retry pending releases, then drain commands under the release rule. `Play` beyond 32 voices evicts the voice with the lowest start sequence.
   - Mix with linear interpolation at step `src_rate / dev_rate`.
   - Channel mapping:
@@ -141,7 +141,7 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
   - Apply per-voice gain × master gain, then clamp to [-1, 1].
   - Release finished, evicted and stopped voices' `Sound` via the release rule.
   - Update `active_voices`, `commands_applied` and `callback_heartbeat`.
-- [ ] Write tests:
+- [x] Write tests:
   - 33rd voice evicts the oldest
   - overlapping plays of the same sound sum, with no restart
   - `StopAll` silences on the next render and moves sounds to the garbage queue
@@ -153,7 +153,7 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
   - a full command queue makes push return the command back (no panic)
   - full garbage queue: pre-fill the garbage queue to capacity, play a short sound and render past its end; the test-held clone's `Arc::strong_count` shows the mixer still holds a reference (no drop in render) and the sound sits in a pending-release slot; after `drain_garbage()` and one more render plus drain, the strong count drops to 1 (released off the realtime thread)
   - with pending-release slots nearly full, commands stay queued and are applied on a later render once slots free
-- [ ] Run the test suite. It must pass before Task 4.
+- [x] Run the test suite. It must pass before Task 4.
 
 ### Task 4: Sink and watcher traits, device supervisor
 

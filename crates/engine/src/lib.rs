@@ -5,9 +5,11 @@
 //! changes. It has no UI dependencies.
 
 pub mod error;
+pub mod mixer;
 pub mod sound;
 
 pub use error::{BuildError, LoadError};
+pub use mixer::{Command, Mixer, MixerShared};
 pub use sound::{Sound, SoundData};
 
 /// Crate version, exposed so the app can log which engine it runs.
