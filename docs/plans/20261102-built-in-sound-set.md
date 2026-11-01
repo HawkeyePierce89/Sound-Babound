@@ -193,13 +193,13 @@ Replace the single embedded demo chime with a registry of built-in sounds, and e
 
 ### Task 8: Update documentation
 
-- [ ] README:
+- [x] README:
   - the features list mentions the built-in CC0 set and links to `crates/app/assets/sounds/SOURCES.md`;
   - fix the first-start text (no sound hotkey by default, stop-all stays) and the fallback-config text;
   - in the config example and the path forms: `builtin:<name>`, and the built-ins have no hotkey until the user sets one;
   - in the settings window section: "Add built-in…", and each row's Play/Stop auditions the sound on the default output only, never in the call (one at a time, stopped when the window closes);
   - in the headless playback section: `play builtin:<name>` and `play --output-only`.
-- [ ] CLAUDE.md:
+- [x] CLAUDE.md:
   - the `config.rs` bullet describes the registry (`BuiltinSound`, `BUILTIN_SOUNDS`, `builtin()`, `SoundSource::Builtin`, the case-insensitive resolve, the template's built-in list without hotkeys);
   - the assets line documents `scripts/convert-sounds.sh <staging-dir>` and `SOURCES.md` next to `gen_demo_wav`;
   - the `cli.rs` bullet documents `--output-only` and `builtin:` resolution;

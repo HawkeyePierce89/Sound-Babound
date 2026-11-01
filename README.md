@@ -10,6 +10,7 @@ Features:
 - one global hotkey per sound and an optional stop-all hotkey
 - overlapping playback (up to 32 voices; the oldest voice is evicted beyond that)
 - WAV, FLAC, OGG Vorbis and MP3, at any sample rate (resampled to the device rate), mono or stereo (files with more channels play their first two)
+- a built-in set of twelve CC0 sounds (air horn, rimshot, sad trombone and so on) embedded in the app, with credits in [`crates/app/assets/sounds/SOURCES.md`](crates/app/assets/sounds/SOURCES.md)
 - per-sound gain and a master gain
 - a headless `play` command for one-off playback from a terminal
 - an optional virtual microphone ("Mic to call"): the sounds, mixed with your real microphone, go into a voice or video call through a virtual audio cable (see [Virtual microphone](#virtual-microphone))
@@ -55,7 +56,7 @@ macOS and Windows need no extra system packages.
 sound-babound
 ```
 
-With no arguments the app starts in the tray. There is no window. On macOS there is no Dock icon either. On first start it writes a commented default config (see below) that binds the embedded demo chime to `CmdOrCtrl+Shift+1` and stop-all to `CmdOrCtrl+Shift+0`.
+With no arguments the app starts in the tray. There is no window. On macOS there is no Dock icon either. On first start it writes a commented default config (see below) that lists the twelve built-in sounds, with no hotkey on any of them, and binds stop-all to `CmdOrCtrl+Shift+0`. Set a sound's hotkey in the settings window or in the config file.
 
 On macOS the hotkeys use the Carbon hotkey API, so no Accessibility permission is needed. To use the virtual microphone on macOS, run the app bundle instead (see [macOS](#macos)).
 
@@ -77,7 +78,9 @@ The tray's "Settings…" item opens a small settings window; `sound-babound sett
 The window has two parts:
 
 - "Virtual mic": the same report as `mic-check` (see [Checking the virtual microphone](#checking-the-virtual-microphone)), refreshed about once a second. The window cannot see the tray's running microphone capture: when the default input is the virtual device, it says so and notes that the tray's capture stays on the last real microphone it used, if there was one.
-- "Sounds": every configured sound with its name, file and hotkey. You can rename a sound, remove it, add sounds with "Add sound…" (a file picker for WAV, FLAC, OGG and MP3 files; the name starts as the file name without its extension, and the path is stored as an absolute path), and set a hotkey: click the hotkey field, then press the combination. The field records the key the way the tray will match it (see [Hotkey syntax](#hotkey-syntax)): on macOS where the key sits, named as on a US layout (on AZERTY, the key labelled A shows as `Q`); on Windows and Linux the key your layout types (the key labelled A shows as `A`; a symbol the config cannot name, such as `&` on AZERTY's digit row, is recorded by its position, `1`). Escape clears the hotkey. A key without a modifier, or with Shift alone, is accepted only for F1–F24, so a plain or capital letter never becomes a global hotkey. The copy, cut and paste shortcuts cannot be set either. The "Stop all" hotkey is shown, but it is set in the config file.
+- "Sounds": every configured sound with its name, file and hotkey. You can rename a sound, remove it, add one of the built-in sounds with "Add built-in…" (a menu of the embedded set; the file column shows `builtin:<name>`), add sounds with "Add sound…" (a file picker for WAV, FLAC, OGG and MP3 files; the name starts as the file name without its extension, and the path is stored as an absolute path), and set a hotkey: click the hotkey field, then press the combination. The field records the key the way the tray will match it (see [Hotkey syntax](#hotkey-syntax)): on macOS where the key sits, named as on a US layout (on AZERTY, the key labelled A shows as `Q`); on Windows and Linux the key your layout types (the key labelled A shows as `A`; a symbol the config cannot name, such as `&` on AZERTY's digit row, is recorded by its position, `1`). Escape clears the hotkey. A key without a modifier, or with Shift alone, is accepted only for F1–F24, so a plain or capital letter never becomes a global hotkey. The copy, cut and paste shortcuts cannot be set either. The "Stop all" hotkey is shown, but it is set in the config file.
+
+Each row has a Play button next to its hotkey field, which turns into Stop while the sound plays. It auditions the sound on the default output only, never in the call, whatever `[mic] enabled` says. It runs `sound-babound play --output-only` in a child process, one at a time: starting another row stops the first, and closing the window (Save, Cancel or the close button) stops it too. A sound that cannot be played shows its error in the window.
 
 Problems are shown next to their sound: a blank name, a hotkey from the file that does not parse, or a hotkey used twice (by two sounds, or by a sound and "Stop all"). Save stays disabled while there is any problem. If the config file does not parse, the window shows the error and cannot edit the sounds; fix the file first.
 
@@ -88,11 +91,13 @@ While a window opened from the tray's "Settings…" item is open, the tray's glo
 ```sh
 sound-babound play               # plays the embedded demo chime
 sound-babound play path/to/file.mp3
+sound-babound play builtin:airhorn   # a built-in sound
+sound-babound play --output-only builtin:airhorn   # never into the virtual mic
 ```
 
-`play` decodes the file first, so a bad file fails right away with an error that names it. It then plays the sound through the default output device and exits when the sound has finished. Ctrl+C stops it. If no output stream comes up within 10 seconds, it exits with an error. If the sound is still playing 10 seconds after its own length (for example because the output device went away and no other device took over), it exits with an error too. Any failure prints a readable message and exits with code 1.
+`builtin:<name>` is resolved the same way as in the config file, ignoring case; the names are listed in [`SOURCES.md`](crates/app/assets/sounds/SOURCES.md), and an unknown name fails with the list of available ones. `play` decodes the file first, so a bad file fails right away with an error that names it. It then plays the sound through the default output device and exits when the sound has finished. Ctrl+C stops it. If no output stream comes up within 10 seconds, it exits with an error. If the sound is still playing 10 seconds after its own length (for example because the output device went away and no other device took over), it exits with an error too. Any failure prints a readable message and exits with code 1.
 
-With `[mic] enabled = true` in the config file, `play` also plays the sound into the virtual microphone. It waits up to 3 seconds for the virtual device; if that does not come up, it warns and plays on the default output only. `play` never opens your real microphone, and on Linux it does not create the virtual device (only the tray does). It reads the config file but never creates it; a missing or malformed file means the defaults (mic off), with a note.
+With `[mic] enabled = true` in the config file, `play` also plays the sound into the virtual microphone. It waits up to 3 seconds for the virtual device; if that does not come up, it warns and plays on the default output only. `play` never opens your real microphone, and on Linux it does not create the virtual device (only the tray does). It reads the config file but never creates it; a missing or malformed file means the defaults (mic off), with a note. With `--output-only`, `play` plays on the default output only and never into the virtual microphone, even when `[mic] enabled = true`; it does not wait for the virtual device either.
 
 ### Checking the virtual microphone
 
@@ -138,7 +143,7 @@ The config file is `config.toml` in a `sound-babound` folder under the OS config
 
 The file is created with defaults on first start. After that the app changes it in two cases only: the "Mic to call" tray item rewrites the `enabled` value of `[mic]`, and Save in the [settings window](#settings-window) rewrites the `[[sound]]` entries' names, paths and hotkeys. Both keep your comments and other keys. To keep the two from overwriting each other's change, the app also creates a hidden `.config.toml.lock` file next to the config (the edit lock) and never removes it; leave it in place. If you have unsaved edits to the file, save them before using either. "Open config folder" in the tray menu opens its folder. After editing, choose "Reload config". New sounds, hotkeys and gains apply right away, and sounds that are already playing keep playing. If the new file does not parse, the error is logged and the old config stays in effect.
 
-At startup, the tray always comes up. If the config file does not parse, the app logs the parse error at error level, with the file's path, and starts with the built-in default config (the demo chime). The tray menu still works: fix the file, then choose "Reload config" to load it. If the file cannot be read at all, the built-in default config is used too, with a warning in the log. The log goes to stderr (see [Logging](#logging)), so on macOS and Linux start the app from a terminal to read it (for the macOS app bundle, see [Logging](#logging)). On Windows tray mode has no console, so the log is not visible; if the demo chime shows up instead of your sounds, check the file for TOML syntax errors.
+At startup, the tray always comes up. If the config file does not parse, the app logs the parse error at error level, with the file's path, and starts with the built-in default config (the built-in sound set). The tray menu still works: fix the file, then choose "Reload config" to load it. If the file cannot be read at all, the built-in default config is used too, with a warning in the log. The log goes to stderr (see [Logging](#logging)), so on macOS and Linux start the app from a terminal to read it (for the macOS app bundle, see [Logging](#logging)). On Windows tray mode has no console, so the log is not visible; if the built-in sounds show up instead of your own, check the file for TOML syntax errors.
 
 Example:
 
@@ -150,13 +155,13 @@ master_gain = 1.0
 stop_all_hotkey = "CmdOrCtrl+Shift+0"
 
 [[sound]]
-name = "Demo chime"          # label in the tray menu (required)
-path = "builtin:demo"        # the embedded chime
-hotkey = "CmdOrCtrl+Shift+1" # optional
+name = "Air horn"            # label in the tray menu (required)
+path = "builtin:airhorn"     # a sound embedded in the app
+hotkey = "CmdOrCtrl+Shift+1" # optional; the built-ins have none until you set one
 gain = 1.0                   # optional, 0.0 to 4.0, default 1.0
 
 [[sound]]
-name = "Airhorn"
+name = "My airhorn"
 path = "sounds/airhorn.mp3"  # relative to the config folder
 hotkey = "CmdOrCtrl+Shift+2"
 gain = 0.8
@@ -187,7 +192,7 @@ Gains outside [0, 4] are clamped, with a warning in the log. "Reload config" app
 
 Path forms:
 
-- `builtin:demo` is the chime embedded in the binary.
+- `builtin:<name>` is a sound embedded in the binary, for example `builtin:airhorn` (names are case-insensitive). The twelve sounds of the default config are listed with their credits in [`SOURCES.md`](crates/app/assets/sounds/SOURCES.md), and `builtin:demo` is a short chime. Built-in sounds have no hotkey until you set one.
 - Absolute paths are used as they are.
 - Relative paths are resolved against the folder that contains `config.toml`.
 
