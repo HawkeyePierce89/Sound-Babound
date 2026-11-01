@@ -329,18 +329,19 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 
 - Modify: `crates/app/src/platform/{mod,linux}.rs`
 
-- [ ] Pure helpers in `platform/mod.rs`, gated `cfg(any(target_os = "linux", test))`:
+- [x] Pure helpers in `platform/mod.rs`, gated `cfg(any(target_os = "linux", test))`:
   - the `load-module` argument lists for the null sink and the remap source (description "Sound-Babound Mic");
   - a parser for `pactl list short modules` that finds stale modules from a crashed run.
-- [ ] `linux.rs`: `VirtualMic::create()`:
+- [x] `linux.rs`: `VirtualMic::create()`:
   - unload stale modules;
   - load the null sink and then the remap source, keeping the module ids from stdout;
   - return a guard that unloads both in reverse order on drop.
-- [ ] A missing `pactl` or a non-zero exit is an error.
-- [ ] Other OSes: `create_virtual_mic()` returns `Ok(None)` through `platform/mod.rs`.
-- [ ] The app logs a failure and runs without the mic path. Wiring happens in Task 13.
-- [ ] Tests (run on every OS through the `test` gate): argument construction, module-list parsing (stale, foreign and malformed lines), unload order.
-- [ ] Run the verification gates plus the Linux stub clippy. All must pass before Task 12.
+- [x] A missing `pactl` or a non-zero exit is an error.
+- [x] Other OSes: `create_virtual_mic()` returns `Ok(None)` through `platform/mod.rs`.
+- [x] The app logs a failure and runs without the mic path. Wiring happens in Task 13.
+  (`VirtualMic`, `create_virtual_mic` and their re-export carry a dead-code allow until Task 13 calls them. A failed stale unload is an error too; a failed remap-source load unloads the null sink before returning the error. The null sink gets the description "Sound-Babound Sink"; the mic sink still finds it by its id, `sound_babound_sink`.)
+- [x] Tests (run on every OS through the `test` gate): argument construction, module-list parsing (stale, foreign and malformed lines), unload order.
+- [x] Run the verification gates plus the Linux stub clippy. All must pass before Task 12.
 
 ### Task 12: macOS microphone permission and app bundle
 

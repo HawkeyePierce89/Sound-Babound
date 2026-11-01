@@ -1,5 +1,10 @@
 //! Linux glue.
 
+use std::io::ErrorKind;
+use std::process::Command;
+
+use anyhow::{Context, bail};
+
 /// No-op: a Linux binary always keeps the console it was launched from.
 pub fn attach_parent_console() {}
 
@@ -18,7 +23,7 @@ pub fn global_hotkeys_supported() -> bool {
 /// The mic sink's device when the config names none: the null sink the app
 /// creates through `pactl`.
 pub fn default_virtual_device() -> &'static str {
-    "sound_babound_sink"
+    super::PACTL_SINK_NAME
 }
 
 /// The inputs the capture must never open: the pattern (which also matches
@@ -31,6 +36,58 @@ pub fn virtual_input_exclusions(pattern: &str) -> Vec<String> {
 #[allow(dead_code)] // For the tray mic status.
 pub fn virtual_mic_hint() -> &'static str {
     "choose \"Sound-Babound Mic\" as the microphone in the call app"
+}
+
+/// Runs `pactl` with `args` and returns its stdout. A missing `pactl` and a
+/// non-zero exit are errors; the latter carries pactl's stderr.
+fn run_pactl(args: &[String]) -> anyhow::Result<String> {
+    let output = match Command::new("pactl").args(args).output() {
+        Ok(output) => output,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            bail!("pactl not found: install pulseaudio-utils (or pipewire-pulse's pactl)")
+        }
+        Err(err) => return Err(err).context("could not run pactl"),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "pactl {} failed ({}): {}",
+            args.join(" "),
+            output.status,
+            stderr.trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The real `pactl` runner a [`VirtualMic`] holds.
+type PactlRunner = fn(&[String]) -> anyhow::Result<String>;
+
+/// The virtual microphone "Sound-Babound Mic": a null sink the mic sink
+/// plays into and a source remapped from its monitor, created through
+/// `pactl` (so it works on PulseAudio and pipewire-pulse alike).
+///
+/// Dropping it unloads both modules, the source first.
+pub struct VirtualMic {
+    _device: super::PactlDevice<PactlRunner>,
+}
+
+impl VirtualMic {
+    /// Unloads modules a crashed run left behind, then loads the null sink and
+    /// the remap source.
+    pub fn create() -> anyhow::Result<Self> {
+        let run: PactlRunner = run_pactl;
+        super::PactlDevice::create(run)
+            .map(|device| Self { _device: device })
+            .context("could not create the virtual mic through pactl")
+    }
+}
+
+/// Creates the virtual microphone. Always `Some` on success: Linux is the
+/// one OS where the app makes the device itself.
+#[allow(dead_code)] // For the tray mic toggle.
+pub fn create_virtual_mic() -> anyhow::Result<Option<VirtualMic>> {
+    VirtualMic::create().map(Some)
 }
 
 #[cfg(test)]
