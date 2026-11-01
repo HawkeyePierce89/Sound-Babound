@@ -24,6 +24,8 @@ pub enum Action {
     StopAll,
     /// Turn the virtual mic on or off, and save that to the config.
     ToggleMic,
+    /// Open the settings window (one at a time).
+    OpenSettings,
     Reload,
     OpenConfigFolder,
     Quit,
@@ -33,6 +35,8 @@ pub enum Action {
 pub const MENU_STOP_ALL: &str = "stop-all";
 /// Menu id of the "Mic to call" item.
 pub const MENU_TOGGLE_MIC: &str = "toggle-mic";
+/// Menu id of the "Settings…" item.
+pub const MENU_SETTINGS: &str = "settings";
 /// Menu id of the "Reload config" item.
 pub const MENU_RELOAD: &str = "reload";
 /// Menu id of the "Open config folder" item.
@@ -92,6 +96,7 @@ impl ActionMap {
         for (id, action) in [
             (MENU_STOP_ALL, Action::StopAll),
             (MENU_TOGGLE_MIC, Action::ToggleMic),
+            (MENU_SETTINGS, Action::OpenSettings),
             (MENU_RELOAD, Action::Reload),
             (MENU_OPEN_CONFIG, Action::OpenConfigFolder),
             (MENU_QUIT, Action::Quit),
@@ -627,6 +632,7 @@ mod tests {
     fn fixed_menu_items_map_to_actions() {
         let map = ActionMap::new(&sample_config());
         assert_eq!(map.for_menu_id(MENU_STOP_ALL), Some(Action::StopAll));
+        assert_eq!(map.for_menu_id(MENU_SETTINGS), Some(Action::OpenSettings));
         assert_eq!(map.for_menu_id(MENU_RELOAD), Some(Action::Reload));
         assert_eq!(
             map.for_menu_id(MENU_OPEN_CONFIG),

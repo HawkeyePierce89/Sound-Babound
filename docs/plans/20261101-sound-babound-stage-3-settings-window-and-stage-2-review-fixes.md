@@ -367,20 +367,20 @@ Part B fixes the five findings from the stage 2 acceptance review:
 - Create: `crates/app/src/settings_process.rs`
 - Modify: `crates/app/src/actions.rs` (`Action::OpenSettings`, `MENU_SETTINGS`), `crates/app/src/tray_app.rs`
 
-- [ ] `SettingsSpawner` trait: `spawn(&mut self) -> Result<()>`.
+- [x] `SettingsSpawner` trait: `spawn(&mut self) -> Result<()>`.
   - The production spawner runs `std::env::current_exe()` with `settings`, with stdin null and stdout/stderr inherited.
   - A waiter thread waits on the child and sends `UserEvent::SettingsClosed` through the proxy.
-- [ ] Pure controller `SettingsLauncher<S>`:
+- [x] Pure controller `SettingsLauncher<S>`:
   - `open(snapshot)` returns `Launched`, `AlreadyOpen` or `Failed(err)`. The snapshot is the config file's bytes, read before the spawn.
   - `closed(current_bytes) -> bool` says whether to reload: true only if the bytes changed.
   - While a child runs, `open` spawns nothing.
-- [ ] Tray:
+- [x] Tray:
   - the menu gets "Settings…" above "Reload config";
   - on `Launched`, unregister all hotkeys;
   - on `SettingsClosed`, reload through the existing path if the controller says so; otherwise, or if the reload failed, register the current board's hotkeys again (`Hotkeys::replace`);
   - `AlreadyOpen` is logged at info;
   - quitting the tray leaves an open settings window running.
-- [ ] Tests:
+- [x] Tests:
   - with a fake spawner: one instance (a second `open` while running spawns nothing);
   - a failed spawn leaves the launcher closed and reopenable;
   - an unchanged file means no reload and a changed file means reload;
@@ -388,7 +388,8 @@ Part B fixes the five findings from the stage 2 acceptance review:
   - after close, `open` launches again;
   - the menu-id mapping for `MENU_SETTINGS`;
   - with the fake `HotkeyBackend`: hotkeys are unregistered while the window is open and registered again after a close without changes.
-- [ ] Run the verification gates. All must pass before Task 12.
+  - Note: `Hotkeys` has a `paused` flag (`pause`/`resume`), so a "Reload config" while the window is open registers nothing. On close the tray reloads first if the bytes changed (still paused), then always `resume`s with the current board's hotkeys, which covers both the unchanged and the failed-reload case. The snapshot is `Option<Vec<u8>>` (`config_snapshot`: `None` without a path or a readable file). The waiter thread starts before the child and receives it over a channel, so a running window always has a waiter; a failed spawn reports no close. `ProcessSpawner`'s command is a `fn() -> Result<Command>`, so its tests run this test binary with `--list` instead of the settings process.
+- [x] Run the verification gates. All must pass before Task 12.
 
 ### Task 12: Verify acceptance criteria
 

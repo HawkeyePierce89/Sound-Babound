@@ -7,7 +7,7 @@
 //! is decided by [`actions`] and [`WithVirtualMic`].
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -21,7 +21,10 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::actions::{
     self, Action, ActionMap, AudioControl, CaptureGate, MENU_OPEN_CONFIG, MENU_QUIT, MENU_RELOAD,
-    MENU_STOP_ALL, MENU_TOGGLE_MIC, Soundboard,
+    MENU_SETTINGS, MENU_STOP_ALL, MENU_TOGGLE_MIC, Soundboard,
+};
+use crate::settings_process::{
+    OpenOutcome, ProcessSpawner, SettingsLauncher, SettingsSpawner, config_snapshot,
 };
 use crate::virtual_mic::{DeviceReply, DeviceWait, DeviceWorker, WithVirtualMic};
 use crate::{paths, platform};
@@ -43,6 +46,8 @@ enum UserEvent {
     HotKey(u32),
     /// A reply from the virtual mic worker thread.
     Device(DeviceReply),
+    /// The settings window's process has exited.
+    SettingsClosed,
 }
 
 /// Runs the tray app until "Quit".
@@ -79,6 +84,16 @@ pub fn run() -> Result<()> {
     let capture = capture_gate.capture(platform::microphone_access(), board.map().mic());
     actions::apply_config(&mut audio, board.map(), capture);
 
+    // The waiter threads' callback must be `Sync`; the proxy only promises
+    // `Send`. A send fails only once the loop has ended (the tray quit and
+    // left the window running), when nothing is left to tell.
+    let settings_proxy = Mutex::new(event_loop.create_proxy());
+    let settings = SettingsLauncher::new(ProcessSpawner::new(Arc::new(move || {
+        if let Ok(proxy) = settings_proxy.lock() {
+            let _ = proxy.send_event(UserEvent::SettingsClosed);
+        }
+    })));
+
     let mut app = TrayApp {
         audio: Some(audio),
         board,
@@ -89,6 +104,7 @@ pub fn run() -> Result<()> {
         mic_label: String::new(),
         next_mic_poll: None,
         capture_gate,
+        settings,
     };
     app.mic_label = app.current_mic_label();
     event_loop.run(move |event, _target, control_flow| {
@@ -111,6 +127,7 @@ pub fn run() -> Result<()> {
                 }
             }
             Event::UserEvent(UserEvent::Device(reply)) => app.on_device_reply(reply),
+            Event::UserEvent(UserEvent::SettingsClosed) => app.on_settings_closed(),
             _ => {}
         }
         app.schedule_mic_poll(control_flow);
@@ -209,6 +226,7 @@ fn build_menu(map: &ActionMap, mic_label: &str) -> Result<(Menu, MicItems)> {
     menu.append(&PredefinedMenuItem::separator())?;
     for (id, label) in [
         (MENU_STOP_ALL, "Stop all"),
+        (MENU_SETTINGS, "Settings…"),
         (MENU_RELOAD, "Reload config"),
         (MENU_OPEN_CONFIG, "Open config folder"),
     ] {
@@ -242,13 +260,21 @@ struct Hotkeys<M = GlobalHotKeyManager> {
     /// failed to start).
     manager: Option<M>,
     registered: Vec<HotKey>,
+    /// Set while the settings window is open: nothing is registered, so the
+    /// window can see (and re-assign) the tray's combinations.
+    paused: bool,
 }
 
 impl<M> Hotkeys<M> {
     fn disabled() -> Hotkeys<M> {
+        Hotkeys::with_manager(None)
+    }
+
+    fn with_manager(manager: Option<M>) -> Hotkeys<M> {
         Hotkeys {
-            manager: None,
+            manager,
             registered: Vec::new(),
+            paused: false,
         }
     }
 }
@@ -264,10 +290,7 @@ impl Hotkeys {
             return Hotkeys::disabled();
         }
         match GlobalHotKeyManager::new() {
-            Ok(manager) => Hotkeys {
-                manager: Some(manager),
-                registered: Vec::new(),
-            },
+            Ok(manager) => Hotkeys::with_manager(Some(manager)),
             Err(err) => {
                 tracing::warn!("cannot start global hotkeys: {err}; use the tray menu");
                 Hotkeys::disabled()
@@ -278,7 +301,11 @@ impl Hotkeys {
 
 impl<M: HotkeyBackend> Hotkeys<M> {
     /// Registers each hotkey; a failure is logged and that hotkey skipped.
+    /// Registers nothing while paused.
     fn register(&mut self, hotkeys: &[HotKey]) {
+        if self.paused {
+            return;
+        }
         let Some(manager) = &self.manager else {
             return;
         };
@@ -310,6 +337,37 @@ impl<M: HotkeyBackend> Hotkeys<M> {
         self.unregister_all();
         self.register(hotkeys);
     }
+
+    /// Unregisters everything and registers nothing until [`Self::resume`],
+    /// a reload meanwhile included.
+    fn pause(&mut self) {
+        self.unregister_all();
+        self.paused = true;
+    }
+
+    /// Ends a pause and registers `hotkeys` (the current board's).
+    fn resume(&mut self, hotkeys: &[HotKey]) {
+        self.paused = false;
+        self.replace(hotkeys);
+    }
+}
+
+/// Starts the settings window and pauses the hotkeys while it is open, so
+/// it can see the tray's combinations. `snapshot` is the config file's
+/// bytes from before the spawn.
+fn open_settings<S: SettingsSpawner, M: HotkeyBackend>(
+    launcher: &mut SettingsLauncher<S>,
+    hotkeys: &mut Hotkeys<M>,
+    snapshot: Option<Vec<u8>>,
+) {
+    match launcher.open(snapshot) {
+        OpenOutcome::Launched => {
+            hotkeys.pause();
+            tracing::info!("settings window opened; hotkeys are paused until it closes");
+        }
+        OpenOutcome::AlreadyOpen => tracing::info!("the settings window is already open"),
+        OpenOutcome::Failed(err) => tracing::error!("{err:#}"),
+    }
 }
 
 /// Everything the event loop owns.
@@ -332,6 +390,8 @@ struct TrayApp {
     next_mic_poll: Option<Instant>,
     /// Turns the microphone permission into the mic path's capture flag.
     capture_gate: CaptureGate,
+    /// The settings window: one at a time; the hotkeys pause while it runs.
+    settings: SettingsLauncher<ProcessSpawner>,
 }
 
 impl TrayApp {
@@ -373,6 +433,11 @@ impl TrayApp {
                 }
             }
             Action::ToggleMic => self.toggle_mic(),
+            Action::OpenSettings => open_settings(
+                &mut self.settings,
+                &mut self.hotkeys,
+                config_snapshot(self.config_path.as_deref()),
+            ),
             Action::Reload => self.reload(),
             Action::OpenConfigFolder => open_config_folder(),
             Action::Quit => self.quit(control_flow, 0),
@@ -424,6 +489,22 @@ impl TrayApp {
             }
             Err(err) => tracing::error!("{err:#}; keeping the previous config"),
         }
+    }
+
+    /// The settings window closed: reloads the config if the window changed
+    /// the file (the hotkeys still paused, so the reload registers none),
+    /// then registers the current board's hotkeys again, the new board's
+    /// after a reload and the previous one's if it failed or was not needed.
+    fn on_settings_closed(&mut self) {
+        let current = config_snapshot(self.config_path.as_deref());
+        if self.settings.closed(current) {
+            self.reload();
+        }
+        self.hotkeys.resume(self.board.map().hotkeys());
+        tracing::info!(
+            hotkeys = self.hotkeys.registered.len(),
+            "settings window closed; hotkeys registered again"
+        );
     }
 
     /// Flips the mic, saves it, applies it and updates both mic items.
@@ -540,7 +621,8 @@ impl TrayApp {
 
     /// Unregisters the hotkeys, shuts the engine down and then drops the
     /// virtual device (or leaves it loaded if a mic stream did not stop in
-    /// time), removes the icon and leaves the event loop with `code`.
+    /// time), removes the icon and leaves the event loop with `code`. An
+    /// open settings window keeps running on its own.
     fn quit(&mut self, control_flow: &mut ControlFlow, code: i32) {
         self.hotkeys.unregister_all();
         if let Some(audio) = self.audio.take() {
@@ -605,9 +687,23 @@ mod tests {
     }
 
     fn with_backend(backend: FakeBackend) -> Hotkeys<FakeBackend> {
-        Hotkeys {
-            manager: Some(backend),
-            registered: Vec::new(),
+        Hotkeys::with_manager(Some(backend))
+    }
+
+    /// Counts spawns; fails while `fail` is set.
+    #[derive(Default)]
+    struct FakeSpawner {
+        spawns: usize,
+        fail: bool,
+    }
+
+    impl SettingsSpawner for FakeSpawner {
+        fn spawn(&mut self) -> Result<()> {
+            if self.fail {
+                anyhow::bail!("cannot launch");
+            }
+            self.spawns += 1;
+            Ok(())
         }
     }
 
@@ -648,6 +744,61 @@ mod tests {
         hotkeys.unregister_all();
         assert!(hotkeys.registered.is_empty());
         assert!(live(&hotkeys).is_empty());
+    }
+
+    #[test]
+    fn a_pause_registers_nothing_until_resumed() {
+        let (a, b) = (key(Code::Digit1), key(Code::Digit2));
+        let mut hotkeys = with_backend(FakeBackend::default());
+        hotkeys.register(&[a]);
+        hotkeys.pause();
+        assert!(hotkeys.registered.is_empty());
+        assert!(live(&hotkeys).is_empty());
+        // A reload while paused registers nothing either.
+        hotkeys.replace(&[a, b]);
+        hotkeys.register(&[b]);
+        assert!(live(&hotkeys).is_empty());
+        hotkeys.resume(&[a, b]);
+        assert_eq!(hotkeys.registered, vec![a, b]);
+        assert_eq!(live(&hotkeys), HashSet::from([a, b]));
+    }
+
+    #[test]
+    fn hotkeys_pause_while_the_settings_window_is_open() {
+        let (a, b) = (key(Code::Digit1), key(Code::Digit2));
+        let board = [a, b];
+        let mut hotkeys = with_backend(FakeBackend::default());
+        hotkeys.register(&board);
+        let mut launcher = SettingsLauncher::new(FakeSpawner::default());
+        let snapshot = Some(b"config".to_vec());
+
+        open_settings(&mut launcher, &mut hotkeys, snapshot.clone());
+        assert!(launcher.is_open());
+        assert!(live(&hotkeys).is_empty());
+        // A second click starts nothing and keeps the pause.
+        open_settings(&mut launcher, &mut hotkeys, snapshot.clone());
+        assert!(live(&hotkeys).is_empty());
+        assert_eq!(launcher.spawner().spawns, 1);
+
+        // Closed without changes: no reload, the same hotkeys come back.
+        assert!(!launcher.closed(snapshot));
+        hotkeys.resume(&board);
+        assert_eq!(live(&hotkeys), HashSet::from(board));
+    }
+
+    #[test]
+    fn a_failed_settings_launch_keeps_the_hotkeys() {
+        let a = key(Code::Digit1);
+        let mut hotkeys = with_backend(FakeBackend::default());
+        hotkeys.register(&[a]);
+        let mut launcher = SettingsLauncher::new(FakeSpawner {
+            fail: true,
+            ..FakeSpawner::default()
+        });
+        open_settings(&mut launcher, &mut hotkeys, None);
+        assert!(!launcher.is_open());
+        assert!(!hotkeys.paused);
+        assert_eq!(live(&hotkeys), HashSet::from([a]));
     }
 
     #[test]

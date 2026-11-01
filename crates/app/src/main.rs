@@ -10,6 +10,7 @@ mod mic_report;
 mod paths;
 mod platform;
 mod settings;
+mod settings_process;
 #[cfg(test)]
 mod test_support;
 mod tray_app;
