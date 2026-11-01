@@ -1,0 +1,51 @@
+[workspace]
+members = ["crates/engine", "crates/app"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"
+
+[workspace.dependencies]
+babound-engine = { path = "crates/engine" }
+
+# Engine
+cpal = "0.18"
+symphonia = { version = "0.6", default-features = false, features = ["wav", "pcm", "flac", "ogg", "vorbis", "mp3"] }
+crossbeam-queue = "0.3"
+thiserror = "2"
+tracing = "0.1"
+
+# Engine, macOS
+objc2-core-audio = { version = "0.3", default-features = false }
+objc2-core-foundation = "0.3"
+
+# Engine, Windows
+windows = { version = "0.62", features = [
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+windows-core = "0.62"
+
+# App
+tao = "0.37"
+tray-icon = "0.26"
+global-hotkey = "0.9"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+dirs = "7"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opener = "0.9"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

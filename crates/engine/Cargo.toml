@@ -1,0 +1,21 @@
+[package]
+name = "babound-engine"
+description = "Audio engine for Sound-Babound: decoding, realtime mixer, output sink and device supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cpal.workspace = true
+crossbeam-queue.workspace = true
+symphonia.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-audio = { workspace = true, features = ["std", "AudioHardware"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows.workspace = true
+windows-core.workspace = true

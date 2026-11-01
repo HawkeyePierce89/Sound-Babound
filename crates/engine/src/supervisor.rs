@@ -1,0 +1,1073 @@
+//! The device supervisor.
+//!
+//! A dedicated thread owns the output sink. It listens for device events and
+//! stream errors on one channel, debounces them, decides whether they affect
+//! the active output and rebuilds the stream on the current default device
+//! when they do. Voices keep playing across a rebuild because the mixer, and
+//! with it every voice position, outlives the stream.
+//!
+//! The decision logic is the pure [`SupervisorCore`], driven by explicit
+//! [`Instant`]s so it can be tested with a fake clock. [`spawn_supervisor`]
+//! wraps it in the thread.
+//!
+//! # Rebuild policy
+//!
+//! A rebuild is an audible gap, so not every event triggers one. After the
+//! trailing-edge debounce window:
+//!
+//! - a [`RebuildPolicy::Always`] event or a stream error rebuilds;
+//! - a window holding only [`RebuildPolicy::IfDefaultOutputChanged`] events
+//!   yields [`Action::CheckDefault`]: the live default output identity is
+//!   re-queried and the stream is rebuilt only if it differs from the identity
+//!   the stream was built on;
+//! - [`RebuildPolicy::Ignore`] events do nothing.
+//!
+//! While no stream is running (initial start, retry backoff) every
+//! non-ignored event rebuilds. A failed build is retried after a backoff, and
+//! a stream whose callback heartbeat stops advancing is rebuilt. `Engine::play`
+//! rejects plays while no stream runs; a play that passed that check just
+//! before the stream went away is dropped here if no stream replaces it (see
+//! `Mixer::apply_offline`). A rebuild from a live stream keeps the command
+//! queue, so plays accepted while the old stream ran (including one whose push
+//! races the teardown) are applied by the new stream, like the voices it
+//! continues.
+
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use tracing::{debug, error, info, warn};
+
+use crate::mixer::{Mixer, MixerShared};
+use crate::sink::{ActiveSink, DeviceIdentity, SinkFactory};
+use crate::watcher::{DeviceEvent, DeviceWatcher, EventSender, RebuildPolicy};
+
+/// Longest the supervisor thread sleeps between garbage drains.
+pub const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A message for the supervisor thread.
+#[derive(Debug)]
+pub enum SupervisorMsg {
+    /// A device event from the watcher.
+    Device(DeviceEvent),
+    /// The active stream reported an error.
+    StreamError(String),
+    /// Stop the stream and exit the thread.
+    Shutdown,
+}
+
+/// The supervisor's time constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timings {
+    /// Quiet time after the last event before acting on a window.
+    pub debounce: Duration,
+    /// Delay before retrying a failed build.
+    pub retry: Duration,
+    /// How long the callback heartbeat may stand still before a rebuild.
+    pub stall: Duration,
+}
+
+impl Default for Timings {
+    fn default() -> Self {
+        Timings {
+            debounce: Duration::from_millis(200),
+            retry: Duration::from_secs(1),
+            stall: Duration::from_secs(2),
+        }
+    }
+}
+
+/// What the supervisor should do now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// Drop the stream and build a new one on the current default device.
+    Rebuild,
+    /// Re-query the default output identity and pass it to
+    /// [`SupervisorCore::resolve_check`].
+    CheckDefault,
+}
+
+/// The result of [`SupervisorCore::resolve_check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckOutcome {
+    /// The default output changed: rebuild.
+    Rebuild,
+    /// The event did not affect the active output: drop it.
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    deadline: Instant,
+    /// Holds an `Always` event or a stream error.
+    force: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveStream {
+    identity: DeviceIdentity,
+    last_beat: Option<u64>,
+    last_beat_at: Instant,
+}
+
+/// The supervisor's pure decision logic. See the module docs.
+#[derive(Debug, Clone)]
+pub struct SupervisorCore {
+    timings: Timings,
+    stream: Option<ActiveStream>,
+    window: Option<Window>,
+    build_at: Option<Instant>,
+}
+
+impl SupervisorCore {
+    /// A core with `timings` that wants to build at `now`.
+    pub fn new(timings: Timings, now: Instant) -> SupervisorCore {
+        SupervisorCore {
+            timings,
+            stream: None,
+            window: None,
+            build_at: Some(now),
+        }
+    }
+
+    /// Record a device event classified by `policy`.
+    pub fn on_event(&mut self, policy: RebuildPolicy, now: Instant) {
+        match policy {
+            RebuildPolicy::Ignore => {}
+            RebuildPolicy::Always => self.open_window(true, now),
+            RebuildPolicy::IfDefaultOutputChanged => self.open_window(false, now),
+        }
+    }
+
+    /// Record a stream error. It always leads to a rebuild.
+    pub fn on_stream_error(&mut self, now: Instant) {
+        self.open_window(true, now);
+    }
+
+    /// Record the result of a build: `Some` with the identity the stream was
+    /// built on, or `None` if the build failed (retried after the backoff).
+    pub fn on_build_result(&mut self, identity: Option<DeviceIdentity>, now: Instant) {
+        match identity {
+            Some(identity) => {
+                self.stream = Some(ActiveStream {
+                    identity,
+                    last_beat: None,
+                    last_beat_at: now,
+                });
+                self.build_at = None;
+            }
+            None => {
+                self.stream = None;
+                self.build_at = Some(now + self.timings.retry);
+            }
+        }
+    }
+
+    /// Record the mixer's callback heartbeat as sampled at `now`.
+    ///
+    /// The first sample after a build is the baseline; the stall clock starts
+    /// at the build and restarts whenever the value changes.
+    pub fn on_heartbeat(&mut self, value: u64, now: Instant) {
+        if let Some(stream) = &mut self.stream {
+            match stream.last_beat {
+                Some(last) if last == value => {}
+                Some(_) => {
+                    stream.last_beat = Some(value);
+                    stream.last_beat_at = now;
+                }
+                None => stream.last_beat = Some(value),
+            }
+        }
+    }
+
+    /// The action due at `now`, if any. Returning [`Action::Rebuild`] marks
+    /// the stream as gone; report the outcome with
+    /// [`on_build_result`](SupervisorCore::on_build_result).
+    pub fn poll(&mut self, now: Instant) -> Option<Action> {
+        if let Some(window) = self.window
+            && now >= window.deadline
+        {
+            self.window = None;
+            if window.force || self.stream.is_none() {
+                return Some(self.begin_rebuild());
+            }
+            return Some(Action::CheckDefault);
+        }
+        if self.build_at.is_some_and(|at| now >= at) {
+            return Some(self.begin_rebuild());
+        }
+        if let Some(stream) = &self.stream
+            && now.saturating_duration_since(stream.last_beat_at) >= self.timings.stall
+        {
+            return Some(self.begin_rebuild());
+        }
+        None
+    }
+
+    /// Decide an [`Action::CheckDefault`] given the live default output
+    /// identity: rebuild if it differs from the identity the stream was built
+    /// on (including `None` against `Some`), otherwise drop the event.
+    pub fn resolve_check(&mut self, current: Option<DeviceIdentity>) -> CheckOutcome {
+        match &self.stream {
+            Some(stream) if current.as_ref() == Some(&stream.identity) => CheckOutcome::Drop,
+            _ => {
+                self.begin_rebuild();
+                CheckOutcome::Rebuild
+            }
+        }
+    }
+
+    /// The next instant at which [`poll`](SupervisorCore::poll) may return
+    /// an action.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let stall = self
+            .stream
+            .as_ref()
+            .map(|s| s.last_beat_at + self.timings.stall);
+        [self.window.map(|w| w.deadline), self.build_at, stall]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Whether a stream is supposed to be running.
+    #[cfg(test)]
+    pub fn has_stream(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// The identity the running stream was built on.
+    #[cfg(test)]
+    pub fn built_on(&self) -> Option<&DeviceIdentity> {
+        self.stream.as_ref().map(|s| &s.identity)
+    }
+
+    fn open_window(&mut self, force: bool, now: Instant) {
+        let force = force || self.window.is_some_and(|w| w.force);
+        self.window = Some(Window {
+            deadline: now + self.timings.debounce,
+            force,
+        });
+    }
+
+    fn begin_rebuild(&mut self) -> Action {
+        self.window = None;
+        self.build_at = None;
+        self.stream = None;
+        Action::Rebuild
+    }
+}
+
+/// A running supervisor thread. Dropping it shuts the thread down.
+#[derive(Debug)]
+pub struct SupervisorHandle {
+    sender: Sender<SupervisorMsg>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl SupervisorHandle {
+    /// Stop the stream, unregister the watcher and join the thread.
+    pub fn shutdown(mut self) {
+        self.stop();
+    }
+
+    fn stop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            // A send error means the thread already exited; join anyway.
+            let _ = self.sender.send(SupervisorMsg::Shutdown);
+            if thread.join().is_err() {
+                error!("supervisor thread panicked");
+            }
+        }
+    }
+}
+
+impl Drop for SupervisorHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Start the supervisor thread.
+///
+/// The thread creates the mixer on `shared`, starts `watcher`, builds the
+/// first stream immediately and then supervises it until shutdown.
+pub(crate) fn spawn_supervisor<F, W>(
+    factory: F,
+    watcher: W,
+    shared: Arc<MixerShared>,
+    timings: Timings,
+) -> std::io::Result<SupervisorHandle>
+where
+    F: SinkFactory,
+    W: DeviceWatcher,
+{
+    let (sender, receiver) = mpsc::channel();
+    let thread_sender = sender.clone();
+    let thread = thread::Builder::new()
+        .name("babound-supervisor".into())
+        .spawn(move || {
+            Worker::new(factory, shared, timings, thread_sender).run(watcher, receiver);
+        })?;
+    Ok(SupervisorHandle {
+        sender,
+        thread: Some(thread),
+    })
+}
+
+/// The supervisor thread's state.
+struct Worker<F> {
+    factory: F,
+    shared: Arc<MixerShared>,
+    mixer: Arc<Mutex<Mixer>>,
+    sender: Sender<SupervisorMsg>,
+    core: SupervisorCore,
+    sink: Option<Box<dyn ActiveSink>>,
+}
+
+impl<F: SinkFactory> Worker<F> {
+    fn new(
+        factory: F,
+        shared: Arc<MixerShared>,
+        timings: Timings,
+        sender: Sender<SupervisorMsg>,
+    ) -> Worker<F> {
+        Worker {
+            factory,
+            mixer: Arc::new(Mutex::new(Mixer::new(Arc::clone(&shared)))),
+            shared,
+            sender,
+            core: SupervisorCore::new(timings, Instant::now()),
+            sink: None,
+        }
+    }
+
+    fn run<W: DeviceWatcher>(mut self, mut watcher: W, receiver: Receiver<SupervisorMsg>) {
+        let guard = match watcher.start(EventSender::new(self.sender.clone())) {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                warn!(error = %err, "device watcher unavailable; relying on stream errors");
+                None
+            }
+        };
+
+        loop {
+            let now = Instant::now();
+            self.core
+                .on_heartbeat(self.shared.callback_heartbeat(), now);
+            match self.core.poll(now) {
+                Some(Action::Rebuild) => self.rebuild(),
+                Some(Action::CheckDefault) => self.check_default(),
+                None => {}
+            }
+            if self.sink.is_none() {
+                self.drop_offline_plays();
+            }
+            self.shared.drain_garbage();
+
+            let wait = self
+                .core
+                .next_deadline()
+                .map_or(DRAIN_INTERVAL, |at| {
+                    at.saturating_duration_since(Instant::now())
+                })
+                .min(DRAIN_INTERVAL);
+            match receiver.recv_timeout(wait) {
+                Ok(SupervisorMsg::Device(event)) => self.on_device_event(event),
+                Ok(SupervisorMsg::StreamError(err)) => {
+                    warn!(error = %err, "output stream error");
+                    self.core.on_stream_error(Instant::now());
+                }
+                Ok(SupervisorMsg::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+
+        drop(self.sink.take());
+        self.shared.set_output_active(false);
+        drop(guard);
+        self.shared.drain_garbage();
+        debug!("supervisor stopped");
+    }
+
+    fn on_device_event(&mut self, event: DeviceEvent) {
+        let policy = event.rebuild_policy();
+        if policy == RebuildPolicy::Ignore {
+            debug!(?event, "input device event ignored");
+        } else {
+            debug!(?event, ?policy, "device event");
+        }
+        self.core.on_event(policy, Instant::now());
+    }
+
+    fn check_default(&mut self) {
+        let current = self.factory.current_default_identity();
+        match self.core.resolve_check(current.clone()) {
+            CheckOutcome::Rebuild => {
+                info!(
+                    default = current.as_ref().map_or("<none>", DeviceIdentity::as_str),
+                    "default output changed; rebuilding"
+                );
+                self.rebuild();
+            }
+            CheckOutcome::Drop => {
+                debug!("device change did not affect the default output; ignored");
+            }
+        }
+    }
+
+    /// Drop the plays queued while no stream exists, and apply the other
+    /// commands. No stream means no callback, so the lock cannot contend.
+    fn drop_offline_plays(&mut self) {
+        let dropped = self
+            .mixer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .apply_offline();
+        if dropped > 0 {
+            info!(dropped, "no output stream; dropped queued plays");
+        }
+    }
+
+    /// Drop the stream, then build a new one. The factory configures the
+    /// mixer while no stream exists, so the callback never contends for it.
+    ///
+    /// When no stream existed, plays queued since the last loop's purge are
+    /// dropped first, so the new stream never starts a press made offline.
+    /// When a stream existed, the queue is kept on purpose: its plays were
+    /// accepted while that stream ran, and the new stream applies them.
+    fn rebuild(&mut self) {
+        if self.sink.is_none() {
+            self.drop_offline_plays();
+        }
+        drop(self.sink.take());
+        self.shared.set_output_active(false);
+        match self
+            .factory
+            .build(Arc::clone(&self.mixer), self.sender.clone())
+        {
+            Ok((sink, info)) => {
+                info!(
+                    device = %info.device_name,
+                    rate = info.sample_rate,
+                    channels = info.channels,
+                    format = %info.sample_format,
+                    "output stream started"
+                );
+                self.sink = Some(sink);
+                self.shared.set_output_active(true);
+                self.core
+                    .on_build_result(Some(info.identity), Instant::now());
+            }
+            Err(err) => {
+                warn!(error = %err, "output stream build failed; will retry");
+                self.core.on_build_result(None, Instant::now());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mixer::Command;
+    use crate::sound::Sound;
+    use crate::test_support::{FakeSinkFactory, FakeWatcher, wait_until};
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn id(name: &str) -> DeviceIdentity {
+        DeviceIdentity::new(name)
+    }
+
+    /// A core with a stream built on `name` at `t0`.
+    fn running(t0: Instant, name: &str) -> SupervisorCore {
+        let mut core = SupervisorCore::new(Timings::default(), t0);
+        assert_eq!(core.poll(t0), Some(Action::Rebuild));
+        core.on_build_result(Some(id(name)), t0);
+        core
+    }
+
+    /// Step the core from `from` to `to` in 10 ms steps with a live heartbeat,
+    /// answering checks with `current` and builds with success on `current`.
+    /// Returns (rebuilds, checks).
+    fn drive(
+        core: &mut SupervisorCore,
+        from: Instant,
+        to: Instant,
+        current: Option<&str>,
+        beat: &mut u64,
+    ) -> (usize, usize) {
+        let (mut rebuilds, mut checks) = (0, 0);
+        let mut t = from;
+        while t <= to {
+            *beat += 1;
+            core.on_heartbeat(*beat, t);
+            match core.poll(t) {
+                Some(Action::Rebuild) => {
+                    rebuilds += 1;
+                    core.on_build_result(current.map(id), t);
+                }
+                Some(Action::CheckDefault) => {
+                    checks += 1;
+                    if core.resolve_check(current.map(id)) == CheckOutcome::Rebuild {
+                        rebuilds += 1;
+                        core.on_build_result(current.map(id), t);
+                    }
+                }
+                None => {}
+            }
+            t += ms(10);
+        }
+        (rebuilds, checks)
+    }
+
+    #[test]
+    fn builds_immediately_on_start() {
+        let t0 = Instant::now();
+        let mut core = SupervisorCore::new(Timings::default(), t0);
+        assert!(!core.has_stream());
+        assert_eq!(core.next_deadline(), Some(t0));
+        assert_eq!(core.poll(t0), Some(Action::Rebuild));
+        core.on_build_result(Some(id("spk")), t0);
+        assert!(core.has_stream());
+        assert_eq!(core.built_on(), Some(&id("spk")));
+        assert_eq!(core.poll(t0 + ms(10)), None);
+    }
+
+    #[test]
+    fn burst_of_five_events_rebuilds_once() {
+        let t0 = Instant::now();
+        let mut core = running(t0, "spk");
+        let t1 = t0 + ms(500);
+        for i in 0..5 {
+            core.on_event(RebuildPolicy::Always, t1 + ms(40 * i));
+        }
+        assert_eq!(core.next_deadline(), Some(t1 + ms(160 + 200)));
+        let mut beat = 0;
+        assert_eq!(
+            drive(&mut core, t1, t1 + ms(350), Some("hp"), &mut beat),
+            (0, 0)
+        );
+        assert_eq!(
+            drive(
+                &mut core,
+                t1 + ms(360),
+                t1 + ms(1500),
+                Some("hp"),
+                &mut beat
+            ),
+            (1, 0)
+        );
+        assert_eq!(core.built_on(), Some(&id("hp")));
+    }
+
+    #[test]
+    fn failed_builds_retry_until_success() {
+        let t0 = Instant::now();
+        let mut core = SupervisorCore::new(Timings::default(), t0);
+        assert_eq!(core.poll(t0), Some(Action::Rebuild));
+        core.on_build_result(None, t0);
+        assert!(!core.has_stream());
+        assert_eq!(core.next_deadline(), Some(t0 + ms(1000)));
+        assert_eq!(core.poll(t0 + ms(999)), None);
+        assert_eq!(core.poll(t0 + ms(1000)), Some(Action::Rebuild));
+        core.on_build_result(None, t0 + ms(1000));
+        assert_eq!(core.poll(t0 + ms(1999)), None);
+        assert_eq!(core.poll(t0 + ms(2000)), Some(Action::Rebuild));
+        core.on_build_result(Some(id("spk")), t0 + ms(2000));
+
+        let mut beat = 0;
+        assert_eq!(
+            drive(
+                &mut core,
+                t0 + ms(2010),
+                t0 + ms(6000),
+                Some("spk"),
+                &mut beat
+            ),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn events_during_backoff_still_debounce_and_rebuild() {
+        let t0 = Instant::now();
+        let mut core = SupervisorCore::new(Timings::default(), t0);
+        assert_eq!(core.poll(t0), Some(Action::Rebuild));
+        core.on_build_result(None, t0);
+        core.on_event(RebuildPolicy::IfDefaultOutputChanged, t0 + ms(100));
+        assert_eq!(core.poll(t0 + ms(299)), None);
+        // No stream is active, so even an identity-checked event rebuilds.
+        assert_eq!(core.poll(t0 + ms(300)), Some(Action::Rebuild));
+    }
+
+    #[test]
+    fn stalled_heartbeat_rebuilds() {
+        let t0 = Instant::now();
+        let mut core = running(t0, "spk");
+        core.on_heartbeat(5, t0 + ms(100));
+        core.on_heartbeat(6, t0 + ms(500));
+        core.on_heartbeat(6, t0 + ms(1500));
+        assert_eq!(core.next_deadline(), Some(t0 + ms(2500)));
+        assert_eq!(core.poll(t0 + ms(2499)), None);
+        assert_eq!(core.poll(t0 + ms(2500)), Some(Action::Rebuild));
+        assert!(!core.has_stream());
+    }
+
+    #[test]
+    fn heartbeat_that_never_moves_after_build_rebuilds() {
+        let t0 = Instant::now();
+        let mut core = running(t0, "spk");
+        core.on_heartbeat(3, t0 + ms(100));
+        core.on_heartbeat(3, t0 + ms(1900));
+        assert_eq!(core.poll(t0 + ms(2000)), Some(Action::Rebuild));
+    }
+
+    #[test]
+    fn stream_error_always_rebuilds() {
+        let t0 = Instant::now();
+        let mut core = running(t0, "spk");
+        let mut beat = 0;
+        core.on_stream_error(t0 + ms(100));
+        // The default is unchanged, but a stream error never goes through the check.
+        assert_eq!(
+            drive(
+                &mut core,
+                t0 + ms(100),
+                t0 + ms(1000),
+                Some("spk"),
+                &mut beat
+            ),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn input_only_events_do_not_rebuild() {
+        let t0 = Instant::now();
+        let mut core = running(t0, "spk");
+        for i in 0..5 {
+            core.on_event(
+                DeviceEvent::DefaultInputChanged.rebuild_policy(),
+                t0 + ms(10 * i),
+            );
+        }
+        // Only the stall watchdog is pending.
+        assert_eq!(core.next_deadline(), Some(t0 + ms(2000)));
+        let mut beat = 0;
+        assert_eq!(
+            drive(&mut core, t0, t0 + ms(3000), Some("spk"), &mut beat),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn unrelated_device_with_same_default_is_dropped() {
+        let t0 = Instant::now();
+        let mut core = running(t0, "spk");
+        core.on_event(
+            DeviceEvent::DeviceListChanged.rebuild_policy(),
+            t0 + ms(100),
+        );
+        assert_eq!(core.poll(t0 + ms(299)), None);
+        assert_eq!(core.poll(t0 + ms(300)), Some(Action::CheckDefault));
+        assert_eq!(core.resolve_check(Some(id("spk"))), CheckOutcome::Drop);
+        assert!(core.has_stream());
+        assert_eq!(core.built_on(), Some(&id("spk")));
+        core.on_heartbeat(1, t0 + ms(300));
+        assert_eq!(core.poll(t0 + ms(400)), None);
+    }
+
+    #[test]
+    fn list_change_with_new_default_rebuilds() {
+        let t0 = Instant::now();
+        let mut core = running(t0, "spk");
+        core.on_event(DeviceEvent::DeviceListChanged.rebuild_policy(), t0);
+        assert_eq!(core.poll(t0 + ms(200)), Some(Action::CheckDefault));
+        assert_eq!(core.resolve_check(Some(id("hp"))), CheckOutcome::Rebuild);
+        assert!(!core.has_stream());
+    }
+
+    #[test]
+    fn removal_of_the_last_device_rebuilds() {
+        let t0 = Instant::now();
+        let mut core = running(t0, "spk");
+        core.on_event(DeviceEvent::DeviceRemoved.rebuild_policy(), t0);
+        assert_eq!(core.poll(t0 + ms(200)), Some(Action::CheckDefault));
+        assert_eq!(core.resolve_check(None), CheckOutcome::Rebuild);
+    }
+
+    #[test]
+    fn mixed_burst_rebuilds_without_check() {
+        let t0 = Instant::now();
+        let mut core = running(t0, "spk");
+        core.on_event(DeviceEvent::DeviceListChanged.rebuild_policy(), t0);
+        core.on_event(
+            DeviceEvent::DefaultOutputChanged.rebuild_policy(),
+            t0 + ms(20),
+        );
+        core.on_event(
+            DeviceEvent::DeviceStateChanged.rebuild_policy(),
+            t0 + ms(40),
+        );
+        assert_eq!(core.poll(t0 + ms(239)), None);
+        assert_eq!(core.poll(t0 + ms(240)), Some(Action::Rebuild));
+    }
+
+    // Thread-level tests.
+
+    fn fast() -> Timings {
+        Timings {
+            debounce: ms(50),
+            retry: ms(50),
+            stall: Duration::from_secs(3600),
+        }
+    }
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    fn spawn(factory: &FakeSinkFactory, watcher: &FakeWatcher) -> SupervisorHandle {
+        spawn_supervisor(
+            factory.clone(),
+            watcher.clone(),
+            Arc::new(MixerShared::new()),
+            fast(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn default_output_change_rebuilds_with_new_format() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let watcher = FakeWatcher::default();
+        let handle = spawn(&factory, &watcher);
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        assert_eq!(
+            factory.mixer().unwrap().lock().unwrap().sample_rate(),
+            48_000
+        );
+
+        factory.set_format(44_100, 2);
+        factory.set_default(Some("hp"));
+        assert!(watcher.send(DeviceEvent::DefaultOutputChanged));
+        assert!(wait_until(WAIT, || factory.builds().len() == 2));
+
+        let builds = factory.builds();
+        assert_eq!(builds[1].sample_rate, 44_100);
+        assert_eq!(builds[1].identity, id("hp"));
+        assert_eq!(
+            factory.mixer().unwrap().lock().unwrap().sample_rate(),
+            44_100
+        );
+        assert_eq!(factory.overlapping_builds(), 0);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn list_change_with_unchanged_default_does_not_rebuild() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let watcher = FakeWatcher::default();
+        let handle = spawn(&factory, &watcher);
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+
+        assert!(watcher.send(DeviceEvent::DeviceListChanged));
+        assert!(wait_until(WAIT, || factory.identity_queries() == 1));
+        thread::sleep(ms(200));
+        assert_eq!(factory.attempts(), 1);
+        assert_eq!(factory.builds().len(), 1);
+
+        // Control: the same event rebuilds once the default really changed.
+        factory.set_default(Some("usb"));
+        assert!(watcher.send(DeviceEvent::DeviceListChanged));
+        assert!(wait_until(WAIT, || factory.builds().len() == 2));
+        assert_eq!(factory.builds()[1].identity, id("usb"));
+        handle.shutdown();
+    }
+
+    #[test]
+    fn input_events_do_not_rebuild_or_query() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let watcher = FakeWatcher::default();
+        let handle = spawn(&factory, &watcher);
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        assert!(watcher.send(DeviceEvent::DefaultInputChanged));
+        // Events are handled in order: once the later list change has been
+        // checked, the input event has been handled too.
+        assert!(watcher.send(DeviceEvent::DeviceListChanged));
+        assert!(wait_until(WAIT, || factory.identity_queries() == 1));
+        thread::sleep(ms(200));
+        // Only the list change queried the default; nothing rebuilt.
+        assert_eq!(factory.identity_queries(), 1);
+        assert_eq!(factory.attempts(), 1);
+        handle.shutdown();
+    }
+
+    fn spawn_with_stall(factory: &FakeSinkFactory, stall: Duration) -> SupervisorHandle {
+        spawn_supervisor(
+            factory.clone(),
+            FakeWatcher::default(),
+            Arc::new(MixerShared::new()),
+            Timings { stall, ..fast() },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stalled_callback_rebuilds_on_the_thread() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        // Nothing renders, so the heartbeat never advances.
+        let handle = spawn_with_stall(&factory, ms(300));
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        assert!(wait_until(WAIT, || factory.builds().len() >= 2));
+        assert_eq!(factory.overlapping_builds(), 0);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn live_callback_does_not_rebuild_on_the_thread() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        // Longer than DRAIN_INTERVAL, so the thread samples the heartbeat
+        // (taking its baseline) before the stall deadline.
+        let handle = spawn_with_stall(&factory, ms(300));
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        let mixer = factory.mixer().unwrap();
+        // Stand in for a running stream callback for well over the stall time.
+        let mut out = vec![0.0; 64];
+        let start = Instant::now();
+        while start.elapsed() < ms(1200) {
+            mixer.lock().unwrap().render(&mut out);
+            thread::sleep(ms(10));
+        }
+        assert_eq!(factory.builds().len(), 1);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn voice_keeps_position_across_rebuild() {
+        let factory = FakeSinkFactory::new(48_000, 1, "spk");
+        let watcher = FakeWatcher::default();
+        let shared = Arc::new(MixerShared::new());
+        let handle = spawn_supervisor(
+            factory.clone(),
+            watcher.clone(),
+            Arc::clone(&shared),
+            fast(),
+        )
+        .unwrap();
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+
+        let sound = Sound::from_interleaved(vec![0.25; 48_000], 48_000, 1, "long").unwrap();
+        shared
+            .push(Command::Play {
+                sound: sound.clone(),
+                gain: 1.0,
+            })
+            .unwrap();
+        let mixer = factory.mixer().unwrap();
+        // Stand in for the stream callback.
+        let mut out = vec![0.0; 480];
+        mixer.lock().unwrap().render(&mut out);
+        assert!(out.iter().all(|&x| (x - 0.25).abs() < 1e-6));
+        let before: Vec<f64> = mixer.lock().unwrap().voice_positions().collect();
+        assert_eq!(before, vec![480.0]);
+
+        factory.set_format(44_100, 2);
+        assert!(watcher.send(DeviceEvent::DefaultOutputChanged));
+        assert!(wait_until(WAIT, || factory.builds().len() == 2));
+
+        let mut m = mixer.lock().unwrap();
+        assert_eq!(m.sample_rate(), 44_100);
+        assert_eq!(m.voice_positions().collect::<Vec<_>>(), before);
+        let mut out = vec![0.0; 441 * 2];
+        m.render(&mut out);
+        let after: Vec<f64> = m.voice_positions().collect();
+        assert_eq!(after.len(), 1);
+        assert!((after[0] - 960.0).abs() < 1e-6, "{after:?}");
+        assert!(out.iter().all(|&x| (x - 0.25).abs() < 1e-6));
+        drop(m);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn failed_builds_are_retried_on_the_thread() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        factory.fail_next(2);
+        let watcher = FakeWatcher::default();
+        let handle = spawn(&factory, &watcher);
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        assert_eq!(factory.attempts(), 3);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn plays_queued_without_output_are_dropped() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        factory.fail_next(usize::MAX);
+        let watcher = FakeWatcher::default();
+        let shared = Arc::new(MixerShared::new());
+        let handle = spawn_supervisor(
+            factory.clone(),
+            watcher.clone(),
+            Arc::clone(&shared),
+            fast(),
+        )
+        .unwrap();
+        assert!(wait_until(WAIT, || factory.attempts() >= 1));
+        assert!(!shared.output_active());
+
+        let sound = Sound::from_interleaved(vec![0.5; 4800], 48_000, 1, "press").unwrap();
+        for _ in 0..5 {
+            shared
+                .push(Command::Play {
+                    sound: sound.clone(),
+                    gain: 1.0,
+                })
+                .unwrap();
+        }
+        shared.push(Command::SetMasterGain(0.5)).unwrap();
+        // The plays are dropped off the realtime thread; the gain applies.
+        assert!(wait_until(WAIT, || sound.handle_count() == 1));
+        assert!(wait_until(WAIT, || shared.commands_applied() == 1));
+
+        // A device comes back: nothing stale starts, new plays do.
+        factory.fail_next(0);
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        assert!(shared.output_active());
+        let mixer = factory.mixer().unwrap();
+        assert_eq!(mixer.lock().unwrap().master_gain(), 0.5);
+        let mut out = vec![0.0; 64];
+        mixer.lock().unwrap().render(&mut out);
+        assert_eq!(shared.active_voices(), 0);
+        handle.shutdown();
+        assert!(!shared.output_active());
+    }
+
+    #[test]
+    fn rebuild_from_offline_drops_plays_queued_since_the_last_purge() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let shared = Arc::new(MixerShared::new());
+        let (sender, _receiver) = mpsc::channel();
+        let mut worker = Worker::new(factory.clone(), Arc::clone(&shared), fast(), sender);
+
+        // A press lands after the loop's purge but before the scheduled build.
+        let sound = Sound::from_interleaved(vec![0.5; 4800], 48_000, 1, "late").unwrap();
+        shared
+            .push(Command::Play {
+                sound: sound.clone(),
+                gain: 1.0,
+            })
+            .unwrap();
+        worker.rebuild();
+        assert!(worker.sink.is_some());
+        assert_eq!(sound.handle_count(), 1);
+
+        let mixer = factory.mixer().unwrap();
+        let mut out = vec![0.0; 64];
+        mixer.lock().unwrap().render(&mut out);
+        assert_eq!(shared.active_voices(), 0);
+        assert!(out.iter().all(|s| *s == 0.0));
+
+        // A rebuild of a running stream keeps queued plays: they are live.
+        shared
+            .push(Command::Play {
+                sound: sound.clone(),
+                gain: 1.0,
+            })
+            .unwrap();
+        worker.rebuild();
+        mixer.lock().unwrap().render(&mut out);
+        assert_eq!(shared.active_voices(), 1);
+        drop(worker);
+    }
+
+    #[test]
+    fn stream_error_rebuilds_on_the_thread() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let watcher = FakeWatcher::default();
+        let handle = spawn(&factory, &watcher);
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        assert!(factory.send_stream_error());
+        assert!(wait_until(WAIT, || factory.builds().len() == 2));
+        assert_eq!(factory.overlapping_builds(), 0);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn supervisor_drains_garbage() {
+        let factory = FakeSinkFactory::new(48_000, 1, "spk");
+        let watcher = FakeWatcher::default();
+        let shared = Arc::new(MixerShared::new());
+        let handle = spawn_supervisor(
+            factory.clone(),
+            watcher.clone(),
+            Arc::clone(&shared),
+            fast(),
+        )
+        .unwrap();
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+
+        let sound = Sound::from_interleaved(vec![0.5; 16], 48_000, 1, "short").unwrap();
+        shared
+            .push(Command::Play {
+                sound: sound.clone(),
+                gain: 1.0,
+            })
+            .unwrap();
+        let mixer = factory.mixer().unwrap();
+        let mut out = vec![0.0; 64];
+        mixer.lock().unwrap().render(&mut out);
+        assert_eq!(shared.active_voices(), 0);
+        assert!(wait_until(WAIT, || sound.handle_count() == 1));
+        handle.shutdown();
+    }
+
+    #[test]
+    fn shutdown_joins_promptly_and_cleans_up() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let watcher = FakeWatcher::default();
+        let handle = spawn_supervisor(
+            factory.clone(),
+            watcher.clone(),
+            Arc::new(MixerShared::new()),
+            Timings::default(),
+        )
+        .unwrap();
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        assert_eq!(watcher.started(), 1);
+        assert_eq!(factory.live_sinks(), 1);
+
+        let start = Instant::now();
+        handle.shutdown();
+        assert!(start.elapsed() < ms(500), "{:?}", start.elapsed());
+        assert_eq!(factory.live_sinks(), 0);
+        assert_eq!(watcher.guards_dropped(), 1);
+        assert!(!watcher.send(DeviceEvent::DefaultOutputChanged));
+    }
+
+    #[test]
+    fn dropping_the_handle_shuts_down() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let watcher = FakeWatcher::default();
+        let handle = spawn(&factory, &watcher);
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        drop(handle);
+        assert_eq!(factory.live_sinks(), 0);
+        assert_eq!(watcher.guards_dropped(), 1);
+    }
+
+    #[test]
+    fn watcher_failure_is_not_fatal() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let watcher = FakeWatcher::default();
+        watcher.fail_start();
+        let handle = spawn(&factory, &watcher);
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        assert!(factory.send_stream_error());
+        assert!(wait_until(WAIT, || factory.builds().len() == 2));
+        handle.shutdown();
+    }
+}
