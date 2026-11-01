@@ -544,6 +544,32 @@ mod tests {
     }
 
     #[test]
+    fn an_added_builtin_is_saved_and_resolves() {
+        use crate::config::SoundSource;
+        use crate::settings::form::SettingsForm;
+
+        let dir = TempDir::new("save-builtin");
+        let path = write_config(&dir, DEFAULT_CONFIG);
+        let mut form = SettingsForm::from_text(DEFAULT_CONFIG);
+        let before = form.rows().len();
+        form.add_builtin("demo").unwrap();
+        assert!(form.can_save());
+        save_sounds(&path, form.loaded(), form.rows()).unwrap();
+
+        let raw = config::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw.sounds.len(), before + 1);
+        let (resolved, warnings) = crate::hotkeys::resolve(&raw, dir.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let added = resolved.sounds.last().unwrap();
+        assert_eq!(added.name, "Demo chime");
+        assert_eq!(added.hotkey, None);
+        assert!(matches!(
+            added.source,
+            SoundSource::Builtin(entry) if entry.name == "demo"
+        ));
+    }
+
+    #[test]
     fn a_changed_sound_list_is_refused_and_the_file_stays_untouched() {
         let dir = TempDir::new("save-changed");
         let (loaded, mut rows) = rows_of(DEFAULT_CONFIG);

@@ -127,12 +127,12 @@ Replace the single embedded demo chime with a registry of built-in sounds, and e
 **Files:**
 - Modify: `crates/app/src/settings/form.rs`, `crates/app/src/settings/view.rs`, `crates/app/src/settings/save.rs` (tests)
 
-- [ ] Add `SettingsForm::add_builtin(name) -> Result<()>`. It looks the name up through `config::builtin`; an unknown name is an error. It appends `SoundRow { name: label, path: "builtin:<name>", hotkey: None, original: None }`, and does nothing on a form that is not editable (like `add`).
-- [ ] In `view.rs`, add `ui.menu_button("Add built-in…", …)` next to "Add sound…", listing `BUILTIN_SOUNDS` by label. Choosing one calls `add_builtin(entry.name)` and closes the menu; an error goes to the message line. The file column is unchanged (it shows the `builtin:` path).
-- [ ] Tests:
+- [x] Add `SettingsForm::add_builtin(name) -> Result<()>`. It looks the name up through `config::builtin`; an unknown name is an error. It appends `SoundRow { name: label, path: "builtin:<name>", hotkey: None, original: None }`, and does nothing on a form that is not editable (like `add`).
+- [x] In `view.rs`, add `ui.menu_button("Add built-in…", …)` next to "Add sound…", listing `BUILTIN_SOUNDS` by label. Choosing one calls `add_builtin(entry.name)` and closes the menu; an error goes to the message line. The file column is unchanged (it shows the `builtin:` path).
+- [x] Tests:
   - `add_builtin` appends the expected row, refuses an unknown name, and does nothing on a failed form;
   - a `save.rs` test adds a built-in row through the form, saves it with `save_sounds` to a temp config, re-reads it, and checks that `hotkeys::resolve` gives no warnings and resolves the row to `SoundSource::Builtin`.
-- [ ] Run the test suite; it must pass before Task 6.
+- [x] Run the test suite; it must pass before Task 6.
 
 ### Task 6: Audition from the settings window
 

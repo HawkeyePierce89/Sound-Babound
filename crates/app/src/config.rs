@@ -31,10 +31,6 @@ pub struct BuiltinSound {
     /// `"builtin:<name>"`; also the decode label.
     pub path: &'static str,
     /// The text shown in menus and written as the default sound name.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "first read by the Add built-in menu (Task 5)")
-    )]
     pub label: &'static str,
     /// The encoded file (WAV for the demo, OGG Vorbis for the rest).
     pub bytes: &'static [u8],

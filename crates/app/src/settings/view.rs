@@ -8,6 +8,7 @@ use std::sync::PoisonError;
 
 use eframe::egui;
 
+use crate::config;
 use crate::hotkeys;
 use crate::platform;
 use crate::settings::StatusText;
@@ -176,9 +177,21 @@ impl SettingsApp {
                 }
             }
         }
-        if ui.button("Add sound…").clicked() {
-            self.add_sounds();
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Add sound…").clicked() {
+                self.add_sounds();
+            }
+            ui.menu_button("Add built-in…", |ui| {
+                for entry in config::BUILTIN_SOUNDS {
+                    if ui.button(entry.label).clicked() {
+                        if let Err(err) = self.form.add_builtin(entry.name) {
+                            self.message = Some(format!("{err:#}"));
+                        }
+                        ui.close();
+                    }
+                }
+            });
+        });
         if let Some(hotkey) = hotkeys::hotkey_spec(self.form.stop_all_hotkey()) {
             ui.weak(format!(
                 "\"Stop all\" hotkey: {hotkey} (set in the config file)"
