@@ -1,22 +1,75 @@
-//! Output sinks.
+//! Streams, the factories that build them and the endpoints they feed.
 //!
-//! A [`SinkFactory`] builds an [`ActiveSink`] (a running output stream) on
-//! the current default device. The supervisor owns both, drops the sink to
-//! stop the stream and asks the factory for a new one when the device changes.
+//! Every stream the engine runs (the monitor output, the mic sink and the
+//! capture) is supervised the same way; only its [`StreamRole`], its
+//! [`StreamFactory`] and its [`Endpoint`] differ.
+//!
+//! - A [`StreamFactory`] builds an [`ActiveStream`] on the device its role
+//!   targets right now, and reports that device's identity without building.
+//!   It caches no device.
+//! - An [`Endpoint`] is the state the stream's callback reads or writes and
+//!   the supervisor watches: the build target handed to the factory, the
+//!   callback heartbeat, the active flag and the housekeeping done while no
+//!   stream exists. [`MixerEndpoint`] serves both output roles,
+//!   [`CaptureEndpoint`] the capture.
+//!
+//! The supervisor owns the factory, the endpoint and the stream. It drops the
+//! stream to stop it and asks the factory for a new one when the device
+//! changes.
 
 use std::fmt;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use crate::error::BuildError;
-use crate::mixer::Mixer;
+use crate::mixer::{Mixer, MixerShared};
+use crate::passthrough::{PassthroughReader, PassthroughShared};
 use crate::supervisor::SupervisorMsg;
 
-/// An opaque, comparable identity of an output device.
+/// Which stream a supervisor runs. Each role has its own rebuild policy (see
+/// `DeviceEvent::rebuild_policy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamRole {
+    /// The local output: the default output device, so the user hears the
+    /// sounds.
+    Monitor,
+    /// The output to the virtual cable that a call app uses as its microphone.
+    MicSink,
+    /// The microphone capture that is passed through to the mic sink.
+    Capture,
+}
+
+impl StreamRole {
+    /// Every role, for exhaustive tests.
+    #[cfg(test)]
+    pub const ALL: [StreamRole; 3] = [
+        StreamRole::Monitor,
+        StreamRole::MicSink,
+        StreamRole::Capture,
+    ];
+
+    /// A short name for logs and thread names.
+    pub fn label(self) -> &'static str {
+        match self {
+            StreamRole::Monitor => "monitor",
+            StreamRole::MicSink => "mic-sink",
+            StreamRole::Capture => "capture",
+        }
+    }
+}
+
+impl fmt::Display for StreamRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// An opaque, comparable identity of an audio device.
 ///
 /// It is the backend's stable device id when there is one, otherwise the
 /// device name. Identities are only compared with each other, never parsed.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeviceIdentity(String);
 
 impl DeviceIdentity {
@@ -37,7 +90,7 @@ impl fmt::Display for DeviceIdentity {
     }
 }
 
-/// What a sink was built on.
+/// What a stream was built on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamInfo {
     /// Identity of the device the stream runs on.
@@ -52,38 +105,225 @@ pub struct StreamInfo {
     pub sample_format: String,
 }
 
-/// A running output stream. Dropping it stops the stream.
+/// A running stream. Dropping it stops the stream.
 ///
 /// It is not `Send`: the supervisor thread builds, owns and drops it.
-pub trait ActiveSink {}
+pub trait ActiveStream {}
 
-/// A successful [`SinkFactory::build`].
-pub type BuiltSink = (Box<dyn ActiveSink>, StreamInfo);
+/// A successful [`StreamFactory::build`].
+pub type BuiltStream = (Box<dyn ActiveStream>, StreamInfo);
 
-/// Builds output streams on the current default device.
-pub trait SinkFactory: Send + 'static {
-    /// Build and start a stream on the current default output device.
+/// Builds the streams of one role.
+pub trait StreamFactory: Send + 'static {
+    /// What a build feeds: the mixer for an output, the passthrough for a
+    /// capture. It comes from [`Endpoint::target`].
+    type Target;
+
+    /// The role this factory builds for.
+    fn role(&self) -> StreamRole;
+
+    /// Build and start a stream on the device this role targets right now.
     ///
     /// It is called only while no stream exists, so the factory may lock
-    /// `mixer` freely before starting the stream; it must call
-    /// [`Mixer::configure`] with the stream's rate and channel count before
-    /// the stream starts. Once the stream runs, only its callback touches the
-    /// mixer (with `try_lock`). Stream errors are reported by sending
-    /// [`SupervisorMsg::StreamError`] on `on_error`.
+    /// `target` freely before starting the stream. An output factory must
+    /// call [`Mixer::configure`] with the stream's rate and channel count
+    /// before the stream starts. Once the stream runs, only its callback
+    /// touches the target (with `try_lock`). Stream errors are reported by
+    /// sending [`SupervisorMsg::StreamError`] on `on_error`.
     fn build(
         &mut self,
-        mixer: Arc<Mutex<Mixer>>,
+        target: Self::Target,
         on_error: Sender<SupervisorMsg>,
-    ) -> Result<BuiltSink, BuildError>;
+    ) -> Result<BuiltStream, BuildError>;
 
-    /// Re-query the live default output device and return its identity.
-    /// `None` means there is no output device. Nothing is cached.
-    fn current_default_identity(&mut self) -> Option<DeviceIdentity>;
+    /// Re-query the devices and return the identity of the one a build would
+    /// pick now. `None` means there is none. Nothing is cached.
+    fn current_identity(&mut self) -> Option<DeviceIdentity>;
+}
+
+/// A boxed factory is a factory, so the engine can pick its factories at
+/// run time (see `Backends`).
+impl<F: StreamFactory + ?Sized> StreamFactory for Box<F> {
+    type Target = F::Target;
+
+    fn role(&self) -> StreamRole {
+        (**self).role()
+    }
+
+    fn build(
+        &mut self,
+        target: Self::Target,
+        on_error: Sender<SupervisorMsg>,
+    ) -> Result<BuiltStream, BuildError> {
+        (**self).build(target, on_error)
+    }
+
+    fn current_identity(&mut self) -> Option<DeviceIdentity> {
+        (**self).current_identity()
+    }
+}
+
+/// The state a stream feeds, as the supervisor sees it.
+///
+/// The supervisor thread owns the endpoint. Every method runs there.
+pub trait Endpoint: Send + 'static {
+    /// What the factory builds against.
+    type Target;
+
+    /// A handle for the next build.
+    fn target(&self) -> Self::Target;
+
+    /// A counter the stream's callback advances; the stall watchdog reads it.
+    fn heartbeat(&self) -> u64;
+
+    /// Mark the stream as running (after a build returned) or gone. Marking
+    /// it running also closes the play grace window.
+    fn set_active(&self, active: bool);
+
+    /// A live stream is being torn down for a rebuild: keep accepting plays
+    /// until `until` and keep them for the replacement stream.
+    fn open_play_grace(&self, until: Instant);
+
+    /// Close the play grace window (on shutdown).
+    fn close_play_grace(&self);
+
+    /// Housekeeping while no stream exists. Drops the plays queued offline,
+    /// unless the play grace window is still open at `now`, and applies the
+    /// other queued commands. Returns the number of plays dropped.
+    fn purge_offline(&self, now: Instant) -> usize;
+
+    /// Free what the callback released, off the realtime thread.
+    fn drain_garbage(&self);
+}
+
+/// The endpoint of an output role: a mixer the stream callback renders.
+#[derive(Debug)]
+pub struct MixerEndpoint {
+    shared: Arc<MixerShared>,
+    mixer: Arc<Mutex<Mixer>>,
+}
+
+impl MixerEndpoint {
+    /// An endpoint with a new, unconfigured mixer on `shared`.
+    pub fn new(shared: Arc<MixerShared>) -> MixerEndpoint {
+        MixerEndpoint {
+            mixer: Arc::new(Mutex::new(Mixer::new(Arc::clone(&shared)))),
+            shared,
+        }
+    }
+
+    /// An endpoint with a new, unconfigured mic mixer on `shared` that adds
+    /// `reader`'s passthrough to its mix.
+    pub fn with_passthrough(shared: Arc<MixerShared>, reader: PassthroughReader) -> MixerEndpoint {
+        MixerEndpoint {
+            mixer: Arc::new(Mutex::new(Mixer::with_passthrough(
+                Arc::clone(&shared),
+                reader,
+            ))),
+            shared,
+        }
+    }
+
+    /// The state shared with the control threads.
+    #[cfg(test)]
+    pub fn shared(&self) -> &Arc<MixerShared> {
+        &self.shared
+    }
+}
+
+impl Endpoint for MixerEndpoint {
+    type Target = Arc<Mutex<Mixer>>;
+
+    fn target(&self) -> Arc<Mutex<Mixer>> {
+        Arc::clone(&self.mixer)
+    }
+
+    fn heartbeat(&self) -> u64 {
+        self.shared.callback_heartbeat()
+    }
+
+    fn set_active(&self, active: bool) {
+        self.shared.set_output_active(active);
+        // Closed only after output is marked active, so plays stay accepted
+        // without a gap.
+        if active {
+            self.shared.close_play_grace();
+        }
+    }
+
+    fn open_play_grace(&self, until: Instant) {
+        self.shared.open_play_grace(until);
+    }
+
+    fn close_play_grace(&self) {
+        self.shared.close_play_grace();
+    }
+
+    fn purge_offline(&self, now: Instant) -> usize {
+        if self.shared.play_grace_open(now) {
+            return 0;
+        }
+        // No stream means no callback, so the lock cannot contend.
+        self.mixer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .apply_offline()
+    }
+
+    fn drain_garbage(&self) {
+        self.shared.drain_garbage();
+    }
+}
+
+/// The endpoint of the capture: the passthrough ring its callback writes.
+///
+/// A capture queues no commands and releases no sounds, so there is no
+/// play grace, nothing to purge and no garbage to drain.
+#[derive(Debug)]
+pub struct CaptureEndpoint {
+    shared: Arc<PassthroughShared>,
+}
+
+impl CaptureEndpoint {
+    /// An endpoint writing into `shared`.
+    pub fn new(shared: Arc<PassthroughShared>) -> CaptureEndpoint {
+        CaptureEndpoint { shared }
+    }
+}
+
+impl Endpoint for CaptureEndpoint {
+    type Target = Arc<PassthroughShared>;
+
+    fn target(&self) -> Arc<PassthroughShared> {
+        Arc::clone(&self.shared)
+    }
+
+    fn heartbeat(&self) -> u64 {
+        self.shared.heartbeat()
+    }
+
+    fn set_active(&self, active: bool) {
+        self.shared.set_active(active);
+    }
+
+    fn open_play_grace(&self, _until: Instant) {}
+
+    fn close_play_grace(&self) {}
+
+    fn purge_offline(&self, _now: Instant) -> usize {
+        0
+    }
+
+    fn drain_garbage(&self) {}
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::mixer::Command;
+    use crate::sound::Sound;
 
     #[test]
     fn identities_compare_by_value() {
@@ -92,5 +332,84 @@ mod tests {
         assert_ne!(a, DeviceIdentity::new("headset"));
         assert_eq!(a.as_str(), "speakers");
         assert_eq!(a.to_string(), "speakers");
+    }
+
+    #[test]
+    fn roles_have_distinct_labels() {
+        let labels: Vec<_> = StreamRole::ALL.iter().map(|r| r.to_string()).collect();
+        assert_eq!(labels, ["monitor", "mic-sink", "capture"]);
+    }
+
+    fn press() -> Sound {
+        Sound::from_interleaved(vec![0.5; 480], 48_000, 1, "press").unwrap()
+    }
+
+    #[test]
+    fn mixer_endpoint_marks_output_and_closes_grace_when_active() {
+        let endpoint = MixerEndpoint::new(Arc::new(MixerShared::new()));
+        let shared = Arc::clone(endpoint.shared());
+        let now = Instant::now();
+        endpoint.open_play_grace(now + Duration::from_secs(60));
+        assert!(shared.play_grace_open(now));
+        endpoint.set_active(true);
+        assert!(shared.output_active());
+        assert!(!shared.play_grace_open(now));
+        endpoint.set_active(false);
+        assert!(!shared.output_active());
+    }
+
+    #[test]
+    fn mixer_endpoint_purge_respects_the_grace_window() {
+        let endpoint = MixerEndpoint::new(Arc::new(MixerShared::new()));
+        let shared = Arc::clone(endpoint.shared());
+        let sound = press();
+        shared
+            .push(Command::Play {
+                sound: sound.clone(),
+                gain: 1.0,
+            })
+            .unwrap();
+        let now = Instant::now();
+        endpoint.open_play_grace(now + Duration::from_secs(60));
+        assert_eq!(endpoint.purge_offline(now), 0);
+        assert_eq!(sound.handle_count(), 2);
+
+        endpoint.close_play_grace();
+        assert_eq!(endpoint.purge_offline(now), 1);
+        assert_eq!(sound.handle_count(), 1);
+    }
+
+    #[test]
+    fn capture_endpoint_wraps_the_passthrough() {
+        let shared = Arc::new(PassthroughShared::new());
+        let endpoint = CaptureEndpoint::new(Arc::clone(&shared));
+        assert!(Arc::ptr_eq(&endpoint.target(), &shared));
+        assert_eq!(endpoint.heartbeat(), 0);
+        endpoint.target().write(&[0.25f32, 0.75], 2);
+        assert_eq!(endpoint.heartbeat(), 1);
+
+        endpoint.set_active(true);
+        assert!(shared.is_active());
+        endpoint.set_active(false);
+        assert!(!shared.is_active());
+
+        // Nothing is queued on a capture, so housekeeping is a no-op.
+        let now = Instant::now();
+        endpoint.open_play_grace(now + Duration::from_secs(1));
+        endpoint.close_play_grace();
+        assert_eq!(endpoint.purge_offline(now), 0);
+        endpoint.drain_garbage();
+        assert_eq!(shared.fill(), 1);
+    }
+
+    #[test]
+    fn mixer_endpoint_target_is_the_one_mixer() {
+        let endpoint = MixerEndpoint::new(Arc::new(MixerShared::new()));
+        assert!(Arc::ptr_eq(&endpoint.target(), &endpoint.target()));
+        assert_eq!(endpoint.heartbeat(), 0);
+        endpoint.target().lock().unwrap().configure(48_000, 1);
+        let mut out = [0.0; 16];
+        endpoint.target().lock().unwrap().render(&mut out);
+        assert_eq!(endpoint.heartbeat(), 1);
     }
 }

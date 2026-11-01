@@ -1,4 +1,5 @@
-//! Sample-format conversion from the f32 mix to the device format.
+//! Sample-format conversion between the f32 mix and the device formats:
+//! [`OutputSample`] for the output streams, [`InputSample`] for the capture.
 //!
 //! These are pure, allocation-free functions that run inside the audio
 //! callback. Conversion goes through cpal's `FromSample`, so every integer
@@ -43,6 +44,27 @@ impl OutputSample for U24 {
         U24::from_sample(i32::from_sample(sample))
     }
 }
+
+/// A device sample type the capture can read from.
+pub trait InputSample: SizedSample {
+    /// Convert to f32 in [-1, 1]. NaN becomes silence.
+    fn to_mix(self) -> f32;
+}
+
+macro_rules! input_sample {
+    ($($t:ty),*) => {$(
+        impl InputSample for $t {
+            #[inline]
+            fn to_mix(self) -> f32 {
+                clamp(f32::from_sample(self))
+            }
+        }
+    )*};
+}
+
+// dasp scales I24 and U24 by 2^23 without overflow on the way in, so unlike
+// the output side they need no detour through i32.
+input_sample!(f32, f64, i8, i16, I24, i32, i64, u8, u16, U24, u32, u64);
 
 /// Clamp a mixed sample to the valid range. NaN maps to silence.
 #[inline]
@@ -150,6 +172,42 @@ mod tests {
         let mut u = [U24::new_unchecked(5); 2];
         fill_silence(&mut u);
         assert_eq!(u.map(|s| s.inner()), [1 << 23; 2]);
+    }
+
+    #[test]
+    fn input_conversion_at_full_scale() {
+        assert_eq!(i16::MIN.to_mix(), -1.0);
+        assert_eq!(0i16.to_mix(), 0.0);
+        assert_eq!(i16::MAX.to_mix(), 32_767.0 / 32_768.0);
+        assert_eq!(i8::MIN.to_mix(), -1.0);
+        assert_eq!(i32::MIN.to_mix(), -1.0);
+        assert!(i32::MAX.to_mix() > 0.999_999);
+        assert_eq!(i64::MIN.to_mix(), -1.0);
+        assert!(i64::MAX.to_mix() > 0.999_999);
+
+        assert_eq!(0u8.to_mix(), -1.0);
+        assert_eq!(128u8.to_mix(), 0.0);
+        assert_eq!(u8::MAX.to_mix(), 127.0 / 128.0);
+        assert_eq!(0u16.to_mix(), -1.0);
+        assert_eq!(32_768u16.to_mix(), 0.0);
+        assert_eq!(0u32.to_mix(), -1.0);
+        assert_eq!(0u64.to_mix(), -1.0);
+        assert_eq!((1u64 << 63).to_mix(), 0.0);
+
+        assert_eq!(I24::new_unchecked(-(1 << 23)).to_mix(), -1.0);
+        assert_eq!(I24::new_unchecked(0).to_mix(), 0.0);
+        let max = I24::new_unchecked((1 << 23) - 1).to_mix();
+        assert!(max > 0.999_999 && max < 1.0, "{max}");
+        assert_eq!(U24::new_unchecked(0).to_mix(), -1.0);
+        assert_eq!(U24::new_unchecked(1 << 23).to_mix(), 0.0);
+        let max = U24::new_unchecked((1 << 24) - 1).to_mix();
+        assert!(max > 0.999_999 && max < 1.0, "{max}");
+
+        assert_eq!(0.5f32.to_mix(), 0.5);
+        assert_eq!(1.5f32.to_mix(), 1.0);
+        assert_eq!((-3.0f64).to_mix(), -1.0);
+        assert_eq!(f32::NAN.to_mix(), 0.0);
+        assert_eq!(f64::NAN.to_mix(), 0.0);
     }
 
     #[test]

@@ -188,6 +188,7 @@ impl DeviceWatcher for CoreAudioWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink::StreamRole;
     use crate::watcher::RebuildPolicy;
     use crate::watcher::tests::table_event;
 
@@ -227,8 +228,9 @@ mod tests {
             assert_eq!(event_for_selector(selector), Some(table_event(source)));
         }
         assert_eq!(
-            event_for_selector(kAudioHardwarePropertyDevices).map(DeviceEvent::rebuild_policy),
-            Some(RebuildPolicy::IfDefaultOutputChanged)
+            event_for_selector(kAudioHardwarePropertyDevices)
+                .map(|e| e.rebuild_policy(StreamRole::Monitor)),
+            Some(RebuildPolicy::IfIdentityChanged)
         );
     }
 

@@ -6,7 +6,8 @@ use std::str::FromStr;
 
 use global_hotkey::hotkey::HotKey;
 
-use crate::config::{RawConfig, ResolvedConfig, ResolvedSound, SoundSource};
+use crate::config::{MicConfig, RawConfig, RawMic, ResolvedConfig, ResolvedSound, SoundSource};
+use crate::platform;
 
 /// Lowest accepted gain (per-sound and master).
 pub const MIN_GAIN: f32 = 0.0;
@@ -92,6 +93,29 @@ impl HotkeyRegistry {
     }
 }
 
+/// Validates the `[mic]` table: gains are clamped like every other gain,
+/// a missing `virtual_device` selects the platform default, and a blank one
+/// does too, with a warning.
+pub fn resolve_mic(raw: &RawMic, warnings: &mut Vec<String>) -> MicConfig {
+    let default_device = platform::default_virtual_device();
+    let virtual_device = match raw.virtual_device.as_deref().map(str::trim) {
+        None => default_device.to_string(),
+        Some("") => {
+            warnings.push(format!(
+                "mic.virtual_device is empty, using the default {default_device:?}"
+            ));
+            default_device.to_string()
+        }
+        Some(pattern) => pattern.to_string(),
+    };
+    MicConfig {
+        enabled: raw.enabled,
+        virtual_device,
+        sound_gain: clamp_gain(raw.sound_gain, "mic.sound_gain", warnings),
+        mic_gain: clamp_gain(raw.mic_gain, "mic.mic_gain", warnings),
+    }
+}
+
 /// Validates a raw config.
 ///
 /// - Hotkeys that fail to parse, and every repeat of a hotkey already taken
@@ -99,6 +123,7 @@ impl HotkeyRegistry {
 ///   warning; the sound itself stays in the list so the tray can play it.
 /// - Gains (per-sound and master) are clamped to [`MIN_GAIN`, `MAX_GAIN`].
 /// - Entries whose path cannot be resolved are dropped with a warning.
+/// - The `[mic]` table is validated by [`resolve_mic`].
 pub fn resolve(raw: &RawConfig, config_dir: &Path) -> (ResolvedConfig, Vec<String>) {
     let mut warnings = Vec::new();
     let mut registry = HotkeyRegistry {
@@ -132,11 +157,14 @@ pub fn resolve(raw: &RawConfig, config_dir: &Path) -> (ResolvedConfig, Vec<Strin
         });
     }
 
+    let mic = resolve_mic(&raw.mic, &mut warnings);
+
     (
         ResolvedConfig {
             master_gain,
             stop_all_hotkey,
             sounds,
+            mic,
         },
         warnings,
     )
@@ -273,6 +301,7 @@ mod tests {
         );
         assert_eq!(resolved.sounds.len(), 1);
         assert_eq!(resolved.sounds[0].source, SoundSource::BuiltinDemo);
+        assert_eq!(resolved.mic, MicConfig::default());
         assert_eq!(
             resolved.sounds[0].hotkey,
             Some(HotKey::new(
@@ -402,5 +431,90 @@ mod tests {
                 SoundSource::File(dir.join("sounds/rel.wav")),
             ]
         );
+    }
+
+    #[test]
+    fn no_mic_table_resolves_to_mic_off_on_the_platform_default() {
+        let raw = config::parse("master_gain = 1.0\n").unwrap();
+        let (resolved, warnings) = resolve(&raw, Path::new("/cfg"));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            resolved.mic,
+            MicConfig {
+                enabled: false,
+                virtual_device: platform::default_virtual_device().to_string(),
+                sound_gain: 1.0,
+                mic_gain: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn mic_table_values_are_carried() {
+        let raw = config::parse(
+            "[mic]\nenabled = true\nvirtual_device = \" My Cable \"\n\
+             sound_gain = 0.5\nmic_gain = 2.0\n",
+        )
+        .unwrap();
+        let (resolved, warnings) = resolve(&raw, Path::new("/cfg"));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            resolved.mic,
+            MicConfig {
+                enabled: true,
+                virtual_device: "My Cable".into(),
+                sound_gain: 0.5,
+                mic_gain: 2.0,
+            }
+        );
+    }
+
+    #[test]
+    fn mic_gains_are_clamped_with_warnings() {
+        let raw = RawConfig {
+            mic: RawMic {
+                sound_gain: 7.0,
+                mic_gain: -0.5,
+                ..RawMic::default()
+            },
+            ..RawConfig::default()
+        };
+        let (resolved, warnings) = resolve(&raw, Path::new("/cfg"));
+        assert_eq!(resolved.mic.sound_gain, MAX_GAIN);
+        assert_eq!(resolved.mic.mic_gain, MIN_GAIN);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("mic.sound_gain"), "{warnings:?}");
+        assert!(warnings[1].contains("mic.mic_gain"), "{warnings:?}");
+
+        let raw = RawConfig {
+            mic: RawMic {
+                mic_gain: f32::NAN,
+                ..RawMic::default()
+            },
+            ..RawConfig::default()
+        };
+        let (resolved, warnings) = resolve(&raw, Path::new("/cfg"));
+        assert_eq!(resolved.mic.mic_gain, 1.0);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    #[test]
+    fn blank_virtual_device_falls_back_to_the_default_with_a_warning() {
+        for blank in ["", "   "] {
+            let raw = RawConfig {
+                mic: RawMic {
+                    virtual_device: Some(blank.into()),
+                    ..RawMic::default()
+                },
+                ..RawConfig::default()
+            };
+            let (resolved, warnings) = resolve(&raw, Path::new("/cfg"));
+            assert_eq!(
+                resolved.mic.virtual_device,
+                platform::default_virtual_device()
+            );
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("mic.virtual_device"), "{warnings:?}");
+        }
     }
 }

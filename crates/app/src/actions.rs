@@ -7,13 +7,15 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use babound_engine::{Engine, Sound};
+use babound_engine::{CaptureStatus, Engine, MicSettings, MicStatus, Sound};
 use global_hotkey::hotkey::HotKey;
 
-use crate::config::{self, DEFAULT_CONFIG, RawConfig, ResolvedConfig};
-use crate::hotkeys;
+use crate::config::{self, DEFAULT_CONFIG, MicConfig, RawConfig, ResolvedConfig};
+use crate::platform::MicrophoneAccess;
+use crate::{hotkeys, platform};
 
 /// Something the tray can do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +23,8 @@ pub enum Action {
     /// Play the sound at this index of the [`ActionMap`]'s sound list.
     Play(usize),
     StopAll,
+    /// Turn the virtual mic on or off, and save that to the config.
+    ToggleMic,
     Reload,
     OpenConfigFolder,
     Quit,
@@ -28,6 +32,8 @@ pub enum Action {
 
 /// Menu id of the "Stop all" item.
 pub const MENU_STOP_ALL: &str = "stop-all";
+/// Menu id of the "Mic to call" item.
+pub const MENU_TOGGLE_MIC: &str = "toggle-mic";
 /// Menu id of the "Reload config" item.
 pub const MENU_RELOAD: &str = "reload";
 /// Menu id of the "Open config folder" item.
@@ -55,6 +61,7 @@ pub struct ActionMap {
     hotkeys: HashMap<u32, Action>,
     hotkey_list: Vec<HotKey>,
     master_gain: f32,
+    mic: MicConfig,
 }
 
 impl ActionMap {
@@ -85,6 +92,7 @@ impl ActionMap {
         }
         for (id, action) in [
             (MENU_STOP_ALL, Action::StopAll),
+            (MENU_TOGGLE_MIC, Action::ToggleMic),
             (MENU_RELOAD, Action::Reload),
             (MENU_OPEN_CONFIG, Action::OpenConfigFolder),
             (MENU_QUIT, Action::Quit),
@@ -98,6 +106,7 @@ impl ActionMap {
             hotkeys,
             hotkey_list,
             master_gain: config.master_gain,
+            mic: config.mic.clone(),
         }
     }
 
@@ -125,6 +134,11 @@ impl ActionMap {
     pub fn master_gain(&self) -> f32 {
         self.master_gain
     }
+
+    /// The validated `[mic]` table.
+    pub fn mic(&self) -> &MicConfig {
+        &self.mic
+    }
 }
 
 /// The audio controls the tray needs from the engine.
@@ -134,6 +148,21 @@ pub trait AudioControl {
     fn play(&self, sound: &Sound, gain: f32) -> bool;
     /// Queues a master gain change. Returns false if the engine rejected it.
     fn set_master_gain(&self, gain: f32) -> bool;
+    /// Turns the mic path on (`Some`), off (`None`) or changes it. Fails if
+    /// the mic path cannot be started; it is then off.
+    fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<()>;
+    /// Whether every mic path stopped so far has ended. False while a stop
+    /// that timed out left a mic stream running; true for a control
+    /// without threads of its own.
+    fn mic_stopped(&mut self) -> bool {
+        true
+    }
+    /// Starts a mic path that [`AudioControl::set_mic`] deferred until a
+    /// stopped one had ended; does nothing otherwise. Fails if it cannot be
+    /// started; it is then off.
+    fn resume_mic(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl AudioControl for Engine {
@@ -144,16 +173,503 @@ impl AudioControl for Engine {
     fn set_master_gain(&self, gain: f32) -> bool {
         Engine::set_master_gain(self, gain)
     }
+
+    fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<()> {
+        Engine::set_mic(self, settings).context("failed to start the mic path")
+    }
+
+    fn mic_stopped(&mut self) -> bool {
+        Engine::mic_stopped(self)
+    }
+
+    fn resume_mic(&mut self) -> Result<()> {
+        Engine::resume_mic(self).context("failed to start the mic path")
+    }
 }
 
-/// Applies the engine-wide parts of a config: the master gain. Called at
-/// startup and after every successful reload.
-pub fn apply_config(control: &impl AudioControl, map: &ActionMap) {
+/// The engine's mic settings for `mic`: `None` when the mic is off.
+/// See [`settings_for`].
+pub fn mic_settings(mic: &MicConfig, capture: bool) -> Option<MicSettings> {
+    mic.enabled.then(|| settings_for(mic, capture))
+}
+
+/// The engine's mic settings for `mic`, whether or not it is enabled.
+/// The capture refuses the platform's virtual inputs for the configured
+/// device. `capture` is false when the microphone may not be opened, so the
+/// mic sink carries the sounds only.
+pub fn settings_for(mic: &MicConfig, capture: bool) -> MicSettings {
+    MicSettings {
+        device_match: mic.virtual_device.clone(),
+        excluded_inputs: platform::virtual_input_exclusions(&mic.virtual_device),
+        sound_gain: mic.sound_gain,
+        mic_gain: mic.mic_gain,
+        capture,
+    }
+}
+
+/// Turns the OS microphone permission into the `capture` flag of
+/// [`mic_settings`], and warns once when a denial keeps the capture off.
+///
+/// The warning is logged only while the mic is enabled, and again only after
+/// the permission stopped being denied in between.
+#[derive(Debug, Default)]
+pub struct CaptureGate {
+    denial_logged: bool,
+    /// The last decision, which the caller applied.
+    decided: Option<bool>,
+}
+
+impl CaptureGate {
+    /// Whether the capture may be opened for `mic` under `access`.
+    pub fn capture(&mut self, access: MicrophoneAccess, mic: &MicConfig) -> bool {
+        let allowed = access.allows_capture();
+        self.decided = Some(allowed);
+        if allowed {
+            self.denial_logged = false;
+        } else if mic.enabled && !self.denial_logged {
+            self.denial_logged = true;
+            tracing::warn!(
+                "microphone access is denied; the virtual mic carries the sounds only. \
+                 Allow Sound-Babound under System Settings > Privacy & Security > Microphone"
+            );
+        }
+        allowed
+    }
+}
+
+/// Re-reads the microphone permission (`access`) while `mic` is enabled and,
+/// if it changed the capture flag since the gate's last decision, re-applies
+/// the mic path with the new flag. The tray calls it on every mic poll, so a
+/// permission granted or denied while the app runs (including the answer to
+/// the first-run prompt) takes effect without a toggle or a reload. Returns
+/// whether the mic path was re-applied.
+pub fn recheck_capture(
+    control: &mut impl AudioControl,
+    mic: &MicConfig,
+    gate: &mut CaptureGate,
+    access: MicrophoneAccess,
+) -> bool {
+    if !mic.enabled {
+        return false;
+    }
+    let before = gate.decided;
+    let capture = gate.capture(access, mic);
+    if before == Some(capture) {
+        return false;
+    }
+    apply_mic(control, mic, capture);
+    true
+}
+
+/// Applies the engine-wide parts of a config: the master gain and the mic
+/// path (see [`mic_settings`] for `capture`). Called at startup and after
+/// every successful reload. A mic path that fails to start is logged, and
+/// the app runs without it.
+pub fn apply_config(control: &mut impl AudioControl, map: &ActionMap, capture: bool) {
     if !control.set_master_gain(map.master_gain()) {
         tracing::warn!(
             master_gain = map.master_gain(),
             "engine command queue is full; master gain not applied"
         );
+    }
+    apply_mic(control, map.mic(), capture);
+}
+
+/// Turns the mic path on, off or changes it to match `mic`. A failure is
+/// logged; the mic path is then off.
+fn apply_mic(control: &mut impl AudioControl, mic: &MicConfig, capture: bool) {
+    if let Err(err) = control.set_mic(mic_settings(mic, capture)) {
+        tracing::error!("{err:#}; running without the mic path");
+    }
+}
+
+/// The tray's "Mic to call" toggle.
+///
+/// Flips `[mic] enabled` on `board`, saves it to the config file at `path`
+/// and applies the mic path. A save that fails (or no known config file) is
+/// logged, and the change still applies until the app quits. `capture`
+/// decides the capture flag from the flipped `[mic]` config. Returns whether
+/// the mic is now enabled.
+pub fn toggle_mic(
+    control: &mut impl AudioControl,
+    board: &mut Soundboard,
+    path: Option<&Path>,
+    capture: impl FnOnce(&MicConfig) -> bool,
+) -> bool {
+    let enabled = !board.map.mic.enabled;
+    board.map.mic.enabled = enabled;
+    match path {
+        Some(path) => {
+            if let Err(err) = config::set_mic_enabled(path, enabled) {
+                tracing::warn!("{err:#}; the mic setting applies until the app quits");
+            }
+        }
+        None => tracing::warn!(
+            "the config file location is unknown; the mic setting applies until the app quits"
+        ),
+    }
+    let mic = board.map().mic();
+    let capture = capture(mic);
+    apply_mic(control, mic, capture);
+    tracing::info!(enabled, "virtual mic toggled");
+    enabled
+}
+
+/// The text of the tray's "Mic to call" item.
+pub fn mic_toggle_label(enabled: bool) -> &'static str {
+    if enabled {
+        "Mic to call: on"
+    } else {
+        "Mic to call: off"
+    }
+}
+
+/// The text of the tray's mic status line. `not_found` is the platform's
+/// note for a virtual device that no output matches (see
+/// `platform::virtual_mic_not_found`). The capture state is appended only
+/// when the microphone cannot be heard.
+pub fn mic_status_label(status: &MicStatus, not_found: &str) -> String {
+    match status {
+        MicStatus::Off => "Virtual mic: off".to_string(),
+        MicStatus::Starting => "Virtual mic: starting".to_string(),
+        MicStatus::NotFound(_) => format!("Virtual mic: {not_found}"),
+        MicStatus::Failed(_) => "Virtual mic: error, see log".to_string(),
+        MicStatus::Active { device, capture } => match capture {
+            CaptureStatus::Running(_) | CaptureStatus::Starting => {
+                format!("Virtual mic: {device} (active)")
+            }
+            CaptureStatus::Disabled => {
+                format!("Virtual mic: {device} (active, microphone access denied)")
+            }
+            CaptureStatus::Unavailable(_) => {
+                format!("Virtual mic: {device} (active, microphone unavailable)")
+            }
+        },
+    }
+}
+
+/// An [`AudioControl`] that keeps the virtual device the app creates itself
+/// (on Linux) in step with the mic path.
+///
+/// Turning the mic path on creates the device first, if it does not exist
+/// yet; turning it off (or a mic path that fails to start) drops the device
+/// after the engine has stopped using it. If the engine's stop timed out
+/// (a mic supervisor is still blocked in a device query and may still hold
+/// its stream), the device and its lock are kept as retired until
+/// [`AudioControl::mic_stopped`] says the stream has ended
+/// ([`WithVirtualMic::release_retired`]); unloading it under a live stream
+/// would let the server move the stream, the live microphone included, to
+/// the speakers. A mic turned on again meanwhile reuses it.
+///
+/// The mic path runs only while this process owns the device: a device
+/// that cannot be created is logged and
+/// the mic path stays stopped, waiting for it
+/// ([`WithVirtualMic::waiting_for_device`], shown as not found), and
+/// [`WithVirtualMic::restore_device`] tries again and starts it once the
+/// device exists. The device's names are fixed, so a mic path started
+/// without it could find another instance's device (creating it fails on
+/// that instance's lock) and play the live microphone into it, or, once that
+/// instance unloads it, onto the speakers the server moves the stream to.
+/// `create` returns `Ok(None)` on the OSes where the user installs the
+/// device; the mic path then always starts.
+pub struct WithVirtualMic<C, G, F> {
+    control: C,
+    device: Option<G>,
+    /// The device after the mic path stopped while a mic stream may still
+    /// run (see [`WithVirtualMic::release_retired`]). Never set together
+    /// with `device`.
+    retired: Option<G>,
+    create: F,
+    /// The settings of the enabled mic; `None` while the mic is off.
+    settings: Option<MicSettings>,
+    /// Whether the engine's mic path runs. False while `settings` is set
+    /// means the mic path waits for the device.
+    running: bool,
+    /// The last attempt to create the device failed (so repeats log at
+    /// debug).
+    create_failed: bool,
+    /// When [`WithVirtualMic::restore_device`] may next check the device.
+    next_check: Option<Instant>,
+}
+
+/// How often [`WithVirtualMic::restore_device`] asks whether the virtual
+/// device still exists. Each check runs `pactl` on the caller's thread.
+pub const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A virtual device the app created itself, which can vanish behind its
+/// back: a sound server restart drops the modules behind the Linux one.
+pub trait VirtualDevice {
+    /// Whether the device still exists; true when that cannot be told.
+    fn is_present(&mut self) -> bool;
+}
+
+impl VirtualDevice for platform::VirtualMic {
+    fn is_present(&mut self) -> bool {
+        platform::VirtualMic::is_present(self)
+    }
+}
+
+impl<C, G, F> WithVirtualMic<C, G, F>
+where
+    F: FnMut() -> Result<Option<G>>,
+{
+    pub fn new(control: C, create: F) -> Self {
+        WithVirtualMic {
+            control,
+            device: None,
+            retired: None,
+            create,
+            settings: None,
+            running: false,
+            create_failed: false,
+            next_check: None,
+        }
+    }
+
+    /// The wrapped control.
+    pub fn control(&self) -> &C {
+        &self.control
+    }
+
+    /// The virtual device pattern while the mic is on but its path waits for
+    /// the device to be created; `None` otherwise.
+    pub fn waiting_for_device(&self) -> Option<&str> {
+        match &self.settings {
+            Some(settings) if !self.running => Some(&settings.device_match),
+            _ => None,
+        }
+    }
+
+    /// Whether the virtual device currently exists.
+    #[cfg(test)]
+    fn has_device(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// Whether a retired device waits for a mic stream to end.
+    pub fn has_retired_device(&self) -> bool {
+        self.retired.is_some()
+    }
+
+    /// Hands the control to `stop` (the engine shuts down, returning whether
+    /// every stream ended), then drops the virtual device, so no stream is
+    /// left writing to it. If a stream may still run, the device is left
+    /// loaded instead (the next start unloads it as stale): the process
+    /// ends right after, and that ends the stream without moving it.
+    pub fn shutdown(self, stop: impl FnOnce(C) -> bool) {
+        let WithVirtualMic {
+            control,
+            device,
+            retired,
+            ..
+        } = self;
+        if stop(control) {
+            drop(device);
+            drop(retired);
+        } else if device.is_some() || retired.is_some() {
+            tracing::warn!(
+                "a mic stream did not stop in time; the virtual mic stays loaded until the next start"
+            );
+            std::mem::forget(device);
+            std::mem::forget(retired);
+        }
+    }
+}
+
+impl<C, G, F> WithVirtualMic<C, G, F>
+where
+    C: AudioControl,
+    F: FnMut() -> Result<Option<G>>,
+{
+    /// Creates the device, or takes back the retired one, which this
+    /// process still owns; true if that worked (also when `create` makes
+    /// none). A failure is logged (at error for the first of a streak, at
+    /// debug for repeats). While a retired device waits for a mic stream
+    /// that did not stop in time, this fails without creating anything, so
+    /// a new mic path never runs beside the old one; the path waits, and
+    /// [`WithVirtualMic::release_retired`] starts it once the old stream
+    /// has ended.
+    fn create_device(&mut self) -> bool {
+        if self.retired.is_some() {
+            if !self.control.mic_stopped() {
+                tracing::debug!("the stopped mic stream has not ended; the mic path waits for it");
+                return false;
+            }
+            self.device = self.retired.take();
+            return true;
+        }
+        match (self.create)() {
+            Ok(device) => {
+                if self.create_failed {
+                    tracing::info!("the virtual mic is created");
+                }
+                self.device = device;
+                self.create_failed = false;
+                true
+            }
+            Err(err) => {
+                if self.create_failed {
+                    tracing::debug!("{err:#}; the virtual mic is still unavailable");
+                } else {
+                    tracing::error!(
+                        "{err:#}; the virtual mic is unavailable, the mic path waits for it"
+                    );
+                }
+                self.create_failed = true;
+                false
+            }
+        }
+    }
+
+    /// Starts (or updates) the mic path with the stored settings. If that
+    /// fails, the mic is treated as off and the device is dropped (or
+    /// retired).
+    fn start_path(&mut self) -> Result<()> {
+        let result = self.control.set_mic(self.settings.clone());
+        self.running = result.is_ok();
+        if result.is_err() {
+            self.settings = None;
+            self.drop_device();
+            self.create_failed = false;
+        }
+        result
+    }
+
+    /// Drops the device once the mic path is stopped, or retires it if a
+    /// mic stream may still run (see [`WithVirtualMic::release_retired`]).
+    fn drop_device(&mut self) {
+        let Some(device) = self.device.take() else {
+            return;
+        };
+        if self.control.mic_stopped() {
+            drop(device);
+        } else {
+            tracing::warn!(
+                "a mic stream did not stop in time; keeping the virtual mic until it does"
+            );
+            self.retired = Some(device);
+        }
+    }
+
+    /// Once every mic stream has ended, starts the mic path on the retired
+    /// device if the mic path waits for it (the mic was turned on again
+    /// meanwhile), and otherwise drops it. The tray calls it every mic poll
+    /// while there is one.
+    pub fn release_retired(&mut self) {
+        if self.retired.is_none() || !self.control.mic_stopped() {
+            return;
+        }
+        if self.settings.is_some() && !self.running && self.device.is_none() {
+            tracing::info!("the stopped mic stream has ended; starting the mic path");
+            self.device = self.retired.take();
+            if let Err(err) = self.start_path() {
+                tracing::error!("{err:#}; the mic path did not start");
+            }
+        } else {
+            tracing::info!("the stopped mic stream has ended; dropping the virtual mic");
+            self.retired = None;
+        }
+    }
+
+    /// Stops the mic path if it runs; the settings stay, so it waits for the
+    /// device.
+    fn stop_path(&mut self) -> Result<()> {
+        if !self.running {
+            return Ok(());
+        }
+        self.running = false;
+        self.control.set_mic(None)
+    }
+}
+
+impl<C, G, F> WithVirtualMic<C, G, F>
+where
+    C: AudioControl,
+    G: VirtualDevice,
+    F: FnMut() -> Result<Option<G>>,
+{
+    /// Creates the virtual device again if it is gone (for example, the
+    /// sound server restarted and dropped its modules) or if the mic path
+    /// waits for it because creating it failed (for example, the sound
+    /// server was not up yet), and then starts the mic path. A vanished
+    /// device stops the mic path before it is dropped, so the path never
+    /// runs without it. Does nothing with the mic off or no device to look
+    /// after (the user installs the device), and acts at most every
+    /// [`DEVICE_CHECK_INTERVAL`]. The tray calls it while the mic status is
+    /// not found.
+    pub fn restore_device(&mut self, now: Instant) {
+        if self.settings.is_none() || (self.device.is_none() && self.running) {
+            return;
+        }
+        if self.next_check.is_some_and(|next| now < next) {
+            return;
+        }
+        self.next_check = Some(now + DEVICE_CHECK_INTERVAL);
+        if let Some(device) = &mut self.device {
+            if device.is_present() {
+                return;
+            }
+            tracing::warn!(
+                "the virtual mic is gone (did the sound server restart?); creating it again"
+            );
+            if let Err(err) = self.stop_path() {
+                tracing::error!("{err:#}; could not stop the mic path");
+            }
+            // Its modules are gone already, so dropping it unloads nothing.
+            self.device = None;
+        }
+        if self.create_device()
+            && let Err(err) = self.start_path()
+        {
+            tracing::error!("{err:#}; the mic path did not start");
+        }
+    }
+}
+
+impl<C, G, F> AudioControl for WithVirtualMic<C, G, F>
+where
+    C: AudioControl,
+    F: FnMut() -> Result<Option<G>>,
+{
+    fn play(&self, sound: &Sound, gain: f32) -> bool {
+        self.control.play(sound, gain)
+    }
+
+    fn set_master_gain(&self, gain: f32) -> bool {
+        self.control.set_master_gain(gain)
+    }
+
+    fn mic_stopped(&mut self) -> bool {
+        self.control.mic_stopped()
+    }
+
+    /// Like a failed start, a failed deferred start turns the mic off and
+    /// drops (or retires) the device.
+    fn resume_mic(&mut self) -> Result<()> {
+        let result = self.control.resume_mic();
+        if result.is_err() {
+            self.running = false;
+            self.settings = None;
+            self.drop_device();
+            self.create_failed = false;
+        }
+        result
+    }
+
+    fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<()> {
+        let Some(settings) = settings else {
+            let result = self.control.set_mic(None);
+            self.running = false;
+            self.settings = None;
+            self.drop_device();
+            self.create_failed = false;
+            return result;
+        };
+        self.settings = Some(settings);
+        if self.device.is_none() && !self.create_device() {
+            return self.stop_path();
+        }
+        self.start_path()
     }
 }
 
@@ -246,17 +762,27 @@ pub fn fallback_board() -> Result<Soundboard> {
     board_from_text(DEFAULT_CONFIG, Path::new(".")).context("built-in default config is invalid")
 }
 
-/// The board to start with. Falls back to the built-in default config only
-/// if the config file is unknown or unreadable; a malformed config file is
-/// an error.
+/// The board to start with. Falls back to the built-in default config if
+/// the config file is unknown, unreadable or malformed, so the tray always
+/// starts. A malformed file is logged at error level with its path; the
+/// caller keeps the path, so the fixed file can be loaded with a reload.
 pub fn startup_board(path: Option<&Path>) -> Result<Soundboard> {
     let Some(path) = path else {
         tracing::warn!("no config file; using the built-in default config");
         return fallback_board();
     };
     match fs::read_to_string(path) {
-        Ok(text) => board_from_text(&text, config_dir_of(path))
-            .with_context(|| format!("failed to parse config {}", path.display())),
+        Ok(text) => match board_from_text(&text, config_dir_of(path)) {
+            Ok(board) => Ok(board),
+            Err(err) => {
+                tracing::error!(
+                    path = %path.display(),
+                    "failed to parse config: {err:#}; using the built-in default config \
+                     until the file is fixed and reloaded"
+                );
+                fallback_board()
+            }
+        },
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
@@ -270,24 +796,28 @@ pub fn startup_board(path: Option<&Path>) -> Result<Soundboard> {
 /// Reloads the config at `path`.
 ///
 /// On success `install` receives the new board (to swap hotkeys and the
-/// menu), then [`apply_config`] sends the new master gain to `control`, and
-/// the board is returned for the caller to keep. If loading or `install`
-/// fails, `control` is not touched and the error is returned.
+/// menu), then [`apply_config`] sends the new master gain and mic settings to
+/// `control`, and the board is returned for the caller to keep. `capture`
+/// decides the capture flag from the new `[mic]` config. If loading or
+/// `install` fails, `control` is not touched and the error is returned.
 pub fn reload(
-    control: &impl AudioControl,
+    control: &mut impl AudioControl,
     path: &Path,
+    capture: impl FnOnce(&MicConfig) -> bool,
     install: impl FnOnce(&Soundboard) -> Result<()>,
 ) -> Result<Soundboard> {
     let board = load_board(path)?;
     install(&board)?;
-    apply_config(control, board.map());
+    let capture = capture(board.map().mic());
+    apply_config(control, board.map(), capture);
     Ok(board)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
+    use std::rc::Rc;
 
     use global_hotkey::hotkey::{Code, Modifiers};
 
@@ -295,11 +825,14 @@ mod tests {
     use crate::config::{ResolvedSound, SoundSource};
     use crate::test_support::TempDir;
 
-    /// Records every call; `accept` decides the return value.
+    /// Records every call; `accept` decides the return value of the queue
+    /// pushes and `fail_mic` makes `set_mic` fail.
     struct FakeAudio {
         plays: RefCell<Vec<(String, f32)>>,
         gains: RefCell<Vec<f32>>,
+        mics: Vec<Option<MicSettings>>,
         accept: bool,
+        fail_mic: bool,
     }
 
     impl FakeAudio {
@@ -307,7 +840,9 @@ mod tests {
             FakeAudio {
                 plays: RefCell::new(Vec::new()),
                 gains: RefCell::new(Vec::new()),
+                mics: Vec::new(),
                 accept: true,
+                fail_mic: false,
             }
         }
     }
@@ -323,6 +858,14 @@ mod tests {
         fn set_master_gain(&self, gain: f32) -> bool {
             self.gains.borrow_mut().push(gain);
             self.accept
+        }
+
+        fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<()> {
+            self.mics.push(settings);
+            if self.fail_mic {
+                anyhow::bail!("no thread for you");
+            }
+            Ok(())
         }
     }
 
@@ -349,6 +892,16 @@ mod tests {
                 entry("no hotkey", None),
                 entry("three", Some(hk(Code::Digit3))),
             ],
+            mic: MicConfig::default(),
+        }
+    }
+
+    fn mic_on(device: &str) -> MicConfig {
+        MicConfig {
+            enabled: true,
+            virtual_device: device.into(),
+            sound_gain: 0.5,
+            mic_gain: 2.0,
         }
     }
 
@@ -402,6 +955,7 @@ mod tests {
             master_gain: 1.0,
             stop_all_hotkey: None,
             sounds: Vec::new(),
+            mic: MicConfig::default(),
         });
         assert!(map.sound_items().is_empty());
         assert!(map.hotkeys().is_empty());
@@ -422,19 +976,19 @@ mod tests {
 
     #[test]
     fn apply_config_sets_master_gain() {
-        let fake = FakeAudio::new();
-        apply_config(&fake, &ActionMap::new(&sample_config()));
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, &ActionMap::new(&sample_config()), true);
         assert_eq!(*fake.gains.borrow(), [0.75]);
         assert!(fake.plays.borrow().is_empty());
     }
 
     #[test]
     fn apply_config_survives_a_full_queue() {
-        let fake = FakeAudio {
+        let mut fake = FakeAudio {
             accept: false,
             ..FakeAudio::new()
         };
-        apply_config(&fake, &ActionMap::new(&sample_config()));
+        apply_config(&mut fake, &ActionMap::new(&sample_config()), true);
         assert_eq!(*fake.gains.borrow(), [0.75]);
     }
 
@@ -443,8 +997,8 @@ mod tests {
         let dir = TempDir::new("actions-startup");
         let path = write_config(&dir, "master_gain = 0.5\n");
         let board = startup_board(Some(&path)).unwrap();
-        let fake = FakeAudio::new();
-        apply_config(&fake, board.map());
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, board.map(), true);
         assert_eq!(*fake.gains.borrow(), [0.5]);
     }
 
@@ -463,19 +1017,52 @@ mod tests {
     }
 
     #[test]
-    fn startup_rejects_a_malformed_config() {
+    fn startup_falls_back_on_malformed_config() {
         let dir = TempDir::new("actions-malformed");
         let path = write_config(&dir, "master_gain = [\n");
-        let message = format!("{:#}", startup_board(Some(&path)).unwrap_err());
-        assert!(message.contains(&path.display().to_string()), "{message}");
+        let board = startup_board(Some(&path)).unwrap();
+        let labels: Vec<_> = board.map().sound_items().iter().map(|i| &i.label).collect();
+        assert_eq!(labels, ["Demo chime"]);
+        assert_eq!(board.map().master_gain(), 1.0);
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, board.map(), true);
+        assert_eq!(*fake.gains.borrow(), [1.0]);
+    }
+
+    #[test]
+    fn reload_after_a_malformed_startup_installs_the_fixed_file() {
+        let dir = TempDir::new("actions-malformed-fixed");
+        let path = write_config(&dir, "master_gain = [\n");
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, startup_board(Some(&path)).unwrap().map(), true);
+
+        fs::write(
+            &path,
+            "master_gain = 0.5\n[[sound]]\nname = \"fixed\"\npath = \"builtin:demo\"\n",
+        )
+        .unwrap();
+        let mut installed = Vec::new();
+        let board = reload(
+            &mut fake,
+            &path,
+            |_| true,
+            |board| {
+                installed.extend(board.map().sound_items().iter().map(|i| i.label.clone()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(installed, ["fixed"]);
+        assert_eq!(board.map().master_gain(), 0.5);
+        assert_eq!(*fake.gains.borrow(), [1.0, 0.5]);
     }
 
     #[test]
     fn successful_reload_installs_and_applies_the_new_gain() {
         let dir = TempDir::new("actions-reload");
         let path = write_config(&dir, "master_gain = 1.0\n");
-        let fake = FakeAudio::new();
-        apply_config(&fake, startup_board(Some(&path)).unwrap().map());
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, startup_board(Some(&path)).unwrap().map(), true);
 
         fs::write(
             &path,
@@ -483,10 +1070,15 @@ mod tests {
         )
         .unwrap();
         let mut installed = Vec::new();
-        let board = reload(&fake, &path, |board| {
-            installed.push(board.map().sound_items().len());
-            Ok(())
-        })
+        let board = reload(
+            &mut fake,
+            &path,
+            |_| true,
+            |board| {
+                installed.push(board.map().sound_items().len());
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(installed, [1]);
         assert_eq!(board.map().master_gain(), 2.5);
@@ -497,12 +1089,17 @@ mod tests {
     fn failed_reload_leaves_the_engine_untouched() {
         let dir = TempDir::new("actions-reload-bad");
         let path = write_config(&dir, "master_gain = [\n");
-        let fake = FakeAudio::new();
+        let mut fake = FakeAudio::new();
         let mut installed = false;
-        let err = reload(&fake, &path, |_| {
-            installed = true;
-            Ok(())
-        })
+        let err = reload(
+            &mut fake,
+            &path,
+            |_| true,
+            |_| {
+                installed = true;
+                Ok(())
+            },
+        )
         .unwrap_err();
         assert!(format!("{err:#}").contains("config"), "{err:#}");
         assert!(!installed);
@@ -512,24 +1109,31 @@ mod tests {
         // A missing file is a failed reload too.
         fs::remove_file(&path).unwrap();
         assert!(
-            reload(&fake, &path, |_| {
-                installed = true;
-                Ok(())
-            })
+            reload(
+                &mut fake,
+                &path,
+                |_| true,
+                |_| {
+                    installed = true;
+                    Ok(())
+                }
+            )
             .is_err()
         );
         assert!(!installed);
         assert!(fake.gains.borrow().is_empty());
+        assert!(fake.mics.is_empty());
     }
 
     #[test]
     fn failed_install_does_not_apply_the_config() {
         let dir = TempDir::new("actions-install-bad");
         let path = write_config(&dir, "master_gain = 0.25\n");
-        let fake = FakeAudio::new();
-        let err = reload(&fake, &path, |_| anyhow::bail!("menu failed")).unwrap_err();
+        let mut fake = FakeAudio::new();
+        let err = reload(&mut fake, &path, |_| true, |_| anyhow::bail!("menu failed")).unwrap_err();
         assert!(err.to_string().contains("menu failed"));
         assert!(fake.gains.borrow().is_empty());
+        assert!(fake.mics.is_empty());
     }
 
     #[test]
@@ -566,5 +1170,937 @@ mod tests {
         };
         board.play(0, &fake);
         assert_eq!(fake.plays.borrow().len(), 1);
+    }
+
+    #[test]
+    fn apply_config_turns_the_mic_off_when_disabled() {
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, &ActionMap::new(&sample_config()), true);
+        assert_eq!(fake.mics, [None]);
+    }
+
+    #[test]
+    fn mic_settings_follow_the_config_and_the_platform_exclusions() {
+        assert_eq!(mic_settings(&MicConfig::default(), true), None);
+        for capture in [true, false] {
+            assert_eq!(
+                mic_settings(&mic_on("My Cable"), capture),
+                Some(MicSettings {
+                    device_match: "My Cable".into(),
+                    excluded_inputs: platform::virtual_input_exclusions("My Cable"),
+                    sound_gain: 0.5,
+                    mic_gain: 2.0,
+                    capture,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn apply_config_sends_the_mic_settings() {
+        let config = ResolvedConfig {
+            mic: mic_on("My Cable"),
+            ..sample_config()
+        };
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, &ActionMap::new(&config), false);
+        assert_eq!(*fake.gains.borrow(), [0.75]);
+        assert_eq!(fake.mics, [mic_settings(&config.mic, false)]);
+        let sent = fake.mics[0].as_ref().unwrap();
+        assert!(!sent.capture);
+        assert_eq!(sent.device_match, "My Cable");
+    }
+
+    #[test]
+    fn apply_config_survives_a_mic_that_fails_to_start() {
+        let config = ResolvedConfig {
+            mic: mic_on("My Cable"),
+            ..sample_config()
+        };
+        let mut fake = FakeAudio {
+            fail_mic: true,
+            ..FakeAudio::new()
+        };
+        apply_config(&mut fake, &ActionMap::new(&config), true);
+        assert_eq!(*fake.gains.borrow(), [0.75]);
+        assert_eq!(fake.mics.len(), 1);
+    }
+
+    #[test]
+    fn reload_applies_the_mic_table() {
+        let dir = TempDir::new("actions-reload-mic");
+        let path = write_config(&dir, "master_gain = 1.0\n");
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, startup_board(Some(&path)).unwrap().map(), true);
+
+        fs::write(
+            &path,
+            "[mic]\nenabled = true\nvirtual_device = \"Cable\"\nmic_gain = 0.25\n",
+        )
+        .unwrap();
+        let board = reload(&mut fake, &path, |_| true, |_| Ok(())).unwrap();
+        assert!(board.map().mic().enabled);
+        assert_eq!(fake.mics.len(), 2);
+        assert_eq!(fake.mics[0], None);
+        let sent = fake.mics[1].as_ref().unwrap();
+        assert_eq!(sent.device_match, "Cable");
+        assert_eq!(sent.mic_gain, 0.25);
+        assert_eq!(sent.sound_gain, 1.0);
+        assert!(sent.capture);
+
+        // Turning it off again in the file turns the mic path off.
+        fs::write(&path, "[mic]\nenabled = false\n").unwrap();
+        reload(&mut fake, &path, |_| true, |_| Ok(())).unwrap();
+        assert_eq!(fake.mics.last(), Some(&None));
+    }
+
+    #[test]
+    fn only_a_denied_microphone_turns_the_capture_off() {
+        let mic = mic_on("Cable");
+        for access in [
+            MicrophoneAccess::Granted,
+            MicrophoneAccess::Undetermined,
+            MicrophoneAccess::Unknown,
+        ] {
+            assert!(CaptureGate::default().capture(access, &mic), "{access:?}");
+        }
+        assert!(!CaptureGate::default().capture(MicrophoneAccess::Denied, &mic));
+    }
+
+    #[test]
+    fn a_denial_is_logged_once_per_change_and_only_with_the_mic_on() {
+        let mut gate = CaptureGate::default();
+        let off = MicConfig::default();
+        assert!(!gate.capture(MicrophoneAccess::Denied, &off));
+        assert!(!gate.denial_logged, "no warning while the mic is off");
+
+        let on = mic_on("Cable");
+        assert!(!gate.capture(MicrophoneAccess::Denied, &on));
+        assert!(gate.denial_logged);
+        assert!(!gate.capture(MicrophoneAccess::Denied, &on));
+        assert!(gate.denial_logged, "still denied: no second warning");
+
+        assert!(gate.capture(MicrophoneAccess::Granted, &on));
+        assert!(!gate.denial_logged, "a grant re-arms the warning");
+    }
+
+    #[test]
+    fn recheck_reapplies_the_mic_only_when_the_capture_flag_changes() {
+        let mut fake = FakeAudio::new();
+        let mut gate = CaptureGate::default();
+        let on = mic_on("Cable");
+        // Startup: the permission is not asked yet, so the capture opens.
+        assert!(gate.capture(MicrophoneAccess::Undetermined, &on));
+
+        // Still allowed (the prompt was answered "allow"): nothing to do.
+        assert!(!recheck_capture(
+            &mut fake,
+            &on,
+            &mut gate,
+            MicrophoneAccess::Granted
+        ));
+        assert!(fake.mics.is_empty());
+
+        // Denied at the prompt: the mic path restarts without the capture.
+        assert!(recheck_capture(
+            &mut fake,
+            &on,
+            &mut gate,
+            MicrophoneAccess::Denied
+        ));
+        assert_eq!(fake.mics, [mic_settings(&on, false)]);
+        assert!(gate.denial_logged);
+        assert!(!recheck_capture(
+            &mut fake,
+            &on,
+            &mut gate,
+            MicrophoneAccess::Denied
+        ));
+        assert_eq!(fake.mics.len(), 1);
+
+        // Allowed later in System Settings: the capture comes back.
+        assert!(recheck_capture(
+            &mut fake,
+            &on,
+            &mut gate,
+            MicrophoneAccess::Granted
+        ));
+        assert_eq!(fake.mics[1], mic_settings(&on, true));
+    }
+
+    #[test]
+    fn recheck_does_nothing_with_the_mic_off() {
+        let mut fake = FakeAudio::new();
+        let mut gate = CaptureGate::default();
+        let off = MicConfig::default();
+        assert!(gate.capture(MicrophoneAccess::Granted, &off));
+        assert!(!recheck_capture(
+            &mut fake,
+            &off,
+            &mut gate,
+            MicrophoneAccess::Denied
+        ));
+        assert!(fake.mics.is_empty());
+        assert!(!gate.denial_logged);
+    }
+
+    #[test]
+    fn reload_decides_the_capture_from_the_new_mic_config() {
+        let dir = TempDir::new("actions-reload-capture");
+        let path = write_config(&dir, "[mic]\nenabled = true\nvirtual_device = \"Cable\"\n");
+        let mut fake = FakeAudio::new();
+        let mut seen = None;
+        reload(
+            &mut fake,
+            &path,
+            |mic| {
+                seen = Some(mic.clone());
+                false
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        let seen = seen.unwrap();
+        assert!(seen.enabled);
+        assert_eq!(seen.virtual_device, "Cable");
+        assert!(!fake.mics[0].as_ref().unwrap().capture);
+    }
+
+    #[test]
+    fn the_mic_toggle_maps_to_its_action() {
+        let map = ActionMap::new(&sample_config());
+        assert_eq!(map.for_menu_id(MENU_TOGGLE_MIC), Some(Action::ToggleMic));
+    }
+
+    #[test]
+    fn mic_toggle_label_names_the_state() {
+        assert_eq!(mic_toggle_label(true), "Mic to call: on");
+        assert_eq!(mic_toggle_label(false), "Mic to call: off");
+    }
+
+    #[test]
+    fn mic_status_labels_cover_every_status() {
+        let hint = "not found, install BlackHole";
+        let active = |capture| MicStatus::Active {
+            device: "BlackHole 2ch".into(),
+            capture,
+        };
+        let cases = [
+            (MicStatus::Off, "Virtual mic: off"),
+            (MicStatus::Starting, "Virtual mic: starting"),
+            (
+                MicStatus::NotFound("BlackHole".into()),
+                "Virtual mic: not found, install BlackHole",
+            ),
+            (
+                MicStatus::Failed("device busy".into()),
+                "Virtual mic: error, see log",
+            ),
+            (
+                active(CaptureStatus::Running("MacBook Mic".into())),
+                "Virtual mic: BlackHole 2ch (active)",
+            ),
+            (
+                active(CaptureStatus::Starting),
+                "Virtual mic: BlackHole 2ch (active)",
+            ),
+            (
+                active(CaptureStatus::Disabled),
+                "Virtual mic: BlackHole 2ch (active, microphone access denied)",
+            ),
+            (
+                active(CaptureStatus::Unavailable("no input".into())),
+                "Virtual mic: BlackHole 2ch (active, microphone unavailable)",
+            ),
+        ];
+        for (status, label) in cases {
+            assert_eq!(mic_status_label(&status, hint), label, "{status:?}");
+        }
+        // The platform note is used verbatim, so Linux reads naturally.
+        assert_eq!(
+            mic_status_label(
+                &MicStatus::NotFound("sound_babound_sink".into()),
+                "could not create it, see log"
+            ),
+            "Virtual mic: could not create it, see log"
+        );
+    }
+
+    const MIC_CONFIG: &str = "# my comment\nmaster_gain = 0.5\n\n\
+                              [mic]\nenabled = false # keep me\nvirtual_device = \"Cable\"\n";
+
+    #[test]
+    fn toggle_mic_persists_and_applies() {
+        let dir = TempDir::new("actions-toggle");
+        let path = write_config(&dir, MIC_CONFIG);
+        let mut board = load_board(&path).unwrap();
+        let mut fake = FakeAudio::new();
+
+        assert!(toggle_mic(&mut fake, &mut board, Some(&path), |_| true));
+        assert!(board.map().mic().enabled);
+        assert_eq!(fake.mics, [mic_settings(board.map().mic(), true)]);
+        assert_eq!(fake.mics[0].as_ref().unwrap().device_match, "Cable");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("enabled = true # keep me"), "{text}");
+        assert!(text.contains("# my comment"), "{text}");
+        assert!(load_board(&path).unwrap().map().mic().enabled);
+
+        assert!(!toggle_mic(&mut fake, &mut board, Some(&path), |_| true));
+        assert!(!board.map().mic().enabled);
+        assert_eq!(fake.mics.last(), Some(&None));
+        assert!(!load_board(&path).unwrap().map().mic().enabled);
+        // Only the mic changed: no gain or play was sent.
+        assert!(fake.gains.borrow().is_empty());
+        assert!(fake.plays.borrow().is_empty());
+    }
+
+    #[test]
+    fn toggle_mic_applies_even_when_saving_fails() {
+        let dir = TempDir::new("actions-toggle-bad");
+        // Startup fell back to the built-in config: the file is malformed.
+        let path = write_config(&dir, "master_gain = [\n");
+        let mut board = startup_board(Some(&path)).unwrap();
+        let mut fake = FakeAudio::new();
+
+        assert!(toggle_mic(&mut fake, &mut board, Some(&path), |_| true));
+        assert!(board.map().mic().enabled);
+        assert_eq!(fake.mics.len(), 1);
+        assert!(fake.mics[0].is_some());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "master_gain = [\n");
+
+        // No config file at all: applied too.
+        let mut board = fallback_board().unwrap();
+        assert!(toggle_mic(&mut fake, &mut board, None, |_| true));
+        assert_eq!(fake.mics.len(), 2);
+        assert!(fake.mics[1].is_some());
+    }
+
+    #[test]
+    fn toggle_mic_decides_the_capture_from_the_flipped_config() {
+        let dir = TempDir::new("actions-toggle-capture");
+        let path = write_config(&dir, MIC_CONFIG);
+        let mut board = load_board(&path).unwrap();
+        let mut fake = FakeAudio::new();
+        let mut seen = None;
+        toggle_mic(&mut fake, &mut board, Some(&path), |mic| {
+            seen = Some(mic.enabled);
+            false
+        });
+        assert_eq!(seen, Some(true));
+        assert!(!fake.mics[0].as_ref().unwrap().capture);
+    }
+
+    #[test]
+    fn reload_with_a_changed_mic_table_keeps_hotkeys_and_sounds() {
+        let dir = TempDir::new("actions-reload-mic-only");
+        let sounds = "stop_all_hotkey = \"Ctrl+Shift+0\"\n\
+                      [[sound]]\nname = \"demo\"\npath = \"builtin:demo\"\nhotkey = \"Ctrl+Shift+1\"\n";
+        let path = write_config(
+            &dir,
+            &format!("{sounds}[mic]\nenabled = true\nmic_gain = 1.0\n"),
+        );
+        let before = load_board(&path).unwrap();
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, before.map(), true);
+
+        fs::write(
+            &path,
+            format!("{sounds}[mic]\nenabled = true\nmic_gain = 0.5\n"),
+        )
+        .unwrap();
+        let mut installed = None;
+        let after = reload(
+            &mut fake,
+            &path,
+            |_| true,
+            |board| {
+                installed = Some((
+                    board.map().hotkeys().to_vec(),
+                    board.map().sound_items().to_vec(),
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+        let (hotkeys, sounds) = installed.unwrap();
+        assert_eq!(hotkeys, before.map().hotkeys());
+        assert_eq!(sounds, before.map().sound_items());
+        assert_eq!(fake.mics.len(), 2);
+        assert_eq!(fake.mics[0].as_ref().unwrap().mic_gain, 1.0);
+        assert_eq!(fake.mics[1].as_ref().unwrap().mic_gain, 0.5);
+        assert_eq!(fake.mics[1], mic_settings(after.map().mic(), true));
+        // The master gain is re-sent unchanged.
+        assert_eq!(*fake.gains.borrow(), [1.0, 1.0]);
+    }
+
+    type Log = std::rc::Rc<RefCell<Vec<&'static str>>>;
+
+    /// Logs `set_mic` calls into a shared log, so their order against the
+    /// virtual device's creation and drop can be checked.
+    struct LoggingAudio {
+        log: Log,
+        fail_mic: bool,
+    }
+
+    impl AudioControl for LoggingAudio {
+        fn play(&self, _sound: &Sound, _gain: f32) -> bool {
+            self.log.borrow_mut().push("play");
+            true
+        }
+
+        fn set_master_gain(&self, _gain: f32) -> bool {
+            self.log.borrow_mut().push("gain");
+            true
+        }
+
+        fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<()> {
+            self.log.borrow_mut().push(if settings.is_some() {
+                "mic on"
+            } else {
+                "mic off"
+            });
+            if self.fail_mic {
+                anyhow::bail!("no thread for you");
+            }
+            Ok(())
+        }
+    }
+
+    /// Logs its drop.
+    struct FakeDevice(Log);
+
+    impl Drop for FakeDevice {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("device dropped");
+        }
+    }
+
+    fn with_device(
+        log: &Log,
+        fail_mic: bool,
+    ) -> WithVirtualMic<LoggingAudio, FakeDevice, impl FnMut() -> Result<Option<FakeDevice>>> {
+        let device_log = log.clone();
+        WithVirtualMic::new(
+            LoggingAudio {
+                log: log.clone(),
+                fail_mic,
+            },
+            move || {
+                device_log.borrow_mut().push("device created");
+                Ok(Some(FakeDevice(device_log.clone())))
+            },
+        )
+    }
+
+    fn on() -> Option<MicSettings> {
+        mic_settings(&mic_on("Cable"), true)
+    }
+
+    /// A control whose deferred mic start fails.
+    struct FailingResumeAudio(Log);
+
+    impl AudioControl for FailingResumeAudio {
+        fn play(&self, _sound: &Sound, _gain: f32) -> bool {
+            true
+        }
+
+        fn set_master_gain(&self, _gain: f32) -> bool {
+            true
+        }
+
+        fn set_mic(&mut self, _settings: Option<MicSettings>) -> Result<()> {
+            self.0.borrow_mut().push("mic deferred");
+            Ok(())
+        }
+
+        fn resume_mic(&mut self) -> Result<()> {
+            self.0.borrow_mut().push("mic resumed");
+            anyhow::bail!("no thread for you");
+        }
+    }
+
+    #[test]
+    fn a_failed_deferred_start_turns_the_mic_off_and_drops_the_device() {
+        let log = Log::default();
+        let device_log = log.clone();
+        let mut audio = WithVirtualMic::new(FailingResumeAudio(log.clone()), move || {
+            device_log.borrow_mut().push("device created");
+            Ok(Some(FakeDevice(device_log.clone())))
+        });
+        audio.set_mic(on()).unwrap();
+        assert!(audio.resume_mic().is_err());
+        assert!(!audio.has_device());
+        assert_eq!(audio.waiting_for_device(), None);
+        assert_eq!(
+            *log.borrow(),
+            [
+                "device created",
+                "mic deferred",
+                "mic resumed",
+                "device dropped"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_virtual_device_is_created_before_the_mic_starts_and_dropped_after_it_stops() {
+        let log = Log::default();
+        let mut audio = with_device(&log, false);
+        audio.set_mic(on()).unwrap();
+        // A gains-only change keeps the existing device.
+        audio.set_mic(on()).unwrap();
+        assert!(audio.has_device());
+        audio.set_mic(None).unwrap();
+        assert!(!audio.has_device());
+        // Off again: nothing to create or drop.
+        audio.set_mic(None).unwrap();
+        assert_eq!(
+            *log.borrow(),
+            [
+                "device created",
+                "mic on",
+                "mic on",
+                "mic off",
+                "device dropped",
+                "mic off"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mic_path_that_fails_to_start_drops_the_device() {
+        let log = Log::default();
+        let mut audio = with_device(&log, true);
+        assert!(audio.set_mic(on()).is_err());
+        assert!(!audio.has_device());
+        assert_eq!(
+            *log.borrow(),
+            ["device created", "mic on", "device dropped"]
+        );
+    }
+
+    #[test]
+    fn a_device_that_cannot_be_created_keeps_the_mic_path_stopped() {
+        let log = Log::default();
+        let attempts = std::rc::Rc::new(RefCell::new(0));
+        let counter = attempts.clone();
+        let mut audio = WithVirtualMic::new(
+            LoggingAudio {
+                log: log.clone(),
+                fail_mic: false,
+            },
+            move || -> Result<Option<FakeDevice>> {
+                *counter.borrow_mut() += 1;
+                anyhow::bail!("another Sound-Babound instance owns the virtual mic")
+            },
+        );
+        // Another instance's device may exist under the same name: the mic
+        // path must not start and find it.
+        audio.set_mic(on()).unwrap();
+        audio.set_mic(on()).unwrap();
+        assert!(!audio.has_device());
+        assert_eq!(audio.waiting_for_device(), Some("Cable"));
+        assert_eq!(*attempts.borrow(), 2);
+        assert!(log.borrow().is_empty());
+        audio.set_mic(None).unwrap();
+        assert_eq!(audio.waiting_for_device(), None);
+        assert_eq!(*log.borrow(), ["mic off"]);
+    }
+
+    /// A device whose presence the test controls; logs its checks and drop.
+    struct VanishingDevice {
+        log: Log,
+        present: Rc<Cell<bool>>,
+    }
+
+    impl VirtualDevice for VanishingDevice {
+        fn is_present(&mut self) -> bool {
+            self.log.borrow_mut().push("device checked");
+            self.present.get()
+        }
+    }
+
+    impl Drop for VanishingDevice {
+        fn drop(&mut self) {
+            self.log.borrow_mut().push("device dropped");
+        }
+    }
+
+    #[test]
+    fn a_vanished_device_is_created_again_at_most_every_check_interval() {
+        let log = Log::default();
+        let present = Rc::new(Cell::new(true));
+        let (device_log, device_present) = (log.clone(), present.clone());
+        let mut audio = WithVirtualMic::new(
+            LoggingAudio {
+                log: log.clone(),
+                fail_mic: false,
+            },
+            move || -> Result<Option<VanishingDevice>> {
+                device_log.borrow_mut().push("device created");
+                device_present.set(true);
+                Ok(Some(VanishingDevice {
+                    log: device_log.clone(),
+                    present: device_present.clone(),
+                }))
+            },
+        );
+        let start = Instant::now();
+        // With no device there is nothing to check.
+        audio.restore_device(start);
+        audio.set_mic(on()).unwrap();
+        audio.restore_device(start);
+        present.set(false);
+        // Too early for another check.
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL / 2);
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL);
+        assert!(audio.has_device());
+        assert_eq!(audio.waiting_for_device(), None);
+        // The mic path stops before the vanished device is dropped and
+        // starts again once the new one exists.
+        assert_eq!(
+            *log.borrow(),
+            [
+                "device created",
+                "mic on",
+                "device checked",
+                "device checked",
+                "mic off",
+                "device dropped",
+                "device created",
+                "mic on"
+            ]
+        );
+    }
+
+    /// A create function for [`VanishingDevice`] whose calls fail where
+    /// `fails` says so (by call index); logs every attempt.
+    fn flaky_create(
+        log: &Log,
+        present: &Rc<Cell<bool>>,
+        fails: &'static [usize],
+    ) -> impl FnMut() -> Result<Option<VanishingDevice>> + use<> {
+        let (log, present) = (log.clone(), present.clone());
+        let mut calls = 0;
+        move || {
+            let call = calls;
+            calls += 1;
+            if fails.contains(&call) {
+                log.borrow_mut().push("create failed");
+                anyhow::bail!("pactl did not finish within 3s");
+            }
+            log.borrow_mut().push("device created");
+            present.set(true);
+            Ok(Some(VanishingDevice {
+                log: log.clone(),
+                present: present.clone(),
+            }))
+        }
+    }
+
+    #[test]
+    fn a_device_that_cannot_be_created_again_is_retried_at_the_next_check() {
+        let log = Log::default();
+        let present = Rc::new(Cell::new(true));
+        let mut audio = WithVirtualMic::new(
+            LoggingAudio {
+                log: log.clone(),
+                fail_mic: false,
+            },
+            flaky_create(&log, &present, &[1]),
+        );
+        let start = Instant::now();
+        audio.set_mic(on()).unwrap();
+        present.set(false);
+        audio.restore_device(start);
+        assert!(!audio.has_device());
+        assert_eq!(audio.waiting_for_device(), Some("Cable"));
+        // Too early for another attempt.
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL / 2);
+        assert!(!audio.has_device());
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL);
+        assert!(audio.has_device());
+        assert_eq!(audio.waiting_for_device(), None);
+        assert_eq!(
+            *log.borrow(),
+            [
+                "device created",
+                "mic on",
+                "device checked",
+                "mic off",
+                "device dropped",
+                "create failed",
+                "device created",
+                "mic on"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_device_that_failed_to_create_at_mic_on_is_retried_until_the_mic_goes_off() {
+        let log = Log::default();
+        let present = Rc::new(Cell::new(true));
+        let mut audio = WithVirtualMic::new(
+            LoggingAudio {
+                log: log.clone(),
+                fail_mic: false,
+            },
+            flaky_create(&log, &present, &[0, 1, 3]),
+        );
+        let start = Instant::now();
+        // The sound server is not up yet: the mic path waits for the device.
+        audio.set_mic(on()).unwrap();
+        assert!(!audio.has_device());
+        assert_eq!(audio.waiting_for_device(), Some("Cable"));
+        audio.restore_device(start);
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL / 2);
+        assert!(!audio.has_device());
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL);
+        assert!(audio.has_device());
+        audio.set_mic(None).unwrap();
+        // A failure while the mic is on is forgotten once it goes off.
+        audio.set_mic(on()).unwrap();
+        audio.set_mic(None).unwrap();
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL * 3);
+        assert!(!audio.has_device());
+        assert_eq!(
+            *log.borrow(),
+            [
+                "create failed",
+                "create failed",
+                "device created",
+                "mic on",
+                "mic off",
+                "device dropped",
+                "create failed",
+                "mic off"
+            ]
+        );
+    }
+
+    #[test]
+    fn no_device_is_made_where_the_user_installs_it() {
+        let log = Log::default();
+        let mut audio = WithVirtualMic::new(
+            LoggingAudio {
+                log: log.clone(),
+                fail_mic: false,
+            },
+            || -> Result<Option<FakeDevice>> { Ok(None) },
+        );
+        audio.set_mic(on()).unwrap();
+        assert!(!audio.has_device());
+        assert_eq!(*log.borrow(), ["mic on"]);
+    }
+
+    #[test]
+    fn startup_with_the_mic_enabled_creates_the_device_before_applying() {
+        let log = Log::default();
+        let mut audio = with_device(&log, false);
+        let config = ResolvedConfig {
+            mic: mic_on("Cable"),
+            ..sample_config()
+        };
+        apply_config(&mut audio, &ActionMap::new(&config), true);
+        assert_eq!(*log.borrow(), ["gain", "device created", "mic on"]);
+    }
+
+    #[test]
+    fn toggling_through_the_wrapper_creates_and_drops_the_device() {
+        let dir = TempDir::new("actions-toggle-device");
+        let path = write_config(&dir, MIC_CONFIG);
+        let mut board = load_board(&path).unwrap();
+        let log = Log::default();
+        let mut audio = with_device(&log, false);
+        toggle_mic(&mut audio, &mut board, Some(&path), |_| true);
+        assert!(audio.has_device());
+        toggle_mic(&mut audio, &mut board, Some(&path), |_| true);
+        assert!(!audio.has_device());
+        assert_eq!(
+            *log.borrow(),
+            ["device created", "mic on", "mic off", "device dropped"]
+        );
+    }
+
+    #[test]
+    fn shutdown_stops_the_engine_before_dropping_the_device() {
+        let log = Log::default();
+        let mut audio = with_device(&log, false);
+        audio.set_mic(on()).unwrap();
+        let stop_log = log.clone();
+        audio.shutdown(move |control| {
+            stop_log.borrow_mut().push("engine shut down");
+            drop(control);
+            true
+        });
+        assert_eq!(
+            *log.borrow(),
+            [
+                "device created",
+                "mic on",
+                "engine shut down",
+                "device dropped"
+            ]
+        );
+    }
+    /// A control whose mic stop can leave a stream running, as the engine's
+    /// does when a supervisor is blocked in a device query.
+    struct SlowStopAudio {
+        inner: LoggingAudio,
+        stopped: Rc<Cell<bool>>,
+    }
+
+    impl AudioControl for SlowStopAudio {
+        fn play(&self, sound: &Sound, gain: f32) -> bool {
+            self.inner.play(sound, gain)
+        }
+
+        fn set_master_gain(&self, gain: f32) -> bool {
+            self.inner.set_master_gain(gain)
+        }
+
+        fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<()> {
+            self.inner.set_mic(settings)
+        }
+
+        fn mic_stopped(&mut self) -> bool {
+            self.stopped.get()
+        }
+    }
+
+    fn with_slow_stop(
+        log: &Log,
+        stopped: &Rc<Cell<bool>>,
+    ) -> WithVirtualMic<SlowStopAudio, FakeDevice, impl FnMut() -> Result<Option<FakeDevice>>> {
+        let device_log = log.clone();
+        WithVirtualMic::new(
+            SlowStopAudio {
+                inner: LoggingAudio {
+                    log: log.clone(),
+                    fail_mic: false,
+                },
+                stopped: stopped.clone(),
+            },
+            move || {
+                device_log.borrow_mut().push("device created");
+                Ok(Some(FakeDevice(device_log.clone())))
+            },
+        )
+    }
+
+    #[test]
+    fn a_timed_out_mic_stop_keeps_the_device_until_the_stream_ends() {
+        let log = Log::default();
+        let stopped = Rc::new(Cell::new(true));
+        let mut audio = with_slow_stop(&log, &stopped);
+        audio.set_mic(on()).unwrap();
+        stopped.set(false);
+        audio.set_mic(None).unwrap();
+        assert!(!audio.has_device());
+        assert!(audio.has_retired_device());
+        assert_eq!(*log.borrow(), ["device created", "mic on", "mic off"]);
+
+        // Still running: kept.
+        audio.release_retired();
+        assert!(audio.has_retired_device());
+        assert_eq!(log.borrow().len(), 3);
+
+        stopped.set(true);
+        audio.release_retired();
+        assert!(!audio.has_retired_device());
+        assert_eq!(log.borrow().last(), Some(&"device dropped"));
+    }
+
+    #[test]
+    fn a_mic_turned_on_again_waits_for_the_old_stream_then_reuses_the_retired_device() {
+        let log = Log::default();
+        let stopped = Rc::new(Cell::new(false));
+        let mut audio = with_slow_stop(&log, &stopped);
+        audio.set_mic(on()).unwrap();
+        audio.set_mic(None).unwrap();
+        assert!(audio.has_retired_device());
+
+        // The old stream still runs: no second mic path beside it.
+        audio.set_mic(on()).unwrap();
+        assert!(audio.waiting_for_device().is_some());
+        assert!(audio.has_retired_device());
+        assert!(!audio.has_device());
+        audio.release_retired();
+        assert!(audio.waiting_for_device().is_some());
+        assert_eq!(*log.borrow(), ["device created", "mic on", "mic off"]);
+
+        // It ended: the mic path starts on the same device.
+        stopped.set(true);
+        audio.release_retired();
+        assert!(audio.waiting_for_device().is_none());
+        assert!(audio.has_device());
+        assert!(!audio.has_retired_device());
+        assert_eq!(
+            *log.borrow(),
+            ["device created", "mic on", "mic off", "mic on"]
+        );
+    }
+
+    #[test]
+    fn a_mic_turned_on_after_the_old_stream_ended_reuses_the_retired_device_at_once() {
+        let log = Log::default();
+        let stopped = Rc::new(Cell::new(false));
+        let mut audio = with_slow_stop(&log, &stopped);
+        audio.set_mic(on()).unwrap();
+        audio.set_mic(None).unwrap();
+        stopped.set(true);
+        audio.set_mic(on()).unwrap();
+        assert!(audio.has_device());
+        assert!(!audio.has_retired_device());
+        assert_eq!(
+            *log.borrow(),
+            ["device created", "mic on", "mic off", "mic on"]
+        );
+    }
+
+    #[test]
+    fn a_failed_start_after_a_timed_out_stop_retires_the_device() {
+        let log = Log::default();
+        let stopped = Rc::new(Cell::new(true));
+        let mut audio = with_slow_stop(&log, &stopped);
+        audio.set_mic(on()).unwrap();
+        // A restart whose old path did not stop in time, then failed.
+        stopped.set(false);
+        audio.control.inner.fail_mic = true;
+        let mut changed = on();
+        if let Some(settings) = &mut changed {
+            settings.capture = false;
+        }
+        assert!(audio.set_mic(changed).is_err());
+        assert!(audio.has_retired_device());
+        assert!(!log.borrow().contains(&"device dropped"));
+    }
+
+    #[test]
+    fn shutdown_leaves_the_device_loaded_when_a_stream_is_left_running() {
+        let log = Log::default();
+        let stopped = Rc::new(Cell::new(true));
+        let mut audio = with_slow_stop(&log, &stopped);
+        audio.set_mic(on()).unwrap();
+        audio.shutdown(|_control| false);
+        assert_eq!(*log.borrow(), ["device created", "mic on"]);
+
+        // A retired device is left loaded too.
+        let log = Log::default();
+        let stopped = Rc::new(Cell::new(false));
+        let mut audio = with_slow_stop(&log, &stopped);
+        audio.set_mic(on()).unwrap();
+        audio.set_mic(None).unwrap();
+        audio.shutdown(|_control| false);
+        assert!(!log.borrow().contains(&"device dropped"));
+
+        // Once everything stopped, the retired device is dropped.
+        let log = Log::default();
+        let stopped = Rc::new(Cell::new(false));
+        let mut audio = with_slow_stop(&log, &stopped);
+        audio.set_mic(on()).unwrap();
+        audio.set_mic(None).unwrap();
+        audio.shutdown(|_control| true);
+        assert_eq!(log.borrow().last(), Some(&"device dropped"));
     }
 }

@@ -1,51 +1,138 @@
 //! The cpal output sink.
 //!
-//! [`CpalSinkFactory`] builds a stream on whatever the system default output
-//! device is at the moment it is called. It holds no device, host or identity
-//! between calls, so a rebuild always lands on the live default.
+//! [`CpalOutputFactory`] builds the output streams of both output roles:
+//!
+//! - [`OutputTarget::Default`], the monitor: the system default output
+//!   device of [`platform::monitor_host`].
+//! - [`OutputTarget::Named`], the mic sink: the first output device of
+//!   [`platform::mic_host`] whose name or id contains the pattern.
+//!
+//! It holds no device, host or identity between calls. Every build and every
+//! identity query re-queries the host (and, for a named target, re-enumerates
+//! its output devices), so a rebuild always lands on the live device.
+//!
+//! The helpers shared with the capture (error mapping, device identity, name
+//! matching and the mic paths' buffer size) live here too.
 
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{ErrorKind, I24, OutputStreamTimestamp, SampleFormat, StreamConfig, U24};
+use cpal::{
+    BufferSize, ErrorKind, I24, OutputStreamTimestamp, SampleFormat, StreamConfig,
+    SupportedBufferSize, U24,
+};
 
 use crate::convert::{OutputSample, fill_silence, write_samples};
 use crate::error::BuildError;
 use crate::mixer::Mixer;
-use crate::sink::{ActiveSink, BuiltSink, DeviceIdentity, SinkFactory, StreamInfo};
-use crate::supervisor::SupervisorMsg;
+use crate::platform;
+use crate::sink::{
+    ActiveStream, BuiltStream, DeviceIdentity, StreamFactory, StreamInfo, StreamRole,
+};
+use crate::supervisor::{StreamErrorKind, SupervisorMsg};
 
 /// How long the backend may take to open a stream before the build fails
 /// (and the supervisor retries). Not every backend honors it.
-const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Builds cpal output streams on the current default output device.
-#[derive(Debug, Default)]
-pub struct CpalSinkFactory;
-
-/// A running cpal stream. Dropping it stops the stream.
-struct CpalSink {
-    _stream: cpal::Stream,
+/// Which output device a [`CpalOutputFactory`] builds on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputTarget {
+    /// The current default output device (the monitor).
+    Default,
+    /// The first output device whose display name or id contains this
+    /// pattern, ignoring case (the mic sink).
+    Named(String),
 }
 
-impl ActiveSink for CpalSink {}
+/// Builds cpal output streams on the device its [`OutputTarget`] picks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpalOutputFactory {
+    target: OutputTarget,
+}
 
-impl SinkFactory for CpalSinkFactory {
+impl CpalOutputFactory {
+    /// The monitor: the default output device.
+    pub fn monitor() -> CpalOutputFactory {
+        CpalOutputFactory {
+            target: OutputTarget::Default,
+        }
+    }
+
+    /// The mic sink: the first output device matching `pattern`.
+    pub fn mic_sink(pattern: impl Into<String>) -> CpalOutputFactory {
+        CpalOutputFactory {
+            target: OutputTarget::Named(pattern.into()),
+        }
+    }
+
+    /// The target this factory builds on.
+    #[cfg(test)]
+    pub fn target(&self) -> &OutputTarget {
+        &self.target
+    }
+
+    /// Resolve the device a build would use now, without building a stream.
+    fn resolve(&self) -> Result<cpal::Device, BuildError> {
+        match &self.target {
+            OutputTarget::Default => opened(platform::monitor_host())?
+                .default_output_device()
+                .ok_or(BuildError::NoDevice),
+            OutputTarget::Named(pattern) => {
+                let devices = opened(platform::mic_host())?
+                    .output_devices()
+                    .map_err(build_error)?;
+                first_match(devices, pattern, device_labels)
+                    .ok_or_else(|| BuildError::DeviceNotFound(pattern.clone()))
+            }
+        }
+    }
+
+    /// Resolve the device and its default config without building a stream,
+    /// for `mic-check`.
+    pub fn probe(&self) -> Result<StreamInfo, BuildError> {
+        let device = self.resolve()?;
+        let supported = device.default_output_config().map_err(build_error)?;
+        Ok(stream_info(&device, &supported))
+    }
+}
+
+/// A running cpal stream. Dropping it stops the stream.
+pub(crate) struct CpalStream {
+    pub(crate) _stream: cpal::Stream,
+}
+
+impl ActiveStream for CpalStream {}
+
+impl StreamFactory for CpalOutputFactory {
+    type Target = Arc<Mutex<Mixer>>;
+
+    fn role(&self) -> StreamRole {
+        match self.target {
+            OutputTarget::Default => StreamRole::Monitor,
+            OutputTarget::Named(_) => StreamRole::MicSink,
+        }
+    }
+
     fn build(
         &mut self,
         mixer: Arc<Mutex<Mixer>>,
         on_error: Sender<SupervisorMsg>,
-    ) -> Result<BuiltSink, BuildError> {
-        let host = cpal::default_host();
-        let device = host.default_output_device().ok_or(BuildError::NoDevice)?;
-        let identity = identity_of(&device);
-        let device_name = device.to_string();
-
+    ) -> Result<BuiltStream, BuildError> {
+        let device = self.resolve()?;
         let supported = device.default_output_config().map_err(build_error)?;
+        let info = stream_info(&device, &supported);
         let sample_format = supported.sample_format();
-        let config = supported.config();
+        let mut config = supported.config();
+        if matches!(self.target, OutputTarget::Named(_)) {
+            config.buffer_size = mic_buffer_size(
+                supported.buffer_size(),
+                config.sample_rate,
+                platform::MIC_PERIOD_MS,
+            );
+        }
 
         // No stream exists yet, so this lock cannot contend with a callback.
         mixer
@@ -70,36 +157,129 @@ impl SinkFactory for CpalSinkFactory {
             other => return Err(BuildError::UnsupportedFormat(other.to_string())),
         }?;
         stream.play().map_err(build_error)?;
-
-        let info = StreamInfo {
-            identity,
-            device_name,
-            sample_rate: config.sample_rate,
-            channels: config.channels,
-            sample_format: sample_format.to_string(),
-        };
-        Ok((Box::new(CpalSink { _stream: stream }), info))
+        Ok((Box::new(CpalStream { _stream: stream }), info))
     }
 
-    fn current_default_identity(&mut self) -> Option<DeviceIdentity> {
-        cpal::default_host()
-            .default_output_device()
-            .map(|device| identity_of(&device))
+    fn current_identity(&mut self) -> Option<DeviceIdentity> {
+        self.resolve().ok().map(|device| identity_of(&device))
+    }
+}
+
+/// What a stream on `device` with `supported` runs at.
+pub(crate) fn stream_info(
+    device: &cpal::Device,
+    supported: &cpal::SupportedStreamConfig,
+) -> StreamInfo {
+    StreamInfo {
+        identity: identity_of(device),
+        device_name: device_name(device),
+        sample_rate: supported.sample_rate(),
+        channels: supported.channels(),
+        sample_format: supported.sample_format().to_string(),
     }
 }
 
 /// The backend's stable device id, or the device name when there is none.
-fn identity_of(device: &cpal::Device) -> DeviceIdentity {
+pub(crate) fn identity_of(device: &cpal::Device) -> DeviceIdentity {
     match device.id() {
         Ok(id) => DeviceIdentity::new(id.to_string()),
-        Err(_) => DeviceIdentity::new(device.to_string()),
+        Err(_) => DeviceIdentity::new(device_name(device)),
     }
 }
 
-fn build_error(err: cpal::Error) -> BuildError {
+/// The display name of `device`: its description's name, else its id, else
+/// a placeholder. Never through cpal's `Display`, which fails for a device
+/// the backend can no longer describe (one that just went away), and
+/// `to_string` would then panic on the supervisor thread.
+pub(crate) fn device_name(device: &cpal::Device) -> String {
+    match device.description() {
+        Ok(description) => description.name().to_string(),
+        Err(_) => device
+            .id()
+            .map_or_else(|_| UNKNOWN_DEVICE.to_string(), |id| id.to_string()),
+    }
+}
+
+/// The name of a device that has neither a description nor an id.
+const UNKNOWN_DEVICE: &str = "<unknown device>";
+
+/// The display name and, when the backend has one, the id of `device`: the
+/// strings a device pattern is matched against.
+pub(crate) fn device_labels(device: &cpal::Device) -> (String, Option<String>) {
+    (
+        device_name(device),
+        device.id().ok().map(|id| id.to_string()),
+    )
+}
+
+/// Whether `pattern` names a device with display name `name` and id `id`: a
+/// case-insensitive substring of either. A blank pattern names nothing, so
+/// it can never pick an arbitrary device.
+pub(crate) fn name_matches(pattern: &str, name: &str, id: Option<&str>) -> bool {
+    let pattern = pattern.trim().to_lowercase();
+    if pattern.is_empty() {
+        return false;
+    }
+    name.to_lowercase().contains(&pattern)
+        || id.is_some_and(|id| id.to_lowercase().contains(&pattern))
+}
+
+/// The first of `devices`, in enumeration order, that `pattern` names.
+pub(crate) fn first_match<D>(
+    devices: impl IntoIterator<Item = D>,
+    pattern: &str,
+    labels: impl Fn(&D) -> (String, Option<String>),
+) -> Option<D> {
+    devices.into_iter().find(|device| {
+        let (name, id) = labels(device);
+        name_matches(pattern, &name, id.as_deref())
+    })
+}
+
+/// The buffer size a mic path stream (the mic sink or the capture) asks
+/// for: `period_ms` of frames at `rate`, clamped to the range the device
+/// supports. Without a period (the platform's default suits the
+/// passthrough), or if the device reports no range, the backend's default.
+pub(crate) fn mic_buffer_size(
+    supported: &SupportedBufferSize,
+    rate: u32,
+    period_ms: Option<u32>,
+) -> BufferSize {
+    match (period_ms, supported) {
+        (Some(ms), SupportedBufferSize::Range { min, max }) if min <= max => {
+            let frames = u32::try_from(u64::from(rate) * u64::from(ms) / 1000).unwrap_or(u32::MAX);
+            BufferSize::Fixed(frames.clamp(*min, *max))
+        }
+        _ => BufferSize::Default,
+    }
+}
+
+/// The host a [`platform`] host function opened, or the build error for
+/// none.
+pub(crate) fn opened(host: Option<Arc<cpal::Host>>) -> Result<Arc<cpal::Host>, BuildError> {
+    host.ok_or_else(|| BuildError::Backend("no audio host could be opened".to_owned()))
+}
+
+pub(crate) fn build_error(err: cpal::Error) -> BuildError {
     match err.kind() {
         ErrorKind::DeviceNotAvailable => BuildError::NoDevice,
         _ => BuildError::Backend(err.to_string()),
+    }
+}
+
+/// The error callback of every cpal stream: forward the errors that need a
+/// rebuild to the supervisor. It only sends on a channel, which never
+/// blocks.
+pub(crate) fn forward_errors(
+    on_error: Sender<SupervisorMsg>,
+) -> impl FnMut(cpal::Error) + Send + 'static {
+    move |err: cpal::Error| {
+        if needs_rebuild(err.kind()) {
+            let _ = on_error.send(SupervisorMsg::StreamError {
+                kind: stream_error_kind(err.kind()),
+                message: err.to_string(),
+            });
+        }
     }
 }
 
@@ -111,6 +291,15 @@ fn build_error(err: cpal::Error) -> BuildError {
 /// have a different rate) is forwarded.
 fn needs_rebuild(kind: ErrorKind) -> bool {
     !matches!(kind, ErrorKind::Xrun | ErrorKind::RealtimeDenied)
+}
+
+/// How the supervisor classifies a forwarded stream error. Only the log
+/// level depends on it; every forwarded error rebuilds.
+fn stream_error_kind(kind: ErrorKind) -> StreamErrorKind {
+    match kind {
+        ErrorKind::DeviceChanged => StreamErrorKind::DeviceChanged,
+        _ => StreamErrorKind::Other,
+    }
 }
 
 fn build_typed<T>(
@@ -128,11 +317,7 @@ where
             move |out: &mut [T], info: &cpal::OutputCallbackInfo| {
                 fill_from_mixer(&mixer, out, callback_latency(info.timestamp()));
             },
-            move |err: cpal::Error| {
-                if needs_rebuild(err.kind()) {
-                    let _ = on_error.send(SupervisorMsg::StreamError(err.to_string()));
-                }
-            },
+            forward_errors(on_error),
             Some(OPEN_TIMEOUT),
         )
         .map_err(build_error)
@@ -219,6 +404,48 @@ mod tests {
             .map(|i| (i as f32 * 0.013).sin() * 0.7)
             .collect();
         Sound::from_interleaved(samples, rate, 1, "tone").unwrap()
+    }
+
+    #[test]
+    fn mic_buffer_size_asks_for_the_period_within_the_device_range() {
+        let range = SupportedBufferSize::Range { min: 64, max: 4096 };
+        assert_eq!(
+            mic_buffer_size(&range, 48_000, Some(10)),
+            BufferSize::Fixed(480)
+        );
+        assert_eq!(
+            mic_buffer_size(&range, 44_100, Some(10)),
+            BufferSize::Fixed(441)
+        );
+        // Clamped to what the device supports.
+        let narrow = SupportedBufferSize::Range {
+            min: 1024,
+            max: 2048,
+        };
+        assert_eq!(
+            mic_buffer_size(&narrow, 48_000, Some(10)),
+            BufferSize::Fixed(1024)
+        );
+        let small = SupportedBufferSize::Range { min: 16, max: 256 };
+        assert_eq!(
+            mic_buffer_size(&small, 48_000, Some(10)),
+            BufferSize::Fixed(256)
+        );
+    }
+
+    #[test]
+    fn mic_buffer_size_keeps_the_default_without_a_period_or_a_range() {
+        let range = SupportedBufferSize::Range { min: 64, max: 4096 };
+        assert_eq!(mic_buffer_size(&range, 48_000, None), BufferSize::Default);
+        assert_eq!(
+            mic_buffer_size(&SupportedBufferSize::Unknown, 48_000, Some(10)),
+            BufferSize::Default
+        );
+        let inverted = SupportedBufferSize::Range { min: 512, max: 64 };
+        assert_eq!(
+            mic_buffer_size(&inverted, 48_000, Some(10)),
+            BufferSize::Default
+        );
     }
 
     fn playing_mixer(sound: &Sound, rate: u32, channels: u16) -> Mixer {
@@ -347,6 +574,22 @@ mod tests {
     }
 
     #[test]
+    fn device_changed_maps_to_its_own_kind() {
+        assert_eq!(
+            stream_error_kind(ErrorKind::DeviceChanged),
+            StreamErrorKind::DeviceChanged
+        );
+        for kind in [
+            ErrorKind::DeviceNotAvailable,
+            ErrorKind::StreamInvalidated,
+            ErrorKind::BackendError,
+            ErrorKind::DeviceBusy,
+        ] {
+            assert_eq!(stream_error_kind(kind), StreamErrorKind::Other, "{kind:?}");
+        }
+    }
+
+    #[test]
     fn device_loss_maps_to_no_device() {
         assert!(matches!(
             build_error(cpal::Error::new(ErrorKind::DeviceNotAvailable)),
@@ -358,24 +601,120 @@ mod tests {
         ));
     }
 
-    /// Needs a real output device: `cargo test -p babound-engine -- --ignored`.
     #[test]
-    #[ignore = "needs a real audio output device"]
-    fn smoke_builds_a_real_stream() {
-        let mut factory = CpalSinkFactory;
+    fn names_match_case_insensitively_by_display_name_or_id() {
+        assert!(name_matches("blackhole", "BlackHole 2ch", None));
+        assert!(name_matches("BLACKHOLE", "BlackHole 2ch", None));
+        assert!(name_matches(
+            "sound_babound_sink",
+            "Sound-Babound",
+            Some("pulseaudio:sound_babound_sink")
+        ));
+        assert!(name_matches(
+            "  cable input ",
+            "CABLE Input (VB-Audio)",
+            None
+        ));
+        assert!(!name_matches(
+            "BlackHole",
+            "MacBook Pro Speakers",
+            Some("BuiltIn")
+        ));
+        // A blank pattern never picks a device.
+        assert!(!name_matches("", "BlackHole 2ch", None));
+        assert!(!name_matches("   ", "BlackHole 2ch", Some("id")));
+    }
+
+    #[test]
+    fn the_first_match_in_enumeration_order_wins() {
+        let devices = [
+            ("Speakers", "spk"),
+            ("BlackHole 16ch", "bh16"),
+            ("BlackHole 2ch", "bh2"),
+        ];
+        let labels = |d: &(&str, &str)| (d.0.to_string(), Some(d.1.to_string()));
+        assert_eq!(
+            first_match(devices, "blackhole", labels),
+            Some(("BlackHole 16ch", "bh16"))
+        );
+        assert_eq!(
+            first_match(devices, "BH2", labels),
+            Some(("BlackHole 2ch", "bh2"))
+        );
+        assert_eq!(first_match(devices, "cable", labels), None);
+    }
+
+    #[test]
+    fn output_targets_map_to_roles() {
+        let monitor = CpalOutputFactory::monitor();
+        assert_eq!(monitor.role(), StreamRole::Monitor);
+        assert_eq!(monitor.target(), &OutputTarget::Default);
+        let mic = CpalOutputFactory::mic_sink("BlackHole");
+        assert_eq!(mic.role(), StreamRole::MicSink);
+        assert_eq!(mic.target(), &OutputTarget::Named("BlackHole".into()));
+    }
+
+    /// Needs real devices: `cargo test -p babound-engine -- --ignored`.
+    ///
+    /// Builds the monitor and, when `BABOUND_MIC_DEVICE` or the platform's
+    /// default virtual device pattern resolves, the mic sink and the
+    /// capture. It plays nothing: both mixers have no voices and no
+    /// passthrough, and nothing reads the captured audio.
+    #[test]
+    #[ignore = "needs real audio devices"]
+    fn smoke_builds_real_streams() {
+        let mut monitor = CpalOutputFactory::monitor();
         let shared = Arc::new(MixerShared::new());
         let mixer = Arc::new(Mutex::new(Mixer::new(Arc::clone(&shared))));
         let (tx, _rx) = mpsc::channel();
-        let (sink, info) = factory.build(Arc::clone(&mixer), tx).unwrap();
+        let (sink, info) = monitor.build(Arc::clone(&mixer), tx.clone()).unwrap();
         assert!(info.sample_rate > 0);
         assert!(info.channels > 0);
-        assert_eq!(
-            factory.current_default_identity(),
-            Some(info.identity.clone())
+        assert_eq!(monitor.current_identity(), Some(info.identity.clone()));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            shared.callback_heartbeat() > 0,
+            "monitor callback is running"
         );
 
+        let pattern = std::env::var("BABOUND_MIC_DEVICE")
+            .unwrap_or_else(|_| crate::platform::SMOKE_MIC_PATTERN.to_string());
+        let mut mic = CpalOutputFactory::mic_sink(pattern.clone());
+        let Ok(probe) = mic.probe() else {
+            eprintln!("no output device matches {pattern:?}; mic streams skipped");
+            return;
+        };
+        let mic_shared = Arc::new(MixerShared::new());
+        let mic_mixer = Arc::new(Mutex::new(Mixer::new(Arc::clone(&mic_shared))));
+        let (mic_sink, mic_info) = mic.build(mic_mixer, tx.clone()).unwrap();
+        assert_eq!(mic_info, probe);
+        assert_ne!(
+            mic_info.identity, info.identity,
+            "mic sink is not the monitor"
+        );
+        assert_eq!(mic.current_identity(), Some(mic_info.identity.clone()));
+
+        let mut capture = crate::capture::CpalCaptureFactory::new(vec![pattern]);
+        let capture_probe = capture.probe().input.unwrap();
+        let passthrough = Arc::new(crate::passthrough::PassthroughShared::new());
+        let (capture_stream, capture_info) = capture.build(Arc::clone(&passthrough), tx).unwrap();
+        assert_eq!(capture_info, capture_probe);
+        assert!(capture_info.sample_rate > 0);
+        assert!(capture_info.channels > 0);
+        assert_eq!(passthrough.capture_rate(), capture_info.sample_rate);
+        assert_eq!(
+            capture.current_identity(),
+            Some(capture_info.identity.clone())
+        );
         std::thread::sleep(Duration::from_millis(300));
-        assert!(shared.callback_heartbeat() > 0, "callback is running");
+        assert!(
+            mic_shared.callback_heartbeat() > 0,
+            "mic sink callback is running"
+        );
+        assert!(passthrough.heartbeat() > 0, "capture callback is running");
+
+        drop(capture_stream);
+        drop(mic_sink);
         drop(sink);
     }
 }

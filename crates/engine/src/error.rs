@@ -43,18 +43,55 @@ impl LoadError {
     }
 }
 
-/// A failure while building an output stream.
+/// A failure while building a stream.
 #[derive(Debug, Error)]
 pub enum BuildError {
-    /// There is no output device.
-    #[error("no output device")]
+    /// There is no device for the stream (no default output for the
+    /// monitor, no default input for the capture).
+    #[error("no audio device")]
     NoDevice,
+    /// No output device matches the mic sink's device pattern.
+    #[error("no output device matches {0:?}")]
+    DeviceNotFound(String),
+    /// The default input is the virtual mic device (or its monitor) and no
+    /// physical input to fall back to is present, so capturing it would feed
+    /// the mic path back into itself.
+    #[error("default input {0:?} is the virtual mic device; capture refused")]
+    FeedbackExcluded(String),
     /// The device's sample format is not supported by the engine.
     #[error("unsupported sample format: {0}")]
     UnsupportedFormat(String),
     /// The audio backend reported an error.
     #[error("audio backend error: {0}")]
     Backend(String),
+}
+
+/// What kind of [`BuildError`] a build failed with, without its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuildErrorKind {
+    /// [`BuildError::NoDevice`].
+    NoDevice,
+    /// [`BuildError::DeviceNotFound`].
+    DeviceNotFound,
+    /// [`BuildError::FeedbackExcluded`].
+    FeedbackExcluded,
+    /// [`BuildError::UnsupportedFormat`].
+    UnsupportedFormat,
+    /// [`BuildError::Backend`].
+    Backend,
+}
+
+impl BuildError {
+    /// The kind of this error.
+    pub fn kind(&self) -> BuildErrorKind {
+        match self {
+            BuildError::NoDevice => BuildErrorKind::NoDevice,
+            BuildError::DeviceNotFound(_) => BuildErrorKind::DeviceNotFound,
+            BuildError::FeedbackExcluded(_) => BuildErrorKind::FeedbackExcluded,
+            BuildError::UnsupportedFormat(_) => BuildErrorKind::UnsupportedFormat,
+            BuildError::Backend(_) => BuildErrorKind::Backend,
+        }
+    }
 }
 
 /// A failure while registering for device-change notifications.
@@ -92,7 +129,13 @@ mod tests {
 
     #[test]
     fn build_error_messages() {
-        assert_eq!(BuildError::NoDevice.to_string(), "no output device");
+        assert_eq!(BuildError::NoDevice.to_string(), "no audio device");
+        let not_found = BuildError::DeviceNotFound("BlackHole".into());
+        assert!(not_found.to_string().contains("BlackHole"));
+        assert_eq!(not_found.kind(), BuildErrorKind::DeviceNotFound);
+        let excluded = BuildError::FeedbackExcluded("Sound-Babound Mic".into());
+        assert!(excluded.to_string().contains("Sound-Babound Mic"));
+        assert_eq!(excluded.kind(), BuildErrorKind::FeedbackExcluded);
         assert!(
             BuildError::UnsupportedFormat("i64".into())
                 .to_string()
@@ -102,6 +145,15 @@ mod tests {
             BuildError::Backend("boom".into())
                 .to_string()
                 .contains("boom")
+        );
+        assert_eq!(BuildError::NoDevice.kind(), BuildErrorKind::NoDevice);
+        assert_eq!(
+            BuildError::UnsupportedFormat("i64".into()).kind(),
+            BuildErrorKind::UnsupportedFormat
+        );
+        assert_eq!(
+            BuildError::Backend("boom".into()).kind(),
+            BuildErrorKind::Backend
         );
         assert!(WatcherError("nope".into()).to_string().contains("nope"));
         assert!(

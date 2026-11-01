@@ -18,6 +18,9 @@ crossbeam-queue = "0.3"
 thiserror = "2"
 tracing = "0.1"
 
+# Engine, Linux: the PulseAudio protocol, for the connection probe (cpal uses the same crate)
+pulseaudio = "0.3"
+
 # Engine, macOS
 objc2-core-audio = { version = "0.3", default-features = false }
 objc2-core-foundation = "0.3"
@@ -39,11 +42,16 @@ tray-icon = "0.26"
 global-hotkey = "0.9"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+toml_edit = "0.25"
 dirs = "7"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opener = "0.9"
+
+# App, macOS
+objc2 = "0.6"
+objc2-avf-audio = { version = "0.3", default-features = false, features = ["std", "AVAudioApplication"] }
 
 [profile.release]
 lto = true
