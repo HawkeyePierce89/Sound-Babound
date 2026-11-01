@@ -193,17 +193,28 @@ pub struct MicProbe {
     /// The input the capture would open, with its default config; `None`
     /// when capture is disabled.
     pub capture: Option<Result<StreamInfo, BuildError>>,
+    /// The default input's name when it is the virtual device (an exclusion
+    /// names it): the capture falls back from it (`capture` is `Ok`) or
+    /// refuses it ([`BuildError::FeedbackExcluded`]). A fresh capture knows
+    /// no earlier physical input, so a probe refuses it.
+    pub excluded_default: Option<String>,
 }
 
 /// Resolve the devices the mic path would use with `settings`, and their
 /// default configs, without building a stream. Nothing is played or
 /// captured.
 pub fn probe_mic(settings: &MicSettings) -> MicProbe {
+    let capture = settings
+        .capture
+        .then(|| CpalCaptureFactory::new(settings.capture_exclusions()).probe());
+    let (capture, excluded_default) = match capture {
+        Some(probe) => (Some(probe.input), probe.excluded_default),
+        None => (None, None),
+    };
     MicProbe {
         sink: CpalOutputFactory::mic_sink(settings.device_match.clone()).probe(),
-        capture: settings
-            .capture
-            .then(|| CpalCaptureFactory::new(settings.capture_exclusions()).probe()),
+        capture,
+        excluded_default,
     }
 }
 

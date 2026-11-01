@@ -405,7 +405,7 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 
 - Modify: `crates/app/src/cli.rs`, `crates/app/src/main.rs`
 
-- [ ] `mic-check`:
+- [x] `mic-check`:
   - reads `[mic]` from the config file without creating it; a missing or malformed file means defaults, with a note;
   - calls `probe_mic`;
   - reports:
@@ -416,15 +416,16 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
     - why the path is unavailable;
   - exits non-zero when the mic path is unavailable;
   - opens no stream and plays nothing.
-- [ ] `play`: when `[mic]` is enabled, `set_mic` before playing.
+- [x] `play`: when `[mic]` is enabled, `set_mic` before playing.
   - Wait for the monitor as before, and for the mic sink up to a short timeout; if the mic sink does not come up, warn and play on the monitor only.
   - Wait until both paths are idle, then drain for the larger output latency.
   - `play` does not create the Linux device.
-- [ ] Tests:
+- [x] Tests:
   - clap parsing of `mic-check`;
   - a pure report formatter fed fabricated `MicProbe` values (found, not found, feedback fallback, excluded with no fallback, permission denied);
   - the play wait logic with closures covering the mic timeout.
-- [ ] Run the verification gates. All must pass before Task 15.
+- [x] Run the verification gates. All must pass before Task 15.
+  (`MicProbe` gained `excluded_default`, the default input's name when an exclusion names it, so the report can show a fallback or a refusal; a fresh probe knows no earlier physical input, so it refuses, as the tray's first capture build does. `DeviceIdentity` is re-exported so app tests can fabricate `StreamInfo`. A per-OS `platform::virtual_device_missing_hint()` gives the not-found advice; on Linux it explains that only the tray creates the device. The exit code is non-zero when the virtual device is missing, the capture cannot open or the permission is denied; the report then says "unavailable" or "sounds only". `play` starts the mic path with capture off, so it never opens the microphone, and waits for `commands_applied` to grow by one per running path. `mic-check` against real devices was not run: it is human-run.)
 
 ### Task 15: Verify acceptance criteria
 

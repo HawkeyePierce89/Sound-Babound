@@ -13,17 +13,19 @@ mod windows;
 #[cfg(target_os = "linux")]
 pub use linux::{
     VirtualMic, attach_parent_console, create_virtual_mic, default_virtual_device,
-    global_hotkeys_supported, virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found,
+    global_hotkeys_supported, virtual_device_missing_hint, virtual_input_exclusions,
+    virtual_mic_hint, virtual_mic_not_found,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
     attach_parent_console, default_virtual_device, microphone_access, prepare_event_loop,
-    virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found, with_tray_icon,
+    virtual_device_missing_hint, virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found,
+    with_tray_icon,
 };
 #[cfg(target_os = "windows")]
 pub use windows::{
-    attach_parent_console, default_virtual_device, virtual_input_exclusions, virtual_mic_hint,
-    virtual_mic_not_found,
+    attach_parent_console, default_virtual_device, virtual_device_missing_hint,
+    virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found,
 };
 
 /// Fallback for every other OS: nothing to attach.
@@ -53,6 +55,13 @@ pub fn virtual_mic_hint() -> &'static str {
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn virtual_mic_not_found() -> &'static str {
     "not found, check [mic] virtual_device"
+}
+
+/// Fallback for every other OS: what `mic-check` suggests when nothing
+/// matches.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn virtual_device_missing_hint() -> &'static str {
+    "set [mic] virtual_device to a virtual audio cable's playback device"
 }
 
 /// Everywhere but Linux the app creates no virtual device: the user installs

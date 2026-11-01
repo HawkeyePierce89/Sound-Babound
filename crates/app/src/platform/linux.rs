@@ -43,6 +43,12 @@ pub fn virtual_mic_not_found() -> &'static str {
     "could not create it, see log"
 }
 
+/// What `mic-check` suggests when no output matches the virtual device
+/// pattern.
+pub fn virtual_device_missing_hint() -> &'static str {
+    "the tray creates it while the mic is on; mic-check does not, so start the tray with the mic on (or set [mic] virtual_device to an existing output)"
+}
+
 /// Runs `pactl` with `args` and returns its stdout. A missing `pactl` and a
 /// non-zero exit are errors; the latter carries pactl's stderr.
 fn run_pactl(args: &[String]) -> anyhow::Result<String> {

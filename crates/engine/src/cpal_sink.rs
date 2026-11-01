@@ -601,7 +601,7 @@ mod tests {
         assert_eq!(mic.current_identity(), Some(mic_info.identity.clone()));
 
         let mut capture = crate::capture::CpalCaptureFactory::new(vec![pattern]);
-        let capture_probe = capture.probe().unwrap();
+        let capture_probe = capture.probe().input.unwrap();
         let passthrough = Arc::new(crate::passthrough::PassthroughShared::new());
         let (capture_stream, capture_info) = capture.build(Arc::clone(&passthrough), tx).unwrap();
         assert_eq!(capture_info, capture_probe);

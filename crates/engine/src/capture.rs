@@ -137,10 +137,24 @@ impl NoticeLog {
     }
 }
 
+/// What [`CpalCaptureFactory::probe`] found.
+#[derive(Debug)]
+pub struct InputProbe {
+    /// The input the capture would open, with its default config.
+    pub input: Result<StreamInfo, BuildError>,
+    /// The default input's name when an exclusion names it, so the capture
+    /// fell back from it or refused it.
+    pub excluded_default: Option<String>,
+}
+
 /// What [`CpalCaptureFactory::select`] found.
 enum Selection {
-    /// Capture from this device. Boxed: a cpal device is large on Linux.
-    Device(Box<cpal::Device>),
+    /// Capture from `device`. Boxed: a cpal device is large on Linux.
+    /// `replaces` names the excluded default input when this is a fallback.
+    Device {
+        device: Box<cpal::Device>,
+        replaces: Option<String>,
+    },
     /// The default input is excluded and there is no fallback.
     Excluded(InputCandidate),
 }
@@ -167,13 +181,28 @@ impl CpalCaptureFactory {
 
     /// Resolve the device and its default config without building a stream,
     /// for `mic-check`. It logs nothing.
-    pub fn probe(&mut self) -> Result<StreamInfo, BuildError> {
-        match self.select()?.0 {
-            Selection::Device(device) => {
-                let supported = device.default_input_config().map_err(build_error)?;
-                Ok(stream_info(&device, &supported))
+    pub fn probe(&mut self) -> InputProbe {
+        let selection = match self.select() {
+            Ok((selection, _)) => selection,
+            Err(err) => {
+                return InputProbe {
+                    input: Err(err),
+                    excluded_default: None,
+                };
             }
-            Selection::Excluded(default) => Err(BuildError::FeedbackExcluded(default.name)),
+        };
+        match selection {
+            Selection::Device { device, replaces } => InputProbe {
+                input: device
+                    .default_input_config()
+                    .map_err(build_error)
+                    .map(|supported| stream_info(&device, &supported)),
+                excluded_default: replaces,
+            },
+            Selection::Excluded(default) => InputProbe {
+                input: Err(BuildError::FeedbackExcluded(default.name.clone())),
+                excluded_default: Some(default.name),
+            },
         }
     }
 
@@ -207,15 +236,22 @@ impl CpalCaptureFactory {
         match (choice, default_device, default) {
             (InputChoice::Default, Some(device), Some(default)) => {
                 self.last_physical = Some(default.identity);
-                Ok((Selection::Device(Box::new(device)), None))
+                let selection = Selection::Device {
+                    device: Box::new(device),
+                    replaces: None,
+                };
+                Ok((selection, None))
             }
             (InputChoice::Fallback(index), _, Some(default)) => {
                 let notice = InputNotice::Fallback {
                     excluded: default.identity,
                     using: available[index].identity.clone(),
                 };
-                let device = devices.swap_remove(index);
-                Ok((Selection::Device(Box::new(device)), Some(notice)))
+                let selection = Selection::Device {
+                    device: Box::new(devices.swap_remove(index)),
+                    replaces: Some(default.name),
+                };
+                Ok((selection, Some(notice)))
             }
             (InputChoice::Excluded, _, Some(default)) => {
                 let notice = InputNotice::Excluded {
@@ -263,7 +299,7 @@ impl StreamFactory for CpalCaptureFactory {
         let (selection, notice) = self.select()?;
         self.log_notice(notice);
         let device = match selection {
-            Selection::Device(device) => device,
+            Selection::Device { device, .. } => device,
             Selection::Excluded(default) => {
                 return Err(BuildError::FeedbackExcluded(default.name));
             }
@@ -301,7 +337,7 @@ impl StreamFactory for CpalCaptureFactory {
 
     fn current_identity(&mut self) -> Option<DeviceIdentity> {
         match self.select().ok()?.0 {
-            Selection::Device(device) => Some(identity_of(&device)),
+            Selection::Device { device, .. } => Some(identity_of(&device)),
             Selection::Excluded(_) => None,
         }
     }

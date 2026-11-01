@@ -44,6 +44,12 @@ pub fn virtual_mic_not_found() -> &'static str {
     "not found, install BlackHole"
 }
 
+/// What `mic-check` suggests when no output matches the virtual device
+/// pattern.
+pub fn virtual_device_missing_hint() -> &'static str {
+    "install BlackHole 2ch (or set [mic] virtual_device to the output of the virtual cable you use)"
+}
+
 /// The app's microphone permission. `AVAudioApplication` exists from
 /// macOS 14; before that the permission cannot be read and is `Unknown`.
 /// Reading it never prompts; opening the capture does.

@@ -36,6 +36,12 @@ pub fn virtual_mic_not_found() -> &'static str {
     "not found, install VB-CABLE"
 }
 
+/// What `mic-check` suggests when no output matches the virtual device
+/// pattern.
+pub fn virtual_device_missing_hint() -> &'static str {
+    "install VB-CABLE (or set [mic] virtual_device to the output of the virtual cable you use)"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

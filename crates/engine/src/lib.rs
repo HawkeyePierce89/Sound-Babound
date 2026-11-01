@@ -22,7 +22,7 @@ mod test_support;
 
 pub use engine::{CaptureStatus, Engine, MicProbe, MicSettings, MicStatus, probe_mic};
 pub use error::{BuildError, BuildErrorKind, LoadError, StartError, WatcherError};
-pub use sink::{StreamInfo, StreamRole};
+pub use sink::{DeviceIdentity, StreamInfo, StreamRole};
 pub use sound::Sound;
 pub use supervisor::StreamStatus;
 pub use watcher::{DeviceEvent, RebuildPolicy};

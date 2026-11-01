@@ -96,7 +96,7 @@ impl HotkeyRegistry {
 /// Validates the `[mic]` table: gains are clamped like every other gain,
 /// a missing `virtual_device` selects the platform default, and a blank one
 /// does too, with a warning.
-fn resolve_mic(raw: &RawMic, warnings: &mut Vec<String>) -> MicConfig {
+pub fn resolve_mic(raw: &RawMic, warnings: &mut Vec<String>) -> MicConfig {
     let default_device = platform::default_virtual_device();
     let virtual_device = match raw.virtual_device.as_deref().map(str::trim) {
         None => default_device.to_string(),
