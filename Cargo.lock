@@ -955,6 +955,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "windows",
 ]
 
 [[package]]

@@ -307,15 +307,15 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
 - Modify: `crates/app/src/main.rs`, `crates/app/src/cli.rs`
 - Create: `crates/app/src/platform/mod.rs`, `crates/app/src/platform/windows.rs` (plus macOS and Linux stubs)
 
-- [ ] `run_play(file: Option<PathBuf>) -> anyhow::Result<()>`:
+- [x] `run_play(file: Option<PathBuf>) -> anyhow::Result<()>`:
   - Decode first, either the file or the embedded `include_bytes!("../assets/demo.wav")`. A decode failure returns a contextual error before any audio starts.
   - Start the `Engine` and call `play`.
   - Wait until `commands_applied >= 1 && active_voices == 0`, polling every 50 ms and handling Ctrl+C via the default process behaviour.
   - Shut down, then return.
-- [ ] `main` returns `anyhow::Result`, so errors print a readable message and exit with code 1.
-- [ ] Windows: `platform::attach_parent_console()` calls `AttachConsole(ATTACH_PARENT_PROCESS)` for CLI mode, so output is visible despite the GUI subsystem. It is a no-op elsewhere.
-- [ ] Write tests: `run_play` on a non-audio temp file returns `Err` whose message names the file, without touching audio; the embedded demo decodes through the same path the CLI uses.
-- [ ] Run the test suite and the Windows-target check. They must pass before Task 10.
+- [x] `main` returns `anyhow::Result`, so errors print a readable message and exit with code 1.
+- [x] Windows: `platform::attach_parent_console()` calls `AttachConsole(ATTACH_PARENT_PROCESS)` for CLI mode, so output is visible despite the GUI subsystem. It is a no-op elsewhere.
+- [x] Write tests: `run_play` on a non-audio temp file returns `Err` whose message names the file, without touching audio; the embedded demo decodes through the same path the CLI uses.
+- [x] Run the test suite and the Windows-target check. They must pass before Task 10.
 
 ### Task 10: Tray application and global hotkeys
 

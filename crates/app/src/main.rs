@@ -5,6 +5,7 @@ mod config;
 mod hotkeys;
 mod logging;
 mod paths;
+mod platform;
 #[cfg(test)]
 mod test_support;
 
@@ -13,13 +14,18 @@ use clap::Parser;
 use crate::cli::{Cli, Command};
 
 fn main() -> anyhow::Result<()> {
+    // Any argument means CLI mode (including --help and --version): attach to
+    // the launching terminal on Windows so the output is visible there.
+    if std::env::args_os().len() > 1 {
+        platform::attach_parent_console();
+    }
     let cli = Cli::parse();
     logging::init();
     tracing::debug!(engine = babound_engine::VERSION, "starting");
 
     match cli.command {
         None => run_tray(),
-        Some(Command::Play { file }) => run_play(file),
+        Some(Command::Play { file }) => cli::run_play(file),
     }
 }
 
@@ -51,14 +57,5 @@ fn run_tray() -> anyhow::Result<()> {
         stop_all = ?resolved.stop_all_hotkey.map(|h| h.to_string()),
         "config loaded; tray mode is not implemented yet"
     );
-    Ok(())
-}
-
-/// Headless playback. Stub until the engine is implemented.
-fn run_play(file: Option<std::path::PathBuf>) -> anyhow::Result<()> {
-    match file {
-        Some(path) => tracing::info!(file = %path.display(), "play is not implemented yet"),
-        None => tracing::info!("play (embedded demo) is not implemented yet"),
-    }
     Ok(())
 }
