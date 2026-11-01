@@ -22,16 +22,20 @@
 //!
 //! # No output
 //!
-//! Only a running stream drains the command queue. `Engine::play` rejects
-//! plays while no stream runs (so presses made with no device do not all
-//! start at once when one comes back). While none exists the supervisor
-//! calls [`Mixer::apply_offline`], which drops any play that passed that
-//! check just before the stream went away and still applies `StopAll` and
-//! `SetMasterGain`.
+//! Only a running stream drains the command queue. `Engine::play` accepts
+//! plays only while [`MixerShared::accepts_plays`] holds: while a stream runs,
+//! or inside the short play grace window the supervisor opens when it tears
+//! down a live stream for a rebuild. So presses made with no device do not
+//! all start at once when one comes back, but a press made during the gap of
+//! a device switch is kept and played by the replacement stream. While no
+//! stream exists and the grace window is closed, the supervisor calls
+//! [`Mixer::apply_offline`], which drops any play that passed that check
+//! (just before the stream went away, or inside a window whose rebuild
+//! failed) and still applies `StopAll` and `SetMasterGain`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
 
@@ -68,6 +72,11 @@ pub struct MixerShared {
     callback_heartbeat: AtomicU64,
     output_active: AtomicBool,
     output_latency_nanos: AtomicU64,
+    /// The reference point for `grace_until_nanos`.
+    epoch: Instant,
+    /// End of the play grace window in nanoseconds since `epoch`; 0 means no
+    /// window.
+    grace_until_nanos: AtomicU64,
 }
 
 impl MixerShared {
@@ -81,6 +90,8 @@ impl MixerShared {
             callback_heartbeat: AtomicU64::new(0),
             output_active: AtomicBool::new(false),
             output_latency_nanos: AtomicU64::new(0),
+            epoch: Instant::now(),
+            grace_until_nanos: AtomicU64::new(0),
         }
     }
 
@@ -118,10 +129,42 @@ impl MixerShared {
         self.callback_heartbeat.load(Ordering::Acquire)
     }
 
-    /// Whether an output stream is running. Plays queued while it is false
-    /// are dropped by the supervisor.
+    /// Whether an output stream is running.
     pub fn output_active(&self) -> bool {
         self.output_active.load(Ordering::Acquire)
+    }
+
+    /// Whether a play made at `now` is accepted: a stream runs, or the play
+    /// grace window opened by a live teardown is still open. Plays queued
+    /// with no stream and no open window are dropped by the supervisor.
+    pub fn accepts_plays(&self, now: Instant) -> bool {
+        self.output_active() || self.play_grace_open(now)
+    }
+
+    /// Whether the play grace window is open at `now`.
+    pub fn play_grace_open(&self, now: Instant) -> bool {
+        match self.grace_until_nanos.load(Ordering::Acquire) {
+            0 => false,
+            nanos => self
+                .epoch
+                .checked_add(Duration::from_nanos(nanos))
+                .is_none_or(|until| now < until),
+        }
+    }
+
+    /// Open the play grace window until `until`. Set by the supervisor when
+    /// it tears down a live stream for a rebuild.
+    pub fn open_play_grace(&self, until: Instant) {
+        let since = until.saturating_duration_since(self.epoch);
+        // 0 means "no window", so a deadline at the epoch itself is stored as
+        // 1 ns; such a window is already closed for any later `now` anyway.
+        let nanos = u64::try_from(since.as_nanos()).unwrap_or(u64::MAX).max(1);
+        self.grace_until_nanos.store(nanos, Ordering::Release);
+    }
+
+    /// Close the play grace window.
+    pub fn close_play_grace(&self) {
+        self.grace_until_nanos.store(0, Ordering::Release);
     }
 
     /// Set by the supervisor around every build.
@@ -159,6 +202,10 @@ impl std::fmt::Debug for MixerShared {
             .field("commands_applied", &self.commands_applied())
             .field("callback_heartbeat", &self.callback_heartbeat())
             .field("output_active", &self.output_active())
+            .field(
+                "grace_until_nanos",
+                &self.grace_until_nanos.load(Ordering::Acquire),
+            )
             .finish()
     }
 }
@@ -1091,5 +1138,32 @@ mod tests {
         assert_eq!(m.shared().callback_heartbeat(), 2);
         assert_eq!(m.shared().commands_applied(), 2);
         assert_eq!(m.shared().active_voices(), 1);
+    }
+
+    #[test]
+    fn accepts_plays_while_output_runs_or_inside_the_grace_window() {
+        let shared = MixerShared::new();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        assert!(!shared.accepts_plays(t0));
+        assert!(!shared.play_grace_open(t0));
+
+        shared.set_output_active(true);
+        assert!(shared.accepts_plays(t0));
+
+        // A live teardown opens the window, then output goes away.
+        shared.open_play_grace(t0 + ms(1000));
+        shared.set_output_active(false);
+        assert!(shared.play_grace_open(t0 + ms(999)));
+        assert!(shared.accepts_plays(t0 + ms(999)));
+        assert!(!shared.play_grace_open(t0 + ms(1000)));
+        assert!(!shared.accepts_plays(t0 + ms(1000)));
+
+        shared.close_play_grace();
+        assert!(!shared.accepts_plays(t0 + ms(10)));
+
+        // A deadline already in the past opens no window.
+        shared.open_play_grace(t0);
+        assert!(!shared.accepts_plays(t0 + ms(1)));
     }
 }

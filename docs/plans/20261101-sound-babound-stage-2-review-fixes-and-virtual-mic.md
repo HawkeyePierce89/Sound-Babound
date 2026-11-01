@@ -117,19 +117,19 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 
 - Modify: `crates/engine/src/mixer.rs`, `crates/engine/src/supervisor.rs`, `crates/engine/src/engine.rs`, `crates/engine/src/test_support.rs`
 
-- [ ] Add `play_grace: Duration` (default 1 s) to `Timings`.
-- [ ] `MixerShared` gets a grace deadline: an atomic count of nanoseconds since an epoch `Instant` it owns, 0 meaning none. It also gets `accepts_plays(now)`, true when `output_active || now < grace_until`.
-- [ ] Worker: when it drops a live sink for a rebuild, set `grace_until = now + play_grace`. A teardown with no stream never sets it.
-- [ ] While the grace window is open and there is no stream, skip `apply_offline` and the purge before a rebuild from offline. Queued commands keep their order and the replacement stream applies them.
-- [ ] Once the window expires with no stream, the existing offline drop applies.
-- [ ] `Engine::play` checks `accepts_plays(Instant::now())`. Update the docs on `Engine::play`, the mixer module and the supervisor module.
-- [ ] `FakeSinkFactory`: add a build gate (`hold_builds`, `release_builds`, `building()`) so a test can play while a build is in progress.
-- [ ] Add an engine test hook that takes `Timings`.
-- [ ] Tests:
+- [x] Add `play_grace: Duration` (default 1 s) to `Timings`.
+- [x] `MixerShared` gets a grace deadline: an atomic count of nanoseconds since an epoch `Instant` it owns, 0 meaning none. It also gets `accepts_plays(now)`, true when `output_active || now < grace_until`.
+- [x] Worker: when it drops a live sink for a rebuild, set `grace_until = now + play_grace`. A teardown with no stream never sets it.
+- [x] While the grace window is open and there is no stream, skip `apply_offline` and the purge before a rebuild from offline. Queued commands keep their order and the replacement stream applies them.
+- [x] Once the window expires with no stream, the existing offline drop applies.
+- [x] `Engine::play` checks `accepts_plays(Instant::now())`. Update the docs on `Engine::play`, the mixer module and the supervisor module.
+- [x] `FakeSinkFactory`: add a build gate (`hold_builds`, `release_builds`, `building()`) so a test can play while a build is in progress.
+- [x] Add an engine test hook that takes `Timings`.
+- [x] Tests:
   - live stream, then `DefaultOutputChanged`, then a play while the replacement build is held: accepted; after release, the new mixer renders it.
   - live stream, then builds that fail forever (short `play_grace`): a play inside the window is accepted and later dropped (`handle_count` returns to 1); a play after the window is rejected.
   - `play_without_output_is_rejected` still holds: the initial start has no grace.
-- [ ] Run the verification gates. All must pass before Task 4.
+- [x] Run the verification gates. All must pass before Task 4.
 
 ### Task 4: Malformed config at startup falls back (Part A.2)
 

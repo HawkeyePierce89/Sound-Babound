@@ -35,13 +35,18 @@
 //! Once it has moved, the stream is rebuilt if the heartbeat stands still for
 //! [`Timings::stall`].
 //!
-//! `Engine::play`
-//! rejects plays while no stream runs; a play that passed that check just
-//! before the stream went away is dropped here if no stream replaces it (see
-//! `Mixer::apply_offline`). A rebuild from a live stream keeps the command
-//! queue, so plays accepted while the old stream ran (including one whose push
-//! races the teardown) are applied by the new stream, like the voices it
-//! continues.
+//! # Plays across a rebuild
+//!
+//! `Engine::play` accepts plays while a stream runs and, after the supervisor
+//! tears down a live stream for a rebuild, for [`Timings::play_grace`] more
+//! (see `MixerShared::accepts_plays`). The initial start and a teardown with
+//! no stream open no window. A rebuild from a live stream keeps the command
+//! queue, and while the window is open the offline purge is skipped, so plays
+//! accepted while the old stream ran, or during the switch, keep their order
+//! and are applied by the new stream, like the voices it continues. Once the
+//! window has closed with no stream, queued plays are dropped (see
+//! `Mixer::apply_offline`), as is a play that passed the check just before the
+//! stream went away.
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -104,6 +109,9 @@ pub struct Timings {
     /// How long a new stream may take to deliver its first callback before a
     /// rebuild.
     pub startup_grace: Duration,
+    /// How long after a live stream is torn down for a rebuild plays are
+    /// still accepted and kept for the replacement stream.
+    pub play_grace: Duration,
 }
 
 impl Default for Timings {
@@ -113,6 +121,7 @@ impl Default for Timings {
             retry: Duration::from_secs(1),
             stall: Duration::from_secs(2),
             startup_grace: Duration::from_secs(10),
+            play_grace: Duration::from_secs(1),
         }
     }
 }
@@ -387,6 +396,7 @@ struct Worker<F> {
     mixer: Arc<Mutex<Mixer>>,
     sender: Sender<SupervisorMsg>,
     core: SupervisorCore,
+    play_grace: Duration,
     sink: Option<Box<dyn ActiveSink>>,
 }
 
@@ -403,6 +413,7 @@ impl<F: SinkFactory> Worker<F> {
             shared,
             sender,
             core: SupervisorCore::new(timings, Instant::now()),
+            play_grace: timings.play_grace,
             sink: None,
         }
     }
@@ -426,7 +437,7 @@ impl<F: SinkFactory> Worker<F> {
                 None => {}
             }
             if self.sink.is_none() {
-                self.drop_offline_plays();
+                self.purge_offline();
             }
             self.shared.drain_garbage();
 
@@ -453,6 +464,7 @@ impl<F: SinkFactory> Worker<F> {
         }
 
         drop(self.sink.take());
+        self.shared.close_play_grace();
         self.shared.set_output_active(false);
         drop(guard);
         self.shared.drain_garbage();
@@ -485,6 +497,15 @@ impl<F: SinkFactory> Worker<F> {
         }
     }
 
+    /// With no stream: drop the queued plays unless the play grace window
+    /// from a live teardown is still open, in which case the queue is kept
+    /// in order for the replacement stream.
+    fn purge_offline(&mut self) {
+        if !self.shared.play_grace_open(Instant::now()) {
+            self.drop_offline_plays();
+        }
+    }
+
     /// Drop the plays queued while no stream exists, and apply the other
     /// commands. No stream means no callback, so the lock cannot contend.
     fn drop_offline_plays(&mut self) {
@@ -501,15 +522,21 @@ impl<F: SinkFactory> Worker<F> {
     /// Drop the stream, then build a new one. The factory configures the
     /// mixer while no stream exists, so the callback never contends for it.
     ///
-    /// When no stream existed, plays queued since the last loop's purge are
-    /// dropped first, so the new stream never starts a press made offline.
     /// When a stream existed, the queue is kept on purpose: its plays were
-    /// accepted while that stream ran, and the new stream applies them.
+    /// accepted while that stream ran, and the new stream applies them. The
+    /// play grace window opens before output is marked inactive, so plays
+    /// stay accepted without a gap. When no stream existed, plays queued
+    /// since the last loop's purge are dropped first, so the new stream never
+    /// starts a press made offline, unless the grace window is still open.
     fn rebuild(&mut self) {
-        if self.sink.is_none() {
-            self.drop_offline_plays();
+        match self.sink.take() {
+            Some(sink) => {
+                self.shared
+                    .open_play_grace(Instant::now() + self.play_grace);
+                drop(sink);
+            }
+            None => self.purge_offline(),
         }
-        drop(self.sink.take());
         self.shared.set_output_active(false);
         // Read before the build, so a callback that runs before the next
         // sample still counts as the stream starting.
@@ -528,6 +555,7 @@ impl<F: SinkFactory> Worker<F> {
                 );
                 self.sink = Some(sink);
                 self.shared.set_output_active(true);
+                self.shared.close_play_grace();
                 self.core
                     .on_build_result(Some(info.identity), baseline, Instant::now());
             }
@@ -883,6 +911,7 @@ mod tests {
             retry: ms(50),
             stall: Duration::from_secs(3600),
             startup_grace: Duration::from_secs(3600),
+            play_grace: ms(50),
         }
     }
 
@@ -1144,6 +1173,108 @@ mod tests {
         mixer.lock().unwrap().render(&mut out);
         assert_eq!(shared.active_voices(), 1);
         drop(worker);
+    }
+
+    #[test]
+    fn failed_rebuild_from_live_keeps_plays_while_the_grace_window_is_open() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let shared = Arc::new(MixerShared::new());
+        let (sender, _receiver) = mpsc::channel();
+        let timings = Timings {
+            play_grace: Duration::from_secs(3600),
+            ..fast()
+        };
+        let mut worker = Worker::new(factory.clone(), Arc::clone(&shared), timings, sender);
+        worker.rebuild();
+        assert!(worker.sink.is_some());
+        // A successful build leaves no window behind.
+        assert!(!shared.play_grace_open(Instant::now()));
+
+        // The live stream goes away and its replacement fails.
+        factory.fail_next(usize::MAX);
+        worker.rebuild();
+        assert!(worker.sink.is_none());
+        assert!(!shared.output_active());
+        assert!(shared.accepts_plays(Instant::now()));
+
+        let sound = Sound::from_interleaved(vec![0.5; 4800], 48_000, 1, "switch").unwrap();
+        shared
+            .push(Command::Play {
+                sound: sound.clone(),
+                gain: 1.0,
+            })
+            .unwrap();
+        shared.push(Command::SetMasterGain(0.5)).unwrap();
+        // Neither the loop's purge nor a retry from offline touches the queue
+        // while the window is open.
+        worker.purge_offline();
+        worker.rebuild();
+        assert_eq!(sound.handle_count(), 2);
+        assert_eq!(shared.commands_applied(), 0);
+
+        // The replacement stream applies both, in order.
+        factory.fail_next(0);
+        worker.rebuild();
+        assert!(worker.sink.is_some());
+        assert!(!shared.play_grace_open(Instant::now()));
+        let mixer = factory.mixer().unwrap();
+        let mut out = vec![0.0; 64];
+        mixer.lock().unwrap().render(&mut out);
+        assert_eq!(shared.active_voices(), 1);
+        assert_eq!(shared.commands_applied(), 2);
+        assert_eq!(mixer.lock().unwrap().master_gain(), 0.5);
+        drop(worker);
+    }
+
+    #[test]
+    fn closed_grace_window_drops_plays_on_the_offline_purge() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let shared = Arc::new(MixerShared::new());
+        let (sender, _receiver) = mpsc::channel();
+        let timings = Timings {
+            play_grace: Duration::ZERO,
+            ..fast()
+        };
+        let mut worker = Worker::new(factory.clone(), Arc::clone(&shared), timings, sender);
+        worker.rebuild();
+        factory.fail_next(usize::MAX);
+        worker.rebuild();
+        assert!(!shared.accepts_plays(Instant::now()));
+
+        let sound = Sound::from_interleaved(vec![0.5; 4800], 48_000, 1, "late").unwrap();
+        shared
+            .push(Command::Play {
+                sound: sound.clone(),
+                gain: 1.0,
+            })
+            .unwrap();
+        worker.purge_offline();
+        assert_eq!(sound.handle_count(), 1);
+        drop(worker);
+    }
+
+    #[test]
+    fn initial_start_and_shutdown_open_no_grace_window() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        factory.fail_next(usize::MAX);
+        let shared = Arc::new(MixerShared::new());
+        let handle = spawn_supervisor(
+            factory.clone(),
+            FakeWatcher::default(),
+            Arc::clone(&shared),
+            Timings {
+                play_grace: Duration::from_secs(3600),
+                ..fast()
+            },
+        )
+        .unwrap();
+        assert!(wait_until(WAIT, || factory.attempts() >= 2));
+        assert!(!shared.accepts_plays(Instant::now()));
+
+        factory.fail_next(0);
+        assert!(wait_until(WAIT, || shared.output_active()));
+        handle.shutdown();
+        assert!(!shared.accepts_plays(Instant::now()));
     }
 
     #[test]

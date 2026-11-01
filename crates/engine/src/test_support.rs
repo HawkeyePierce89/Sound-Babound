@@ -1,7 +1,7 @@
 //! Fakes shared by the engine's tests.
 
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -96,79 +96,121 @@ struct SinkState {
     error_sender: Option<Sender<SupervisorMsg>>,
     live_sinks: usize,
     overlapping_builds: usize,
+    /// Builds wait at the gate while this is set.
+    hold: bool,
+    /// A build is waiting at the gate.
+    building: bool,
+}
+
+/// Longest a held build waits at the gate.
+pub(crate) const BUILD_HOLD_LIMIT: Duration = Duration::from_secs(10);
+
+struct SinkShared {
+    state: Mutex<SinkState>,
+    /// Signalled when `hold` is cleared.
+    gate: Condvar,
 }
 
 /// A sink factory that records builds instead of opening a device.
 /// Clones share state.
 #[derive(Clone)]
-pub(crate) struct FakeSinkFactory(Arc<Mutex<SinkState>>);
+pub(crate) struct FakeSinkFactory(Arc<SinkShared>);
 
 impl FakeSinkFactory {
     pub(crate) fn new(sample_rate: u32, channels: u16, default: &str) -> FakeSinkFactory {
-        FakeSinkFactory(Arc::new(Mutex::new(SinkState {
-            failures_left: 0,
-            sample_rate,
-            channels,
-            default: Some(DeviceIdentity::new(default)),
-            attempts: 0,
-            identity_queries: 0,
-            builds: Vec::new(),
-            mixer: None,
-            error_sender: None,
-            live_sinks: 0,
-            overlapping_builds: 0,
-        })))
+        FakeSinkFactory(Arc::new(SinkShared {
+            state: Mutex::new(SinkState {
+                failures_left: 0,
+                sample_rate,
+                channels,
+                default: Some(DeviceIdentity::new(default)),
+                attempts: 0,
+                identity_queries: 0,
+                builds: Vec::new(),
+                mixer: None,
+                error_sender: None,
+                live_sinks: 0,
+                overlapping_builds: 0,
+                hold: false,
+                building: false,
+            }),
+            gate: Condvar::new(),
+        }))
+    }
+
+    fn state(&self) -> MutexGuard<'_, SinkState> {
+        lock(&self.0.state)
+    }
+
+    /// Make every following build wait until [`release_builds`], or at most
+    /// [`BUILD_HOLD_LIMIT`]. Release before shutting the supervisor down, or
+    /// its join waits for the limit.
+    ///
+    /// [`release_builds`]: FakeSinkFactory::release_builds
+    pub(crate) fn hold_builds(&self) {
+        self.state().hold = true;
+    }
+
+    /// Let held and later builds proceed.
+    pub(crate) fn release_builds(&self) {
+        self.state().hold = false;
+        self.0.gate.notify_all();
+    }
+
+    /// Whether a build is waiting at the gate.
+    pub(crate) fn building(&self) -> bool {
+        self.state().building
     }
 
     /// Fail the next `n` builds.
     pub(crate) fn fail_next(&self, n: usize) {
-        lock(&self.0).failures_left = n;
+        self.state().failures_left = n;
     }
 
     /// Format of the "device" for the next build.
     pub(crate) fn set_format(&self, sample_rate: u32, channels: u16) {
-        let mut state = lock(&self.0);
+        let mut state = self.state();
         state.sample_rate = sample_rate;
         state.channels = channels;
     }
 
     /// Identity of the current default output; `None` means no device.
     pub(crate) fn set_default(&self, default: Option<&str>) {
-        lock(&self.0).default = default.map(DeviceIdentity::new);
+        self.state().default = default.map(DeviceIdentity::new);
     }
 
     /// Build calls, failed ones included.
     pub(crate) fn attempts(&self) -> usize {
-        lock(&self.0).attempts
+        self.state().attempts
     }
 
     pub(crate) fn identity_queries(&self) -> usize {
-        lock(&self.0).identity_queries
+        self.state().identity_queries
     }
 
     /// Successful builds, in order.
     pub(crate) fn builds(&self) -> Vec<StreamInfo> {
-        lock(&self.0).builds.clone()
+        self.state().builds.clone()
     }
 
     /// The mixer handed to the last build.
     pub(crate) fn mixer(&self) -> Option<Arc<Mutex<Mixer>>> {
-        lock(&self.0).mixer.clone()
+        self.state().mixer.clone()
     }
 
     /// Sinks that have been built and not dropped yet.
     pub(crate) fn live_sinks(&self) -> usize {
-        lock(&self.0).live_sinks
+        self.state().live_sinks
     }
 
     /// Builds that started while an older sink was still alive.
     pub(crate) fn overlapping_builds(&self) -> usize {
-        lock(&self.0).overlapping_builds
+        self.state().overlapping_builds
     }
 
     /// Report a stream error the way a real stream callback would.
     pub(crate) fn send_stream_error(&self, kind: StreamErrorKind) -> bool {
-        lock(&self.0).error_sender.as_ref().is_some_and(|s| {
+        self.state().error_sender.as_ref().is_some_and(|s| {
             s.send(SupervisorMsg::StreamError {
                 kind,
                 message: "fake stream error".into(),
@@ -178,13 +220,13 @@ impl FakeSinkFactory {
     }
 }
 
-struct FakeSink(Arc<Mutex<SinkState>>);
+struct FakeSink(Arc<SinkShared>);
 
 impl ActiveSink for FakeSink {}
 
 impl Drop for FakeSink {
     fn drop(&mut self) {
-        lock(&self.0).live_sinks -= 1;
+        lock(&self.0.state).live_sinks -= 1;
     }
 }
 
@@ -194,8 +236,20 @@ impl SinkFactory for FakeSinkFactory {
         mixer: Arc<Mutex<Mixer>>,
         on_error: Sender<SupervisorMsg>,
     ) -> Result<BuiltSink, BuildError> {
-        let mut state = lock(&self.0);
+        let mut state = self.state();
         state.attempts += 1;
+        if state.hold {
+            state.building = true;
+            // Bounded, so a test that fails while holding a build still
+            // unwinds instead of hanging in the supervisor join.
+            state = self
+                .0
+                .gate
+                .wait_timeout_while(state, BUILD_HOLD_LIMIT, |s| s.hold)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+            state.building = false;
+        }
         if state.live_sinks > 0 {
             state.overlapping_builds += 1;
         }
@@ -222,7 +276,7 @@ impl SinkFactory for FakeSinkFactory {
     }
 
     fn current_default_identity(&mut self) -> Option<DeviceIdentity> {
-        let mut state = lock(&self.0);
+        let mut state = self.state();
         state.identity_queries += 1;
         state.default.clone()
     }
