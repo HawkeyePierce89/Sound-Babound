@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use babound_engine::{CaptureStatus, Engine, MicSettings, MicStatus, Sound};
+use babound_engine::{BuildErrorKind, CaptureStatus, Engine, MicSettings, MicStatus, Sound};
 use global_hotkey::hotkey::HotKey;
 
 use crate::config::{self, DEFAULT_CONFIG, MicConfig, RawConfig, ResolvedConfig};
@@ -327,7 +327,8 @@ pub fn mic_toggle_label(enabled: bool) -> &'static str {
 /// The text of the tray's mic status line. `not_found` is the platform's
 /// note for a virtual device that no output matches (see
 /// `platform::virtual_mic_not_found`). The capture state is appended only
-/// when the microphone cannot be heard.
+/// when the microphone cannot be heard, with a short reason when the capture
+/// is unavailable ([`capture_unavailable_reason`]).
 pub fn mic_status_label(status: &MicStatus, not_found: &str) -> String {
     match status {
         MicStatus::Off => "Virtual mic: off".to_string(),
@@ -341,10 +342,22 @@ pub fn mic_status_label(status: &MicStatus, not_found: &str) -> String {
             CaptureStatus::Disabled => {
                 format!("Virtual mic: {device} (active, microphone access denied)")
             }
-            CaptureStatus::Unavailable(_) => {
-                format!("Virtual mic: {device} (active, microphone unavailable)")
-            }
+            CaptureStatus::Unavailable { kind, .. } => format!(
+                "Virtual mic: {device} (active, microphone unavailable: {})",
+                capture_unavailable_reason(*kind)
+            ),
         },
+    }
+}
+
+/// A short reason, for the tray's status line, why the capture failed to
+/// build with this kind of error. The full error is in the log.
+fn capture_unavailable_reason(kind: BuildErrorKind) -> &'static str {
+    match kind {
+        BuildErrorKind::FeedbackExcluded => "default input is the virtual mic device",
+        BuildErrorKind::NoDevice => "no input device",
+        BuildErrorKind::DeviceNotFound => "input device not found",
+        BuildErrorKind::UnsupportedFormat | BuildErrorKind::Backend => "error, see log",
     }
 }
 
@@ -1385,6 +1398,12 @@ mod tests {
             device: "BlackHole 2ch".into(),
             capture,
         };
+        let unavailable = |kind| {
+            active(CaptureStatus::Unavailable {
+                kind,
+                error: "the full error".into(),
+            })
+        };
         let cases = [
             (MicStatus::Off, "Virtual mic: off"),
             (MicStatus::Starting, "Virtual mic: starting"),
@@ -1409,8 +1428,26 @@ mod tests {
                 "Virtual mic: BlackHole 2ch (active, microphone access denied)",
             ),
             (
-                active(CaptureStatus::Unavailable("no input".into())),
-                "Virtual mic: BlackHole 2ch (active, microphone unavailable)",
+                unavailable(BuildErrorKind::FeedbackExcluded),
+                "Virtual mic: BlackHole 2ch (active, microphone unavailable: \
+                 default input is the virtual mic device)",
+            ),
+            (
+                unavailable(BuildErrorKind::NoDevice),
+                "Virtual mic: BlackHole 2ch (active, microphone unavailable: no input device)",
+            ),
+            (
+                unavailable(BuildErrorKind::DeviceNotFound),
+                "Virtual mic: BlackHole 2ch (active, microphone unavailable: \
+                 input device not found)",
+            ),
+            (
+                unavailable(BuildErrorKind::UnsupportedFormat),
+                "Virtual mic: BlackHole 2ch (active, microphone unavailable: error, see log)",
+            ),
+            (
+                unavailable(BuildErrorKind::Backend),
+                "Virtual mic: BlackHole 2ch (active, microphone unavailable: error, see log)",
             ),
         ];
         for (status, label) in cases {

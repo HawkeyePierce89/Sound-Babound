@@ -158,8 +158,13 @@ pub enum CaptureStatus {
     /// Capture is off in the settings (for example, no microphone
     /// permission); the mic sink carries only the sounds.
     Disabled,
-    /// The capture cannot run now, for this reason; it keeps retrying.
-    Unavailable(String),
+    /// The capture cannot run now; it keeps retrying.
+    Unavailable {
+        /// What kind of build failure stops it.
+        kind: BuildErrorKind,
+        /// The build error's text.
+        error: String,
+    },
 }
 
 /// The mic status for these supervisor statuses. Pure. `capture` is `None`
@@ -182,7 +187,9 @@ fn mic_status_of(
                 None => CaptureStatus::Disabled,
                 Some(StreamStatus::Starting) => CaptureStatus::Starting,
                 Some(StreamStatus::Running(info)) => CaptureStatus::Running(info.device_name),
-                Some(StreamStatus::Failed { error, .. }) => CaptureStatus::Unavailable(error),
+                Some(StreamStatus::Failed { error, kind }) => {
+                    CaptureStatus::Unavailable { kind, error }
+                }
             },
         },
     }
@@ -1526,7 +1533,10 @@ mod tests {
         assert!(wait_until(TIMEOUT, || matches!(
             engine.mic_status(),
             MicStatus::Active {
-                capture: CaptureStatus::Unavailable(_),
+                capture: CaptureStatus::Unavailable {
+                    kind: BuildErrorKind::NoDevice,
+                    ..
+                },
                 ..
             }
         )));
@@ -1696,10 +1706,23 @@ mod tests {
                 running(),
                 Some(failed(BuildError::FeedbackExcluded("cable".into())))
             ),
-            active(CaptureStatus::Unavailable(
-                BuildError::FeedbackExcluded("cable".into()).to_string()
-            ))
+            active(CaptureStatus::Unavailable {
+                kind: BuildErrorKind::FeedbackExcluded,
+                error: BuildError::FeedbackExcluded("cable".into()).to_string(),
+            })
         );
+        for err in [
+            BuildError::NoDevice,
+            BuildError::DeviceNotFound("mic".into()),
+            BuildError::UnsupportedFormat("i8".into()),
+            BuildError::Backend("boom".into()),
+        ] {
+            let (kind, error) = (err.kind(), err.to_string());
+            assert_eq!(
+                mic_status_of(&settings, running(), Some(failed(err))),
+                active(CaptureStatus::Unavailable { kind, error })
+            );
+        }
     }
 
     #[test]

@@ -92,16 +92,16 @@ Part B fixes the five findings from the stage 2 acceptance review:
 **Files:**
 - Modify: `crates/engine/src/engine.rs`, `crates/app/src/actions.rs`, `crates/app/src/cli.rs` (if it matches on the variant)
 
-- [ ] `CaptureStatus::Unavailable` carries `{ kind: BuildErrorKind, error: String }`, filled by `mic_status_of` from `StreamStatus::Failed`.
-- [ ] `mic_status_label` gives a short reason for the kind. Wording can be tuned, but each kind gets its own text:
+- [x] `CaptureStatus::Unavailable` carries `{ kind: BuildErrorKind, error: String }`, filled by `mic_status_of` from `StreamStatus::Failed`.
+- [x] `mic_status_label` gives a short reason for the kind. Wording can be tuned, but each kind gets its own text:
   - `FeedbackExcluded`: "default input is the virtual mic device";
   - `NoDevice`: "no input device";
   - `UnsupportedFormat` and `Backend`: "error, see log".
   - Example: "Virtual mic: BlackHole 2ch (active, microphone unavailable: no input device)".
-- [ ] Tests:
+- [x] Tests:
   - an engine test that `mic_status_of` carries the kind;
   - an app test of `mic_status_label` for every `CaptureStatus` and `MicStatus` variant, including each `BuildErrorKind`.
-- [ ] Run the verification gates. All must pass before Task 2.
+- [x] Run the verification gates. All must pass before Task 2.
 
 ### Task 2: macOS default pattern prefers BlackHole 2ch (B.5)
 
