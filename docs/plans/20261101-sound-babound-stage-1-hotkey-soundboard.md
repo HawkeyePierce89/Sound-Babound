@@ -365,7 +365,7 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
 
 ### Task 12: Update documentation
 
-- [ ] `README.md` covers:
+- [x] `README.md` covers:
   - what it does
   - building (`cargo build --release`)
   - running (tray mode, `sound-babound play [FILE]`, `RUST_LOG`)
@@ -373,7 +373,7 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
   - hotkey syntax (modifiers Ctrl/Alt/Shift/Cmd/Super/CmdOrCtrl, key names)
   - the Wayland limitation
   - Linux build dependencies (`libasound2-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev` or `libappindicator3-dev`, `libxdo-dev` if required by tray-icon)
-- [ ] Create a short `CLAUDE.md` covering:
+- [x] Create a short `CLAUDE.md` covering:
   - crate layout
   - realtime callback rules, including the pending-release rule
   - the mixer handoff invariant
