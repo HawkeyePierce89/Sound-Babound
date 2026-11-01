@@ -62,6 +62,14 @@ pub enum BuildError {
 #[error("device watcher failed: {0}")]
 pub struct WatcherError(pub String);
 
+/// A failure while starting the [`crate::Engine`].
+#[derive(Debug, Error)]
+pub enum StartError {
+    /// The supervisor thread could not be spawned.
+    #[error("cannot start the audio supervisor thread: {0}")]
+    Spawn(#[source] std::io::Error),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +104,10 @@ mod tests {
                 .contains("boom")
         );
         assert!(WatcherError("nope".into()).to_string().contains("nope"));
+        assert!(
+            StartError::Spawn(std::io::Error::other("no threads"))
+                .to_string()
+                .contains("supervisor thread")
+        );
     }
 }

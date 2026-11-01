@@ -6,6 +6,7 @@
 
 pub mod convert;
 pub mod cpal_sink;
+pub mod engine;
 pub mod error;
 pub mod mixer;
 pub mod sink;
@@ -17,7 +18,8 @@ pub mod watcher;
 mod test_support;
 
 pub use cpal_sink::CpalSinkFactory;
-pub use error::{BuildError, LoadError, WatcherError};
+pub use engine::Engine;
+pub use error::{BuildError, LoadError, StartError, WatcherError};
 pub use mixer::{Command, Mixer, MixerShared};
 pub use sink::{ActiveSink, BuiltSink, DeviceIdentity, SinkFactory, StreamInfo};
 pub use sound::{Sound, SoundData};

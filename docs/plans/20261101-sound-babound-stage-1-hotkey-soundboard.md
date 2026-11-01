@@ -261,17 +261,17 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
 - Create: `crates/engine/src/engine.rs`
 - Modify: `crates/engine/src/lib.rs`
 
-- [ ] `Engine::start() -> Result<Engine, ...>` uses the cpal factory and the platform watcher. A `pub(crate) start_with(factory, watcher)` exists for tests.
-- [ ] Methods: `play(&Sound, gain) -> bool` (false if the queue is full, logged by the caller side), `stop_all()`, `set_master_gain(f32)`, `active_voices()`, `commands_applied()`, `shutdown(self)`. `Drop` also shuts down.
-- [ ] All methods are non-blocking queue pushes or atomic reads, and `Engine` is `Send + Sync` so it can be shared via `Arc`. `shutdown` signals the thread and joins it.
-- [ ] Re-export the public types from `lib.rs`: `Engine`, `Sound`, `LoadError`, `BuildError`, `DeviceEvent`, `StreamInfo`.
-- [ ] Write tests with the fake factory and watcher, rendering through the fake sink's handle to the mixer:
+- [x] `Engine::start() -> Result<Engine, ...>` uses the cpal factory and the platform watcher. A `pub(crate) start_with(factory, watcher)` exists for tests.
+- [x] Methods: `play(&Sound, gain) -> bool` (false if the queue is full, logged by the caller side), `stop_all()`, `set_master_gain(f32)`, `active_voices()`, `commands_applied()`, `shutdown(self)`. `Drop` also shuts down.
+- [x] All methods are non-blocking queue pushes or atomic reads, and `Engine` is `Send + Sync` so it can be shared via `Arc`. `shutdown` signals the thread and joins it.
+- [x] Re-export the public types from `lib.rs`: `Engine`, `Sound`, `LoadError`, `BuildError`, `DeviceEvent`, `StreamInfo`.
+- [x] Write tests with the fake factory and watcher, rendering through the fake sink's handle to the mixer:
   - `play` then render produces non-zero output
   - `stop_all` silences
   - `set_master_gain(0)` silences
   - the engine is `Send + Sync` (static assertion)
   - play/stop calls from multiple threads do not panic
-- [ ] Run the test suite. It must pass before Task 8.
+- [x] Run the test suite. It must pass before Task 8.
 
 ### Task 8: Configuration and hotkey parsing
 
