@@ -18,6 +18,9 @@ crossbeam-queue = "0.3"
 thiserror = "2"
 tracing = "0.1"
 
+# Engine, Linux: the PulseAudio protocol, for the connection probe (cpal uses the same crate)
+pulseaudio = "0.3"
+
 # Engine, macOS
 objc2-core-audio = { version = "0.3", default-features = false }
 objc2-core-foundation = "0.3"

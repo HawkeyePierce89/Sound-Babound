@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 use crate::convert::InputSample;
 use crate::cpal_sink::{
     CpalStream, OPEN_TIMEOUT, build_error, device_labels, forward_errors, identity_of,
-    mic_buffer_size, name_matches, stream_info,
+    mic_buffer_size, name_matches, opened, stream_info,
 };
 use crate::error::BuildError;
 use crate::passthrough::PassthroughShared;
@@ -251,7 +251,7 @@ impl CpalCaptureFactory {
     /// one when no exclusion names it. Returns the selection and the notice
     /// it deserves.
     fn select(&mut self) -> Result<(Selection, Option<InputNotice>), BuildError> {
-        let host = platform::mic_host();
+        let host = opened(platform::mic_host())?;
         let default_device = host.default_input_device();
         let default = default_device.as_ref().map(InputCandidate::of);
         // Listing is only needed to find a fallback.

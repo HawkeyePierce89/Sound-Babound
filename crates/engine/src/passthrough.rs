@@ -70,6 +70,8 @@ pub struct PassthroughShared {
     generation: AtomicU64,
     heartbeat: AtomicU64,
     active: AtomicBool,
+    /// Set once the mic path is stopped: writes are dropped from then on.
+    closed: AtomicBool,
     underruns: AtomicU64,
     overruns: AtomicU64,
 }
@@ -83,6 +85,7 @@ impl PassthroughShared {
             generation: AtomicU64::new(0),
             heartbeat: AtomicU64::new(0),
             active: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
             overruns: AtomicU64::new(0),
         }
@@ -102,15 +105,30 @@ impl PassthroughShared {
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Close the passthrough for good: later writes are dropped and the ring
+    /// is emptied. Set when the mic path is stopped, before its supervisors
+    /// are joined, so a capture that outlives the stop (its supervisor
+    /// blocked in a device query) passes nothing on.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        while self.ring.pop().is_some() {}
+    }
+
+    /// Whether [`close`](PassthroughShared::close) was called.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     /// Write one block of interleaved capture input. Realtime-safe.
     ///
     /// Each frame is downmixed to mono by averaging its channels; a trailing
     /// partial frame is ignored. One overrun is counted per block that
     /// displaced the oldest samples from a full ring or pushed the fill past
     /// the high mark; in the latter case the oldest samples are popped until
-    /// the fill is back at the target.
+    /// the fill is back at the target. Once the passthrough is closed, the
+    /// block is dropped (the heartbeat still moves).
     pub fn write<T: InputSample>(&self, data: &[T], channels: usize) {
-        if channels > 0 {
+        if channels > 0 && !self.is_closed() {
             let scale = 1.0 / channels as f32;
             let mut overrun = false;
             for frame in data.chunks_exact(channels) {
@@ -398,6 +416,19 @@ mod tests {
         assert!(!shared.is_active());
         shared.set_active(true);
         assert!(shared.is_active());
+    }
+
+    #[test]
+    fn a_closed_passthrough_drops_its_input() {
+        let shared = shared_at(48_000);
+        write_mono(&shared, 100, 0.5);
+        assert_eq!(shared.fill(), 100);
+        shared.close();
+        assert!(shared.is_closed());
+        assert_eq!(shared.fill(), 0, "closing empties the ring");
+        write_mono(&shared, 100, 0.5);
+        assert_eq!(shared.fill(), 0);
+        assert_eq!(shared.heartbeat(), 2, "but still beats");
     }
 
     #[test]

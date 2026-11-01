@@ -16,9 +16,10 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use tracing::warn;
+use tracing::{error, info, warn};
 
 use crate::capture::CpalCaptureFactory;
 use crate::cpal_sink::CpalOutputFactory;
@@ -239,11 +240,45 @@ fn push_play(shared: &MixerShared, sound: &Sound, gain: f32, now: Instant) -> bo
         )
 }
 
+/// Join the threads of `threads` that have ended; true if none is left.
+fn join_finished(threads: &mut Vec<JoinHandle<()>>) -> bool {
+    for thread in threads.extract_if(.., |thread| thread.is_finished()) {
+        if thread.join().is_err() {
+            error!("mic supervisor thread panicked");
+        }
+    }
+    threads.is_empty()
+}
+
+/// Silences a mic path for good when dropped: the mic sink's mixer renders
+/// silence and the passthrough drops the capture's input. A stop that times
+/// out leaves a supervisor blocked in a device query still holding its
+/// stream, so the path is silenced before every stop: such a stream then
+/// carries nothing to the call, neither sounds nor the live microphone.
+#[derive(Debug)]
+struct Silencer {
+    shared: Arc<MixerShared>,
+    /// The capture's passthrough, when capture is enabled.
+    passthrough: Option<Arc<PassthroughShared>>,
+}
+
+impl Drop for Silencer {
+    fn drop(&mut self) {
+        self.shared.silence();
+        if let Some(passthrough) = &self.passthrough {
+            passthrough.close();
+        }
+    }
+}
+
 /// The running mic path: the mic sink and, when enabled, the capture.
 #[derive(Debug)]
 struct MicPath {
     settings: MicSettings,
     shared: Arc<MixerShared>,
+    // Declared before the handles, so dropping the path silences it before
+    // their `Drop` stops the supervisors.
+    silencer: Silencer,
     // Declared before `sink`, so dropping the path stops the capture first.
     capture: Option<SupervisorHandle>,
     sink: SupervisorHandle,
@@ -258,15 +293,18 @@ impl MicPath {
         )
     }
 
-    /// The path's supervisors, the capture first.
+    /// The path's supervisors, the capture first. The path is silenced
+    /// first (see [`Silencer`]), since whoever takes the handles stops them.
     fn into_handles(self) -> impl Iterator<Item = SupervisorHandle> {
+        drop(self.silencer);
         self.capture.into_iter().chain(std::iter::once(self.sink))
     }
 
-    /// Stop the capture and the mic sink together, so a hung device query
-    /// in both costs one stop timeout, not two.
-    fn shutdown(self) {
-        SupervisorHandle::shutdown_all(self.into_handles());
+    /// Silence the path, then stop the capture and the mic sink together, so
+    /// a hung device query in both costs one stop timeout, not two. Returns
+    /// the threads that did not stop in time.
+    fn shutdown(self) -> Vec<JoinHandle<()>> {
+        SupervisorHandle::shutdown_all(self.into_handles())
     }
 }
 
@@ -301,6 +339,15 @@ pub struct Engine {
     mic: Option<MicPath>,
     shared: Arc<MixerShared>,
     supervisor: SupervisorHandle,
+    /// Mic supervisor threads that did not stop in time when their mic path
+    /// was stopped: each is still blocked in a device query and may still
+    /// hold its stream (see [`Engine::mic_stopped`]).
+    stopping: Vec<JoinHandle<()>>,
+    /// Mic settings whose mic path waits for the threads in
+    /// [`Engine::stopping`] to end before it starts (see
+    /// [`Engine::resume_mic`]), so a new mic path never runs beside an old
+    /// one that may still hold its streams, the live microphone included.
+    pending_mic: Option<MicSettings>,
     /// The last master gain passed to [`Engine::set_master_gain`] (`f32`
     /// bits), so a mic path started later gets it too.
     master_gain: AtomicU32,
@@ -356,6 +403,8 @@ impl Engine {
             mic: None,
             shared,
             supervisor,
+            stopping: Vec::new(),
+            pending_mic: None,
             master_gain: AtomicU32::new(1.0f32.to_bits()),
         })
     }
@@ -369,11 +418,20 @@ impl Engine {
     /// - Any other change restarts the mic path (not the monitor).
     ///
     /// The monitor is never touched. Fails only if a supervisor thread
-    /// cannot be spawned; the mic path is then off.
+    /// cannot be spawned; the mic path is then off. A stop waits at most
+    /// `Timings::stop_timeout`; a supervisor still blocked in a device query
+    /// then is left to end on its own, and [`Engine::mic_stopped`] stays
+    /// false until it has. Until then a start or restart is deferred: the
+    /// settings are kept, [`Engine::mic_status`] reports starting, and
+    /// [`Engine::resume_mic`] starts the mic path once every stopped mic
+    /// thread has ended. A stopped path may still hold its streams (a
+    /// capture turned off may still carry the live microphone), so a new
+    /// path never runs beside it.
     pub fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<(), StartError> {
         let Some(settings) = settings else {
+            self.pending_mic = None;
             if let Some(mic) = self.mic.take() {
-                mic.shutdown();
+                self.stopping.extend(mic.shutdown());
             }
             return Ok(());
         };
@@ -391,14 +449,41 @@ impl Engine {
             return Ok(());
         }
         if let Some(mic) = self.mic.take() {
-            mic.shutdown();
+            self.stopping.extend(mic.shutdown());
         }
+        if !join_finished(&mut self.stopping) {
+            if self.pending_mic.is_none() {
+                warn!("a stopped mic path has not ended yet; the mic path starts once it has");
+            }
+            self.pending_mic = Some(settings);
+            return Ok(());
+        }
+        self.pending_mic = None;
         self.mic = Some(self.start_mic(settings)?);
         Ok(())
     }
 
-    /// Start the mic sink and, if enabled, the capture.
-    fn start_mic(&self, settings: MicSettings) -> Result<MicPath, StartError> {
+    /// Start the mic path [`Engine::set_mic`] deferred, once every stopped
+    /// mic supervisor thread has ended. Does nothing while one still runs,
+    /// or with no deferred start. Call it periodically while the mic is on.
+    /// Fails only if a supervisor thread cannot be spawned; the mic path is
+    /// then off.
+    pub fn resume_mic(&mut self) -> Result<(), StartError> {
+        if self.pending_mic.is_none() || !join_finished(&mut self.stopping) {
+            return Ok(());
+        }
+        let Some(settings) = self.pending_mic.take() else {
+            return Ok(());
+        };
+        info!("the stopped mic path has ended; starting the mic path");
+        self.mic = Some(self.start_mic(settings)?);
+        Ok(())
+    }
+
+    /// Start the mic sink and, if enabled, the capture. If the capture
+    /// cannot be spawned, the sink already started is shut down, and its
+    /// thread joins [`Engine::stopping`] if it does not stop in time.
+    fn start_mic(&mut self, settings: MicSettings) -> Result<MicPath, StartError> {
         let shared = Arc::new(MixerShared::new());
         // Applied before the first build (offline) or by the first render.
         // The queue is empty, so the pushes cannot fail.
@@ -421,21 +506,31 @@ impl Engine {
             self.timings,
         )
         .map_err(StartError::Spawn)?;
-        let capture = match passthrough {
-            Some(passthrough) => Some(
-                spawn_supervisor(
-                    self.backends.capture(&settings.capture_exclusions()),
-                    CaptureEndpoint::new(passthrough),
-                    self.backends.watcher(StreamRole::Capture),
-                    self.timings,
-                )
-                // Dropping `sink` on the way out stops it.
-                .map_err(StartError::Spawn)?,
-            ),
+        let capture = match &passthrough {
+            Some(passthrough) => match spawn_supervisor(
+                self.backends.capture(&settings.capture_exclusions()),
+                CaptureEndpoint::new(Arc::clone(passthrough)),
+                self.backends.watcher(StreamRole::Capture),
+                self.timings,
+            ) {
+                Ok(capture) => Some(capture),
+                Err(err) => {
+                    // A sink left running may still hold its stream, so it
+                    // is silenced first and `mic_stopped` must wait for it.
+                    shared.silence();
+                    self.stopping
+                        .extend(SupervisorHandle::shutdown_all(std::iter::once(sink)));
+                    return Err(StartError::Spawn(err));
+                }
+            },
             None => None,
         };
         Ok(MicPath {
             settings,
+            silencer: Silencer {
+                shared: Arc::clone(&shared),
+                passthrough,
+            },
             shared,
             capture,
             sink,
@@ -524,7 +619,11 @@ impl Engine {
 
     /// What the mic path is doing. For UI display.
     pub fn mic_status(&self) -> MicStatus {
-        self.mic.as_ref().map_or(MicStatus::Off, MicPath::status)
+        match &self.mic {
+            Some(mic) => mic.status(),
+            None if self.pending_mic.is_some() => MicStatus::Starting,
+            None => MicStatus::Off,
+        }
     }
 
     /// How long until the last frame the latest callback wrote is played,
@@ -538,18 +637,36 @@ impl Engine {
             .map_or(monitor, |mic| monitor.max(mic.shared.output_latency()))
     }
 
+    /// Whether every mic path stopped so far has ended: false while a mic
+    /// supervisor thread that a stop left running (it was blocked in a
+    /// device query past the stop timeout) has not ended yet, since it may
+    /// still hold its stream on the mic sink. Whoever owns the virtual
+    /// device keeps it until this is true.
+    pub fn mic_stopped(&mut self) -> bool {
+        join_finished(&mut self.stopping)
+    }
+
     /// Stop every stream, unregister the watchers and join the supervisor
     /// threads. They stop together, so this waits at most one
     /// `Timings::stop_timeout` even when device queries hang.
-    pub fn shutdown(self) {
+    ///
+    /// Returns whether every supervisor thread has ended, including the mic
+    /// threads an earlier stop left running (see [`Engine::mic_stopped`]).
+    /// False means a stream may still run until its blocked query returns.
+    pub fn shutdown(self) -> bool {
         let Engine {
-            mic, supervisor, ..
+            mic,
+            supervisor,
+            mut stopping,
+            ..
         } = self;
-        SupervisorHandle::shutdown_all(
+        let left = SupervisorHandle::shutdown_all(
             mic.into_iter()
                 .flat_map(MicPath::into_handles)
                 .chain(std::iter::once(supervisor)),
         );
+        let earlier = join_finished(&mut stopping);
+        left.is_empty() && earlier
     }
 
     /// Push a command built by `command` to every path. Every path gets it,
@@ -931,6 +1048,233 @@ mod tests {
         assert_monitor_untouched(&backends);
         engine.shutdown();
         assert_eq!(backends.watcher.guards_dropped(), 1);
+    }
+
+    /// An engine on fake backends whose mic sink builds hang until
+    /// released, with a short stop timeout.
+    fn hung_mic_rig() -> (Engine, FakeBackends) {
+        let backends = FakeBackends::new(
+            FakeSinkFactory::new(48_000, 2, "speakers"),
+            FakeWatcher::default(),
+        );
+        let timings = Timings {
+            stop_timeout: Duration::from_millis(100),
+            ..fast()
+        };
+        let mut engine = Engine::start_with_backends(backends.clone(), timings).unwrap();
+        assert!(wait_until(TIMEOUT, || engine.has_output()));
+        backends.mic_sink.hold_builds();
+        engine.set_mic(Some(mic_settings())).unwrap();
+        assert!(wait_until(TIMEOUT, || backends.mic_sink.building()));
+        (engine, backends)
+    }
+
+    #[test]
+    fn a_mic_stop_that_times_out_is_reported_until_its_thread_ends() {
+        let (mut engine, backends) = hung_mic_rig();
+        assert!(engine.mic_stopped());
+
+        engine.set_mic(None).unwrap();
+        assert_eq!(engine.mic_status(), MicStatus::Off);
+        // The mic sink's supervisor is still blocked in its build.
+        assert!(!engine.mic_stopped());
+
+        backends.mic_sink.release_builds();
+        assert!(wait_until(TIMEOUT, || engine.mic_stopped()));
+        assert_eq!(backends.mic_sink.live_sinks(), 0);
+        assert!(engine.shutdown());
+    }
+
+    #[test]
+    fn a_restart_waits_for_the_stopped_mic_path_to_end() {
+        let (mut engine, backends) = hung_mic_rig();
+        // Turning capture off restarts the mic path; the old one does not
+        // stop in time, so the new one waits for it.
+        let no_capture = MicSettings {
+            capture: false,
+            ..mic_settings()
+        };
+        engine.set_mic(Some(no_capture.clone())).unwrap();
+        assert!(!engine.mic_stopped());
+        assert_eq!(engine.mic_status(), MicStatus::Starting);
+        engine.resume_mic().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(backends.mic_sink_requests(), ["cable"]);
+        assert_eq!(backends.capture_requests().len(), 1);
+
+        // A newer change replaces the deferred settings.
+        let quieter = MicSettings {
+            sound_gain: 0.5,
+            ..no_capture
+        };
+        engine.set_mic(Some(quieter)).unwrap();
+        assert_eq!(backends.mic_sink_requests(), ["cable"]);
+
+        backends.mic_sink.release_builds();
+        assert!(wait_until(TIMEOUT, || engine.mic_stopped()));
+        assert_eq!(backends.mic_sink.live_sinks(), 0);
+        engine.resume_mic().unwrap();
+        assert_eq!(backends.mic_sink_requests(), ["cable", "cable"]);
+        assert_eq!(backends.capture_requests().len(), 1);
+        assert!(wait_until(TIMEOUT, || engine.mic_status()
+            == MicStatus::Active {
+                device: "cable".into(),
+                capture: CaptureStatus::Disabled,
+            }));
+        let mixer = backends.mic_sink.mixer().unwrap();
+        render(&mixer);
+        assert_eq!(mixer.lock().unwrap().path_gains(), (0.5, 1.0));
+        // Nothing is left to resume.
+        engine.resume_mic().unwrap();
+        assert_eq!(backends.mic_sink_requests().len(), 2);
+        assert!(engine.shutdown());
+    }
+
+    #[test]
+    fn mic_off_cancels_a_deferred_start() {
+        let (mut engine, backends) = hung_mic_rig();
+        engine.set_mic(None).unwrap();
+        // On again while the old path still runs: deferred.
+        engine.set_mic(Some(mic_settings())).unwrap();
+        assert_eq!(engine.mic_status(), MicStatus::Starting);
+        engine.set_mic(None).unwrap();
+        assert_eq!(engine.mic_status(), MicStatus::Off);
+
+        backends.mic_sink.release_builds();
+        assert!(wait_until(TIMEOUT, || engine.mic_stopped()));
+        engine.resume_mic().unwrap();
+        assert_eq!(backends.mic_sink_requests(), ["cable"]);
+        assert_eq!(engine.mic_status(), MicStatus::Off);
+        assert!(engine.shutdown());
+    }
+
+    /// A live mic path (sink and capture running, carrying a sound and the
+    /// microphone) whose supervisors are both blocked in an identity query
+    /// that a device event started, with a short stop timeout.
+    fn live_mic_with_hung_queries() -> (
+        Engine,
+        FakeBackends,
+        Arc<Mutex<Mixer>>,
+        Arc<PassthroughShared>,
+    ) {
+        let backends = FakeBackends::new(
+            FakeSinkFactory::new(48_000, 2, "speakers"),
+            FakeWatcher::default(),
+        );
+        let timings = Timings {
+            stop_timeout: Duration::from_millis(100),
+            ..fast()
+        };
+        let mut engine = Engine::start_with_backends(backends.clone(), timings).unwrap();
+        assert!(wait_until(TIMEOUT, || engine.has_output()));
+        mic_on(&mut engine, &backends, mic_settings());
+        let mixer = backends.mic_sink.mixer().unwrap();
+        let passthrough = backends.capture.passthrough().unwrap();
+
+        // The microphone reaches the mic sink, and so does a sound.
+        passthrough.write(&[0.25f32; 4800], 1);
+        assert!(!is_silent(&render(&mixer)));
+        assert!(engine.play(&tone(), 1.0));
+        assert!(!is_silent(&render(&mixer)));
+
+        backends.mic_sink.hold_identity_queries();
+        backends.capture.hold_identity_queries();
+        assert!(backends.watcher.send(DeviceEvent::DeviceListChanged));
+        assert!(wait_until(TIMEOUT, || backends.mic_sink.querying()
+            && backends.capture.querying()));
+        (engine, backends, mixer, passthrough)
+    }
+
+    /// The stopped path's streams still run, but carry nothing.
+    fn assert_silenced(mixer: &Mutex<Mixer>, passthrough: &PassthroughShared) {
+        assert!(passthrough.is_closed());
+        passthrough.write(&[0.25f32; 4800], 1);
+        assert_eq!(passthrough.fill(), 0);
+        assert!(is_silent(&render(mixer)));
+        assert!(is_silent(&render(mixer)));
+    }
+
+    fn release_queries(backends: &FakeBackends) {
+        backends.mic_sink.release_identity_queries();
+        backends.capture.release_identity_queries();
+    }
+
+    #[test]
+    fn a_mic_stop_that_times_out_silences_the_live_path() {
+        let (mut engine, backends, mixer, passthrough) = live_mic_with_hung_queries();
+        engine.set_mic(None).unwrap();
+        assert_eq!(engine.mic_status(), MicStatus::Off);
+        assert!(!engine.mic_stopped());
+        // Both streams are still up, blocked behind their supervisors.
+        assert_eq!(backends.mic_sink.live_sinks(), 1);
+        assert_eq!(backends.capture.live_sinks(), 1);
+        assert_silenced(&mixer, &passthrough);
+
+        release_queries(&backends);
+        assert!(wait_until(TIMEOUT, || engine.mic_stopped()));
+        assert_eq!(backends.mic_sink.live_sinks(), 0);
+        assert_eq!(backends.capture.live_sinks(), 0);
+        assert!(engine.shutdown());
+    }
+
+    #[test]
+    fn a_restart_that_times_out_silences_the_old_path_and_not_the_new_one() {
+        let (mut engine, backends, mixer, passthrough) = live_mic_with_hung_queries();
+        let no_capture = MicSettings {
+            capture: false,
+            ..mic_settings()
+        };
+        engine.set_mic(Some(no_capture)).unwrap();
+        assert_eq!(engine.mic_status(), MicStatus::Starting);
+        assert!(!engine.mic_stopped());
+        assert_silenced(&mixer, &passthrough);
+
+        release_queries(&backends);
+        assert!(wait_until(TIMEOUT, || engine.mic_stopped()));
+        engine.resume_mic().unwrap();
+        assert!(wait_until(TIMEOUT, || engine.mic_status()
+            == MicStatus::Active {
+                device: "cable".into(),
+                capture: CaptureStatus::Disabled,
+            }));
+        let new_mixer = backends.mic_sink.mixer().unwrap();
+        assert!(!Arc::ptr_eq(&mixer, &new_mixer));
+        assert!(engine.play(&tone(), 1.0));
+        assert!(!is_silent(&render(&new_mixer)));
+        assert!(engine.shutdown());
+    }
+
+    #[test]
+    fn dropping_the_mic_path_silences_it() {
+        let (mut engine, backends) = mic_rig();
+        mic_on(&mut engine, &backends, mic_settings());
+        let mixer = backends.mic_sink.mixer().unwrap();
+        let passthrough = backends.capture.passthrough().unwrap();
+        let mic = engine.mic.take().unwrap();
+        let shared = Arc::clone(&mic.shared);
+        assert!(!shared.is_silenced());
+        drop(mic);
+        assert!(shared.is_silenced());
+        assert_silenced(&mixer, &passthrough);
+        assert!(engine.shutdown());
+    }
+
+    #[test]
+    fn shutdown_reports_supervisors_left_running() {
+        let (mut engine, backends) = hung_mic_rig();
+        engine.set_mic(None).unwrap();
+        // The earlier mic stop's thread still runs.
+        assert!(!engine.shutdown());
+        backends.mic_sink.release_builds();
+        assert!(wait_until(TIMEOUT, || backends.watcher.guards_dropped() == 3));
+
+        let (engine, backends) = hung_mic_rig();
+        // The mic path's own stop times out during the shutdown.
+        assert!(!engine.shutdown());
+        backends.mic_sink.release_builds();
+
+        let (engine, _backends) = mic_rig();
+        assert!(engine.shutdown());
     }
 
     #[test]

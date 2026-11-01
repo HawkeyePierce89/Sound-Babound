@@ -96,21 +96,23 @@ impl DeviceWatcher for InputPoller {
     }
 }
 
-impl InputHost for Arc<cpal::Host> {
+impl InputHost for Option<Arc<cpal::Host>> {
     /// Only the shared PulseAudio host is kept; a fallback host is not, so
     /// the next poll tries PulseAudio again.
     fn keep(&self) -> bool {
-        self.id() == HostId::PulseAudio
+        self.as_ref()
+            .is_some_and(|host| host.id() == HostId::PulseAudio)
     }
 
-    /// A failed input list means the connection is gone.
+    /// A failed input list (or no host) means the connection is gone.
     fn inputs(&self) -> Option<InputsSnapshot> {
-        let inputs = self
+        let host = self.as_ref()?;
+        let inputs = host
             .input_devices()
             .ok()?
             .map(|device| identity_of(&device))
             .collect();
-        let default = self
+        let default = host
             .default_input_device()
             .map(|device| identity_of(&device));
         Some(InputsSnapshot::new(default, inputs))
@@ -137,7 +139,7 @@ impl DeviceWatcher for OutputPoller {
 
 /// The mic host asked for its outputs: a snapshot with no default whose list
 /// holds the outputs.
-struct OutputList(Arc<cpal::Host>);
+struct OutputList(Option<Arc<cpal::Host>>);
 
 impl InputHost for OutputList {
     /// Only the shared PulseAudio host is kept, as for the inputs.
@@ -145,10 +147,11 @@ impl InputHost for OutputList {
         self.0.keep()
     }
 
-    /// A failed output list means the connection is gone.
+    /// A failed output list (or no host) means the connection is gone.
     fn inputs(&self) -> Option<InputsSnapshot> {
         let outputs = self
             .0
+            .as_ref()?
             .output_devices()
             .ok()?
             .map(|device| identity_of(&device))

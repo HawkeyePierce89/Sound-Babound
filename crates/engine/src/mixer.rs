@@ -85,6 +85,8 @@ pub struct MixerShared {
     commands_applied: AtomicU64,
     callback_heartbeat: AtomicU64,
     output_active: AtomicBool,
+    /// Set once the path is stopped: renders output silence from then on.
+    silenced: AtomicBool,
     output_latency_nanos: AtomicU64,
     /// The reference point for `grace_until_nanos`.
     epoch: Instant,
@@ -103,6 +105,7 @@ impl MixerShared {
             commands_applied: AtomicU64::new(0),
             callback_heartbeat: AtomicU64::new(0),
             output_active: AtomicBool::new(false),
+            silenced: AtomicBool::new(false),
             output_latency_nanos: AtomicU64::new(0),
             epoch: Instant::now(),
             grace_until_nanos: AtomicU64::new(0),
@@ -181,6 +184,20 @@ impl MixerShared {
         self.grace_until_nanos.store(0, Ordering::Release);
     }
 
+    /// Silence this path for good: every later render outputs silence (no
+    /// voices, no passthrough), whatever stream renders it. Set when the
+    /// path is stopped, before its supervisor is joined, so a stream that
+    /// outlives the stop (its supervisor blocked in a device query) carries
+    /// nothing, the live microphone included.
+    pub fn silence(&self) {
+        self.silenced.store(true, Ordering::Release);
+    }
+
+    /// Whether [`silence`](MixerShared::silence) was called.
+    pub fn is_silenced(&self) -> bool {
+        self.silenced.load(Ordering::Acquire)
+    }
+
     /// Set by the supervisor around every build.
     pub fn set_output_active(&self, active: bool) {
         self.output_active.store(active, Ordering::Release);
@@ -216,6 +233,7 @@ impl std::fmt::Debug for MixerShared {
             .field("commands_applied", &self.commands_applied())
             .field("callback_heartbeat", &self.callback_heartbeat())
             .field("output_active", &self.output_active())
+            .field("silenced", &self.is_silenced())
             .field(
                 "grace_until_nanos",
                 &self.grace_until_nanos.load(Ordering::Acquire),
@@ -373,6 +391,8 @@ impl Mixer {
     }
 
     /// Mix every voice into `out` (interleaved, `channels` per frame).
+    /// Outputs silence once the path is silenced (`MixerShared::silence`),
+    /// still applying commands and releasing sounds.
     /// Realtime-safe: no allocation, no freeing, no locks, no I/O.
     pub fn render(&mut self, out: &mut [f32]) {
         self.retry_pending();
@@ -380,7 +400,7 @@ impl Mixer {
         let applied = self.apply_commands();
 
         out.fill(0.0);
-        if self.channels > 0 && self.sample_rate > 0 {
+        if self.channels > 0 && self.sample_rate > 0 && !self.shared.is_silenced() {
             self.mix(out);
         }
         self.release_finished();
@@ -742,6 +762,30 @@ mod tests {
         assert_eq!(m.shared().commands_applied(), 1);
         assert_eq!(m.shared().callback_heartbeat(), 1);
         assert_eq!(m.render_scratch(64).len(), 0);
+    }
+
+    #[test]
+    fn a_silenced_mixer_renders_silence_but_still_applies_commands() {
+        let passthrough = Arc::new(PassthroughShared::new());
+        let mut m = Mixer::with_passthrough(Arc::new(MixerShared::new()), passthrough.reader());
+        m.configure(48_000, 2);
+        passthrough.begin_capture(48_000);
+        passthrough.write(&[0.25f32; 4800], 1);
+        let s = constant(0.5, 4800, 48_000, 1);
+        play(&m, &s, 1.0);
+        assert!(render(&mut m, 64).iter().any(|&x| x != 0.0));
+
+        m.shared().silence();
+        assert!(m.shared().is_silenced());
+        play(&m, &s, 1.0);
+        assert!(render(&mut m, 64).iter().all(|&x| x == 0.0));
+        assert_eq!(m.shared().commands_applied(), 2);
+        assert_eq!(m.shared().callback_heartbeat(), 2);
+        // A stop still releases the voices.
+        m.shared().push(Command::StopAll).unwrap();
+        render(&mut m, 64);
+        assert_eq!(m.shared().active_voices(), 0);
+        assert_eq!(m.shared().drain_garbage(), 2);
     }
 
     #[test]

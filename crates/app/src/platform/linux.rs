@@ -89,17 +89,32 @@ type PactlRunner = fn(&[String]) -> anyhow::Result<String>;
 ///
 /// Dropping it unloads both modules, the source first, if they are still
 /// loaded.
+///
+/// It holds the device lock (see [`super::lock_device`]) for as long as it
+/// lives, so only one process at a time owns the modules. The fields drop in
+/// order: the modules are unloaded before the lock is released.
 pub struct VirtualMic {
     device: super::PactlDevice<PactlRunner>,
+    _lock: std::fs::File,
 }
 
 impl VirtualMic {
-    /// Unloads modules a crashed run left behind, then loads the null sink and
-    /// the remap source.
+    /// Takes the device lock (failing if another instance holds it), unloads
+    /// modules a crashed run left behind, then loads the null sink and the
+    /// remap source.
     pub fn create() -> anyhow::Result<Self> {
+        let path = super::device_lock_path(std::env::var_os("XDG_RUNTIME_DIR"), dirs::cache_dir())
+            .context(
+                "found no per-user directory for the virtual mic's lock file \
+                     (XDG_RUNTIME_DIR and HOME are not set)",
+            )?;
+        let lock = super::lock_device(&path)?;
         let run: PactlRunner = run_pactl;
         super::PactlDevice::create(run)
-            .map(|device| Self { device })
+            .map(|device| Self {
+                device,
+                _lock: lock,
+            })
             .context("could not create the virtual mic through pactl")
     }
 

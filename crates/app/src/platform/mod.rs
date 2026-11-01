@@ -336,6 +336,66 @@ fn stale_modules(list: &str) -> Vec<u32> {
     sources
 }
 
+/// The file whose lock says which process owns the Linux virtual
+/// microphone: in `XDG_RUNTIME_DIR` (private to the user, like the sound
+/// server's socket), or else in `sound-babound` inside the user's cache
+/// directory. Never in the shared temp dir, where another user could create
+/// the file first and keep the owner from opening it. Each directory counts
+/// only if it is an absolute path; `None` if neither is.
+#[cfg(any(target_os = "linux", test))]
+fn device_lock_path(
+    runtime_dir: Option<std::ffi::OsString>,
+    cache_dir: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    const NAME: &str = "sound-babound-virtual-mic.lock";
+    let runtime_dir = runtime_dir
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_absolute());
+    if let Some(dir) = runtime_dir {
+        return Some(dir.join(NAME));
+    }
+    cache_dir
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("sound-babound").join(NAME))
+}
+
+/// An exclusive lock on `path`, held until the returned file is dropped (or
+/// the process ends, so a crashed run never keeps it).
+///
+/// The virtual device's module names are fixed, and creating it unloads the
+/// modules with those names as stale. Without the lock a second tray would
+/// unload the first one's live null sink; the server would then move the
+/// first tray's mic sink stream (the live microphone included) to the
+/// speakers, and recreating the sink under the same name right away could
+/// hide the change from its device poller. Holding the lock while the device
+/// exists makes the stale cleanup safe: no other live process owns modules
+/// with these names.
+///
+/// The file's directory is created if it is missing.
+#[cfg(any(target_os = "linux", test))]
+fn lock_device(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    use anyhow::Context;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("could not open the lock file {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+            "another Sound-Babound instance owns the virtual mic; turn its mic off or quit it"
+        ),
+        Err(std::fs::TryLockError::Error(err)) => {
+            Err(err).with_context(|| format!("could not lock {}", path.display()))
+        }
+    }
+}
+
 /// The null sink and remap source behind the Linux virtual microphone, loaded
 /// through `run` (one `pactl` invocation per call, returning its stdout).
 ///
@@ -437,6 +497,39 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+
+    #[test]
+    fn the_device_lock_lives_in_a_per_user_dir() {
+        let cache = Some(std::path::PathBuf::from("/home/ann/.cache"));
+        assert_eq!(
+            device_lock_path(Some("/run/user/1000".into()), cache.clone()),
+            Some("/run/user/1000/sound-babound-virtual-mic.lock".into())
+        );
+        let in_cache = Some("/home/ann/.cache/sound-babound/sound-babound-virtual-mic.lock".into());
+        // An empty or relative runtime dir does not count.
+        assert_eq!(device_lock_path(Some("".into()), cache.clone()), in_cache);
+        assert_eq!(
+            device_lock_path(Some("run/user".into()), cache.clone()),
+            in_cache
+        );
+        assert_eq!(device_lock_path(None, cache), in_cache);
+        // Never the shared temp dir: no per-user dir means no lock path.
+        assert_eq!(device_lock_path(None, None), None);
+        assert_eq!(device_lock_path(None, Some("cache".into())), None);
+    }
+
+    #[test]
+    fn the_device_lock_admits_one_owner_at_a_time() {
+        let dir = crate::test_support::TempDir::new("device-lock");
+        // Its directory is created on the way.
+        let path = dir.path().join("sound-babound").join("virtual-mic.lock");
+        let first = lock_device(&path).unwrap();
+        let err = lock_device(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("another Sound-Babound instance"));
+        drop(first);
+        let again = lock_device(&path).unwrap();
+        drop(again);
+    }
 
     #[cfg(unix)]
     fn sh(script: &str) -> std::process::Command {

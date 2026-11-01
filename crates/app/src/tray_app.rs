@@ -19,8 +19,8 @@ use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::actions::{
-    self, Action, ActionMap, CaptureGate, MENU_OPEN_CONFIG, MENU_QUIT, MENU_RELOAD, MENU_STOP_ALL,
-    MENU_TOGGLE_MIC, Soundboard, WithVirtualMic,
+    self, Action, ActionMap, AudioControl, CaptureGate, MENU_OPEN_CONFIG, MENU_QUIT, MENU_RELOAD,
+    MENU_STOP_ALL, MENU_TOGGLE_MIC, Soundboard, WithVirtualMic,
 };
 use crate::{paths, platform};
 
@@ -430,7 +430,8 @@ impl TrayApp {
     }
 
     /// Creates the app's own virtual device again if the mic sink cannot
-    /// find it because it is gone (a sound server restart drops it).
+    /// find it because it is gone (a sound server restart drops it), or if
+    /// the mic path waits for it because creating it failed.
     fn restore_virtual_mic(&mut self) {
         if !matches!(self.mic_status(), MicStatus::NotFound(_)) {
             return;
@@ -440,11 +441,15 @@ impl TrayApp {
         }
     }
 
-    /// The engine's current mic status.
+    /// The engine's current mic status, or not found while the mic path
+    /// waits for the virtual device to be created.
     fn mic_status(&self) -> MicStatus {
         self.audio
             .as_ref()
-            .map_or(MicStatus::Off, |audio| audio.control().mic_status())
+            .map_or(MicStatus::Off, |audio| match audio.waiting_for_device() {
+                Some(pattern) => MicStatus::NotFound(pattern.to_string()),
+                None => audio.control().mic_status(),
+            })
     }
 
     /// The status line's text for the engine's current mic status.
@@ -471,17 +476,28 @@ impl TrayApp {
     }
 
     /// Refreshes the mic status when due and sets the event loop to wake
-    /// for the next refresh while the mic is enabled. Leaves an exit alone.
+    /// for the next refresh while the mic is enabled, or while a retired
+    /// virtual device waits for a mic stream that did not stop in time.
+    /// Leaves an exit alone.
     fn schedule_mic_poll(&mut self, control_flow: &mut ControlFlow) {
-        if matches!(control_flow, ControlFlow::ExitWithCode(_)) || self.audio.is_none() {
+        let Some(audio) = &self.audio else {
+            return;
+        };
+        if matches!(control_flow, ControlFlow::ExitWithCode(_)) {
             return;
         }
         let (refresh, next) = mic_poll(
-            self.board.map().mic().enabled,
+            self.board.map().mic().enabled || audio.has_retired_device(),
             self.next_mic_poll,
             Instant::now(),
         );
         if refresh {
+            if let Some(audio) = &mut self.audio {
+                audio.release_retired();
+                if let Err(err) = audio.resume_mic() {
+                    tracing::error!("{err:#}; the mic path did not start");
+                }
+            }
             self.recheck_capture();
             self.restore_virtual_mic();
             self.refresh_mic_status();
@@ -491,8 +507,8 @@ impl TrayApp {
     }
 
     /// Unregisters the hotkeys, shuts the engine down and then drops the
-    /// virtual device, removes the icon and leaves the event loop with
-    /// `code`.
+    /// virtual device (or leaves it loaded if a mic stream did not stop in
+    /// time), removes the icon and leaves the event loop with `code`.
     fn quit(&mut self, control_flow: &mut ControlFlow, code: i32) {
         self.hotkeys.unregister_all();
         if let Some(audio) = self.audio.take() {

@@ -450,7 +450,13 @@ impl SupervisorHandle {
     /// first, then all are waited for against one deadline, so they
     /// take at most one [`Timings::stop_timeout`] between them rather than
     /// one each.
-    pub fn shutdown_all(handles: impl IntoIterator<Item = SupervisorHandle>) {
+    ///
+    /// Returns the threads that did not stop in time: each is still blocked
+    /// in a device query, may still hold its stream, and stops on its own
+    /// once the query returns. [`JoinHandle::is_finished`] tells when.
+    pub fn shutdown_all(
+        handles: impl IntoIterator<Item = SupervisorHandle>,
+    ) -> Vec<JoinHandle<()>> {
         let mut handles: Vec<SupervisorHandle> = handles.into_iter().collect();
         for handle in &handles {
             handle.signal();
@@ -461,14 +467,16 @@ impl SupervisorHandle {
             .max()
             .unwrap_or_default();
         let deadline = Instant::now() + timeout;
-        for handle in &mut handles {
-            handle.wait(deadline);
-        }
+        handles
+            .iter_mut()
+            .filter_map(|handle| handle.wait(deadline))
+            .collect()
     }
 
     fn stop(&mut self) {
         self.signal();
-        self.wait(Instant::now() + self.stop_timeout);
+        // A thread left running stops on its own; nobody waits for it.
+        let _ = self.wait(Instant::now() + self.stop_timeout);
     }
 
     /// Tell a running thread to stop.
@@ -480,11 +488,10 @@ impl SupervisorHandle {
         }
     }
 
-    /// Join the thread if it ends by `deadline`; otherwise leave it.
-    fn wait(&mut self, deadline: Instant) {
-        let Some(thread) = self.thread.take() else {
-            return;
-        };
+    /// Join the thread if it ends by `deadline`; otherwise leave it and
+    /// return it.
+    fn wait(&mut self, deadline: Instant) -> Option<JoinHandle<()>> {
+        let thread = self.thread.take()?;
         let done = self.done.get_mut().unwrap_or_else(PoisonError::into_inner);
         let left = deadline.saturating_duration_since(Instant::now());
         if let Err(RecvTimeoutError::Timeout) = done.recv_timeout(left) {
@@ -493,11 +500,12 @@ impl SupervisorHandle {
                 "supervisor did not stop in time (a device query is not returning); \
                  leaving its thread to stop on its own"
             );
-            return;
+            return Some(thread);
         }
         if thread.join().is_err() {
             error!("supervisor thread panicked");
         }
+        None
     }
 }
 
@@ -1657,10 +1665,13 @@ mod tests {
         }
 
         let start = Instant::now();
-        SupervisorHandle::shutdown_all(handles);
+        let left = SupervisorHandle::shutdown_all(handles);
         let waited = start.elapsed();
         // One timeout, not three.
         assert!(waited >= ms(300) && waited < ms(800), "{waited:?}");
+        // The hung threads are handed back, still running.
+        assert_eq!(left.len(), 3);
+        assert!(left.iter().all(|thread| !thread.is_finished()));
 
         for factory in &factories {
             factory.release_builds();
@@ -1669,6 +1680,9 @@ mod tests {
         for factory in &factories {
             assert!(wait_until(WAIT, || factory.live_sinks() == 0));
         }
+        assert!(wait_until(WAIT, || left
+            .iter()
+            .all(|thread| thread.is_finished())));
     }
 
     #[test]
@@ -1687,7 +1701,7 @@ mod tests {
             })
             .collect();
         assert!(wait_until(WAIT, || factory.live_sinks() == 2));
-        SupervisorHandle::shutdown_all(handles);
+        assert!(SupervisorHandle::shutdown_all(handles).is_empty());
         // Joined: everything is torn down by the time it returns.
         assert_eq!(factory.live_sinks(), 0);
         assert_eq!(watcher.guards_dropped(), 2);

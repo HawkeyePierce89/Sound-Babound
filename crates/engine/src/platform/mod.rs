@@ -9,6 +9,10 @@
 //!   the whole process (see [`shared_host`]).
 //! - [`MIC_PERIOD_MS`]: the period the mic paths' streams ask for, if the
 //!   host's default does not suit the passthrough.
+//!
+//! Both host functions return `None` when no host can be opened (only on
+//! Linux, where opening one may be held off); a build then fails and is
+//! retried.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -36,14 +40,14 @@ pub use windows::SMOKE_MIC_PATTERN;
 
 /// Every other OS: cpal's default host for every role.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub fn monitor_host() -> cpal::Host {
-    cpal::default_host()
+pub fn monitor_host() -> Option<std::sync::Arc<cpal::Host>> {
+    Some(std::sync::Arc::new(cpal::default_host()))
 }
 
 /// Every other OS: cpal's default host for every role.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub fn mic_host() -> std::sync::Arc<cpal::Host> {
-    std::sync::Arc::new(cpal::default_host())
+pub fn mic_host() -> Option<std::sync::Arc<cpal::Host>> {
+    Some(std::sync::Arc::new(cpal::default_host()))
 }
 
 /// Every other OS: the host's default period.

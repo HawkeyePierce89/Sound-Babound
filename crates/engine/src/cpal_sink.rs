@@ -77,11 +77,13 @@ impl CpalOutputFactory {
     /// Resolve the device a build would use now, without building a stream.
     fn resolve(&self) -> Result<cpal::Device, BuildError> {
         match &self.target {
-            OutputTarget::Default => platform::monitor_host()
+            OutputTarget::Default => opened(platform::monitor_host())?
                 .default_output_device()
                 .ok_or(BuildError::NoDevice),
             OutputTarget::Named(pattern) => {
-                let devices = platform::mic_host().output_devices().map_err(build_error)?;
+                let devices = opened(platform::mic_host())?
+                    .output_devices()
+                    .map_err(build_error)?;
                 first_match(devices, pattern, device_labels)
                     .ok_or_else(|| BuildError::DeviceNotFound(pattern.clone()))
             }
@@ -250,6 +252,12 @@ pub(crate) fn mic_buffer_size(
         }
         _ => BufferSize::Default,
     }
+}
+
+/// The host a [`platform`] host function opened, or the build error for
+/// none.
+pub(crate) fn opened(host: Option<Arc<cpal::Host>>) -> Result<Arc<cpal::Host>, BuildError> {
+    host.ok_or_else(|| BuildError::Backend("no audio host could be opened".to_owned()))
 }
 
 pub(crate) fn build_error(err: cpal::Error) -> BuildError {

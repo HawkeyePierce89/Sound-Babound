@@ -113,6 +113,10 @@ struct SinkState {
     hold: bool,
     /// A build is waiting at the gate.
     building: bool,
+    /// Identity queries wait at the gate while this is set.
+    hold_queries: bool,
+    /// An identity query is waiting at the gate.
+    querying: bool,
 }
 
 /// Longest a held build waits at the gate.
@@ -161,6 +165,8 @@ impl FakeSinkFactory {
                 overlapping_builds: 0,
                 hold: false,
                 building: false,
+                hold_queries: false,
+                querying: false,
             }),
             gate: Condvar::new(),
         }))
@@ -188,6 +194,26 @@ impl FakeSinkFactory {
     /// Whether a build is waiting at the gate.
     pub(crate) fn building(&self) -> bool {
         self.state().building
+    }
+
+    /// Make every following identity query wait until
+    /// [`release_identity_queries`], or at most [`BUILD_HOLD_LIMIT`], as a
+    /// query to a sound server that stopped answering does.
+    ///
+    /// [`release_identity_queries`]: FakeSinkFactory::release_identity_queries
+    pub(crate) fn hold_identity_queries(&self) {
+        self.state().hold_queries = true;
+    }
+
+    /// Let held and later identity queries proceed.
+    pub(crate) fn release_identity_queries(&self) {
+        self.state().hold_queries = false;
+        self.0.gate.notify_all();
+    }
+
+    /// Whether an identity query is waiting at the gate.
+    pub(crate) fn querying(&self) -> bool {
+        self.state().querying
     }
 
     /// Fail the next `n` builds.
@@ -318,6 +344,16 @@ impl FakeSinkFactory {
     fn fake_identity(&self) -> Option<DeviceIdentity> {
         let mut state = self.state();
         state.identity_queries += 1;
+        if state.hold_queries {
+            state.querying = true;
+            state = self
+                .0
+                .gate
+                .wait_timeout_while(state, BUILD_HOLD_LIMIT, |s| s.hold_queries)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+            state.querying = false;
+        }
         if state.not_found.is_some() {
             return None;
         }

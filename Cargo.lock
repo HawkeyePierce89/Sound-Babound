@@ -131,6 +131,7 @@ dependencies = [
  "cpal",
  "crossbeam-queue",
  "objc2-core-audio",
+ "pulseaudio",
  "symphonia",
  "thiserror 2.0.21",
  "tracing",

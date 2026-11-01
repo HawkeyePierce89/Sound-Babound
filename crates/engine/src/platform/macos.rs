@@ -3,14 +3,14 @@
 use std::sync::Arc;
 
 /// The monitor's host: CoreAudio.
-pub fn monitor_host() -> cpal::Host {
-    cpal::default_host()
+pub fn monitor_host() -> Option<Arc<cpal::Host>> {
+    Some(Arc::new(cpal::default_host()))
 }
 
 /// The mic paths' host: CoreAudio, which lists virtual cables such as
 /// BlackHole as ordinary devices.
-pub fn mic_host() -> Arc<cpal::Host> {
-    Arc::new(cpal::default_host())
+pub fn mic_host() -> Option<Arc<cpal::Host>> {
+    Some(Arc::new(cpal::default_host()))
 }
 
 /// The mic paths' stream period: CoreAudio's default (the device's
