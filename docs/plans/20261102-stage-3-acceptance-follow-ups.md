@@ -154,14 +154,13 @@ Item 9, `WORKER_FINISH_TIMEOUT`:
 - [x] `finish_within`'s warning says the same in one sentence. The value stays 10 s.
 - [x] Run `cargo test -p sound-babound`; it must pass before Task 4.
 
-### Task 4: Verify acceptance criteria
 
-- [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --workspace --all-targets` with zero warnings
-- [ ] `cargo test --workspace`. The existing drift tests pass with unchanged tolerances, and the new cases (4096/4096, 48k → 44.1k long block, two writes with no read, same-rate rebuild) pass.
-- [ ] `cargo check --workspace --target x86_64-pc-windows-msvc`
-- [ ] The Linux cross-check: `PKG_CONFIG=<stub> PKG_CONFIG_ALLOW_CROSS=1 cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu`
-- [ ] Every new behavior has a test that fails without its fix: items 1, 2, 5, 6 and 7.
+- [x] `cargo fmt --all -- --check`
+- [x] `cargo clippy --workspace --all-targets` with zero warnings
+- [x] `cargo test --workspace`. The existing drift tests pass with unchanged tolerances, and the new cases (4096/4096, 48k → 44.1k long block, two writes with no read, same-rate rebuild) pass.
+- [x] `cargo check --workspace --target x86_64-pc-windows-msvc`
+- [x] The Linux cross-check: `PKG_CONFIG=<stub> PKG_CONFIG_ALLOW_CROSS=1 cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu`
+- [x] Every new behavior has a test that fails without its fix: items 1, 2, 5, 6 and 7.
 
 ### Task 5: Update documentation
 
