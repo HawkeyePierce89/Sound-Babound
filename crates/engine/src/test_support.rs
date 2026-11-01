@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::error::{BuildError, WatcherError};
 use crate::mixer::Mixer;
 use crate::sink::{ActiveSink, BuiltSink, DeviceIdentity, SinkFactory, StreamInfo};
-use crate::supervisor::SupervisorMsg;
+use crate::supervisor::{StreamErrorKind, SupervisorMsg};
 use crate::watcher::{DeviceEvent, DeviceWatcher, EventSender, WatcherGuard};
 
 /// Poll `condition` every 5 ms until it holds or `timeout` passes.
@@ -167,10 +167,13 @@ impl FakeSinkFactory {
     }
 
     /// Report a stream error the way a real stream callback would.
-    pub(crate) fn send_stream_error(&self) -> bool {
+    pub(crate) fn send_stream_error(&self, kind: StreamErrorKind) -> bool {
         lock(&self.0).error_sender.as_ref().is_some_and(|s| {
-            s.send(SupervisorMsg::StreamError("fake stream error".into()))
-                .is_ok()
+            s.send(SupervisorMsg::StreamError {
+                kind,
+                message: "fake stream error".into(),
+            })
+            .is_ok()
         })
     }
 }

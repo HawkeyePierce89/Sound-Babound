@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use tracing::{debug, error, info, warn};
+use tracing::{Level, debug, error, info, warn};
 
 use crate::mixer::{Mixer, MixerShared};
 use crate::sink::{ActiveSink, DeviceIdentity, SinkFactory};
@@ -62,10 +62,33 @@ pub const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
 pub enum SupervisorMsg {
     /// A device event from the watcher.
     Device(DeviceEvent),
-    /// The active stream reported an error.
-    StreamError(String),
+    /// The active stream reported an error. Every kind rebuilds; the kind
+    /// only picks the log level (see [`stream_error_level`]).
+    StreamError {
+        kind: StreamErrorKind,
+        message: String,
+    },
     /// Stop the stream and exit the thread.
     Shutdown,
+}
+
+/// What kind of error a stream reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamErrorKind {
+    /// The backend rerouted the stream because the device changed. This is
+    /// the expected result of switching outputs, not a fault.
+    DeviceChanged,
+    /// Any other error that needs a rebuild.
+    Other,
+}
+
+/// The level a stream error is logged at. A device change is routine and
+/// logged at debug; anything else is a warning. Both rebuild.
+pub(crate) fn stream_error_level(kind: StreamErrorKind) -> Level {
+    match kind {
+        StreamErrorKind::DeviceChanged => Level::DEBUG,
+        StreamErrorKind::Other => Level::WARN,
+    }
 }
 
 /// The supervisor's time constants.
@@ -416,8 +439,12 @@ impl<F: SinkFactory> Worker<F> {
                 .min(DRAIN_INTERVAL);
             match receiver.recv_timeout(wait) {
                 Ok(SupervisorMsg::Device(event)) => self.on_device_event(event),
-                Ok(SupervisorMsg::StreamError(err)) => {
-                    warn!(error = %err, "output stream error");
+                Ok(SupervisorMsg::StreamError { kind, message }) => {
+                    if stream_error_level(kind) == Level::DEBUG {
+                        debug!(error = %message, "output device changed; rebuilding");
+                    } else {
+                        warn!(error = %message, "output stream error");
+                    }
                     self.core.on_stream_error(Instant::now());
                 }
                 Ok(SupervisorMsg::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
@@ -1125,10 +1152,32 @@ mod tests {
         let watcher = FakeWatcher::default();
         let handle = spawn(&factory, &watcher);
         assert!(wait_until(WAIT, || factory.builds().len() == 1));
-        assert!(factory.send_stream_error());
+        assert!(factory.send_stream_error(StreamErrorKind::Other));
         assert!(wait_until(WAIT, || factory.builds().len() == 2));
         assert_eq!(factory.overlapping_builds(), 0);
         handle.shutdown();
+    }
+
+    #[test]
+    fn device_changed_stream_error_still_rebuilds() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let watcher = FakeWatcher::default();
+        let handle = spawn(&factory, &watcher);
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        assert!(factory.send_stream_error(StreamErrorKind::DeviceChanged));
+        assert!(wait_until(WAIT, || factory.builds().len() == 2));
+        assert_eq!(factory.overlapping_builds(), 0);
+        assert_eq!(factory.live_sinks(), 1);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn device_changed_logs_at_debug_and_others_at_warn() {
+        assert_eq!(
+            stream_error_level(StreamErrorKind::DeviceChanged),
+            Level::DEBUG
+        );
+        assert_eq!(stream_error_level(StreamErrorKind::Other), Level::WARN);
     }
 
     #[test]
@@ -1201,7 +1250,7 @@ mod tests {
         watcher.fail_start();
         let handle = spawn(&factory, &watcher);
         assert!(wait_until(WAIT, || factory.builds().len() == 1));
-        assert!(factory.send_stream_error());
+        assert!(factory.send_stream_error(StreamErrorKind::Other));
         assert!(wait_until(WAIT, || factory.builds().len() == 2));
         handle.shutdown();
     }

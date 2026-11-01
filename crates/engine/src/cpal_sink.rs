@@ -15,7 +15,7 @@ use crate::convert::{OutputSample, fill_silence, write_samples};
 use crate::error::BuildError;
 use crate::mixer::Mixer;
 use crate::sink::{ActiveSink, BuiltSink, DeviceIdentity, SinkFactory, StreamInfo};
-use crate::supervisor::SupervisorMsg;
+use crate::supervisor::{StreamErrorKind, SupervisorMsg};
 
 /// How long the backend may take to open a stream before the build fails
 /// (and the supervisor retries). Not every backend honors it.
@@ -113,6 +113,15 @@ fn needs_rebuild(kind: ErrorKind) -> bool {
     !matches!(kind, ErrorKind::Xrun | ErrorKind::RealtimeDenied)
 }
 
+/// How the supervisor classifies a forwarded stream error. Only the log
+/// level depends on it; every forwarded error rebuilds.
+fn stream_error_kind(kind: ErrorKind) -> StreamErrorKind {
+    match kind {
+        ErrorKind::DeviceChanged => StreamErrorKind::DeviceChanged,
+        _ => StreamErrorKind::Other,
+    }
+}
+
 fn build_typed<T>(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -130,7 +139,10 @@ where
             },
             move |err: cpal::Error| {
                 if needs_rebuild(err.kind()) {
-                    let _ = on_error.send(SupervisorMsg::StreamError(err.to_string()));
+                    let _ = on_error.send(SupervisorMsg::StreamError {
+                        kind: stream_error_kind(err.kind()),
+                        message: err.to_string(),
+                    });
                 }
             },
             Some(OPEN_TIMEOUT),
@@ -344,6 +356,22 @@ mod tests {
         assert!(needs_rebuild(ErrorKind::DeviceNotAvailable));
         assert!(needs_rebuild(ErrorKind::StreamInvalidated));
         assert!(needs_rebuild(ErrorKind::BackendError));
+    }
+
+    #[test]
+    fn device_changed_maps_to_its_own_kind() {
+        assert_eq!(
+            stream_error_kind(ErrorKind::DeviceChanged),
+            StreamErrorKind::DeviceChanged
+        );
+        for kind in [
+            ErrorKind::DeviceNotAvailable,
+            ErrorKind::StreamInvalidated,
+            ErrorKind::BackendError,
+            ErrorKind::DeviceBusy,
+        ] {
+            assert_eq!(stream_error_kind(kind), StreamErrorKind::Other, "{kind:?}");
+        }
     }
 
     #[test]

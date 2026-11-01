@@ -102,14 +102,14 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 
 - Modify: `crates/engine/src/supervisor.rs`, `crates/engine/src/cpal_sink.rs`, `crates/engine/src/test_support.rs`
 
-- [ ] Replace `SupervisorMsg::StreamError(String)` with `StreamError { kind: StreamErrorKind, message: String }`, where `StreamErrorKind` is `DeviceChanged` or `Other`.
-- [ ] Map cpal `ErrorKind::DeviceChanged` to `DeviceChanged` in the cpal error callback. `needs_rebuild` is unchanged.
-- [ ] Add a pure `stream_error_level(kind) -> tracing::Level`: DEBUG for `DeviceChanged`, WARN otherwise. The worker logs at that level. Both kinds still rebuild.
-- [ ] Tests:
+- [x] Replace `SupervisorMsg::StreamError(String)` with `StreamError { kind: StreamErrorKind, message: String }`, where `StreamErrorKind` is `DeviceChanged` or `Other`.
+- [x] Map cpal `ErrorKind::DeviceChanged` to `DeviceChanged` in the cpal error callback. `needs_rebuild` is unchanged.
+- [x] Add a pure `stream_error_level(kind) -> tracing::Level`: DEBUG for `DeviceChanged`, WARN otherwise. The worker logs at that level. Both kinds still rebuild.
+- [x] Tests:
   - the level mapping;
   - the cpal `ErrorKind` to `StreamErrorKind` mapping;
   - a thread-level test where a `DeviceChanged` error still rebuilds.
-- [ ] Run the verification gates. All must pass before Task 3.
+- [x] Run the verification gates. All must pass before Task 3.
 
 ### Task 3: Plays accepted during a live rebuild (Part A.3)
 
