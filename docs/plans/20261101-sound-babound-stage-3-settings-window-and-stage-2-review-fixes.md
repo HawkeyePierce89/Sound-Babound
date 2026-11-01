@@ -242,15 +242,16 @@ Part B fixes the five findings from the stage 2 acceptance review:
 **Files:**
 - Modify: `crates/app/src/tray_app.rs`, `crates/app/src/platform/mod.rs` (if `VirtualMic` needs a `Send` note)
 
-- [ ] `UserEvent::Device(DeviceReply)`. The worker's reply callback sends it through an `EventLoopProxy`, and the loop hands it to `WithVirtualMic` and refreshes the status line.
-- [ ] `TrayAudio` uses the worker. On Windows and macOS `create` returns `Ok(None)` at once, so the path starts after one round trip.
-- [ ] `quit` uses the new `shutdown`.
-- [ ] The tray's mic status maps "creating" to `MicStatus::Starting`.
-- [ ] Tests:
+- [x] `UserEvent::Device(DeviceReply)`. The worker's reply callback sends it through an `EventLoopProxy`, and the loop hands it to `WithVirtualMic` and refreshes the status line.
+- [x] `TrayAudio` uses the worker. On Windows and macOS `create` returns `Ok(None)` at once, so the path starts after one round trip.
+- [x] `quit` uses the new `shutdown`.
+- [x] The tray's mic status maps "creating" to `MicStatus::Starting`.
+- [x] Tests:
   - a pure mapping test from the virtual-mic wait state to the tray's `MicStatus`;
   - the existing `mic_poll` tests still pass.
   - The event loop itself is not unit tested.
-- [ ] Run the verification gates plus the Linux cross clippy. All must pass before Task 7.
+  - Note: the event loop is now built before the worker is spawned, so the worker's reply callback holds an `EventLoopProxy`; a reply sent before the loop runs (the startup `Create`) waits in its queue. The `mpsc` channel and `handle_device_replies` are gone. The pure mapping is `tray_mic_status(wait, engine)`, which asks the engine only when nothing is waited for. `platform/mod.rs` needed no change: `VirtualMic` was already `Send` for the worker (Task 5).
+- [x] Run the verification gates plus the Linux cross clippy. All must pass before Task 7.
 
 ### Task 7: Shared config editor and the sounds writer
 

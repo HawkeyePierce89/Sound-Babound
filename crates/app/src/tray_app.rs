@@ -2,11 +2,12 @@
 //! sounds, plus global hotkeys.
 //!
 //! All UI objects live on the main thread inside the tao event loop. Menu
-//! and hotkey events are forwarded into the loop as user events through an
-//! [`EventLoopProxy`]; what they do is decided by [`actions`].
+//! and hotkey events, and the virtual mic worker's replies, are forwarded
+//! into the loop as user events through an [`EventLoopProxy`]; what they do
+//! is decided by [`actions`] and [`WithVirtualMic`].
 
 use std::path::PathBuf;
-use std::sync::{Mutex, mpsc};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -40,6 +41,8 @@ type TrayAudio = WithVirtualMic<Engine, DeviceWorker>;
 enum UserEvent {
     Menu(MenuId),
     HotKey(u32),
+    /// A reply from the virtual mic worker thread.
+    Device(DeviceReply),
 }
 
 /// Runs the tray app until "Quit".
@@ -61,19 +64,20 @@ pub fn run() -> Result<()> {
     };
     let board = actions::startup_board(config_path.as_deref())?;
     let engine = Engine::start().context("failed to start the audio engine")?;
-    let (reply_sender, device_replies) = mpsc::channel();
+
+    let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    platform::prepare_event_loop(&mut event_loop);
+    forward_events(event_loop.create_proxy());
+    // Replies sent before the loop runs wait in its queue. A send fails
+    // only once the loop has ended, when nothing is left to tell.
+    let reply_proxy = event_loop.create_proxy();
     let worker = DeviceWorker::spawn(platform::create_virtual_mic, move |reply| {
-        // The receiver is gone only once the event loop has ended.
-        let _ = reply_sender.send(reply);
+        let _ = reply_proxy.send_event(UserEvent::Device(reply));
     })?;
     let mut audio: TrayAudio = WithVirtualMic::new(engine, worker);
     let mut capture_gate = CaptureGate::default();
     let capture = capture_gate.capture(platform::microphone_access(), board.map().mic());
     actions::apply_config(&mut audio, board.map(), capture);
-
-    let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
-    platform::prepare_event_loop(&mut event_loop);
-    forward_events(event_loop.create_proxy());
 
     let mut app = TrayApp {
         audio: Some(audio),
@@ -85,7 +89,6 @@ pub fn run() -> Result<()> {
         mic_label: String::new(),
         next_mic_poll: None,
         capture_gate,
-        device_replies,
     };
     app.mic_label = app.current_mic_label();
     event_loop.run(move |event, _target, control_flow| {
@@ -107,6 +110,7 @@ pub fn run() -> Result<()> {
                     app.dispatch(action, control_flow);
                 }
             }
+            Event::UserEvent(UserEvent::Device(reply)) => app.on_device_reply(reply),
             _ => {}
         }
         app.schedule_mic_poll(control_flow);
@@ -125,6 +129,21 @@ fn mic_poll(enabled: bool, next: Option<Instant>, now: Instant) -> (bool, Option
     match next {
         Some(deadline) if deadline > now => (false, Some(deadline)),
         _ => (true, Some(now + MIC_POLL)),
+    }
+}
+
+/// The tray's mic status: the virtual mic's wait state while the mic path
+/// waits for its device, otherwise the engine's status (asked only then).
+/// Pure.
+///
+/// A device being created (or a stopped mic stream that has yet to end)
+/// shows as starting; a failed create shows as not found for its pattern,
+/// which makes the mic poll retry it.
+fn tray_mic_status(wait: Option<DeviceWait<'_>>, engine: impl FnOnce() -> MicStatus) -> MicStatus {
+    match wait {
+        Some(DeviceWait::Pending) => MicStatus::Starting,
+        Some(DeviceWait::Unavailable(pattern)) => MicStatus::NotFound(pattern.to_string()),
+        None => engine(),
     }
 }
 
@@ -313,9 +332,6 @@ struct TrayApp {
     next_mic_poll: Option<Instant>,
     /// Turns the microphone permission into the mic path's capture flag.
     capture_gate: CaptureGate,
-    /// The virtual mic worker's replies, handed to the audio on every event
-    /// and mic poll.
-    device_replies: mpsc::Receiver<DeviceReply>,
 }
 
 impl TrayApp {
@@ -453,13 +469,9 @@ impl TrayApp {
     /// The engine's current mic status, or not found while the mic path
     /// waits for the virtual device to be created.
     fn mic_status(&self) -> MicStatus {
-        self.audio
-            .as_ref()
-            .map_or(MicStatus::Off, |audio| match audio.waiting_for_device() {
-                Some(DeviceWait::Unavailable(pattern)) => MicStatus::NotFound(pattern.to_string()),
-                Some(DeviceWait::Pending) => MicStatus::Starting,
-                None => audio.control().mic_status(),
-            })
+        self.audio.as_ref().map_or(MicStatus::Off, |audio| {
+            tray_mic_status(audio.waiting_for_device(), || audio.control().mic_status())
+        })
     }
 
     /// The status line's text for the engine's current mic status.
@@ -493,7 +505,6 @@ impl TrayApp {
         if self.audio.is_none() || matches!(control_flow, ControlFlow::ExitWithCode(_)) {
             return;
         }
-        self.handle_device_replies();
         let Some(audio) = &self.audio else {
             return;
         };
@@ -517,18 +528,12 @@ impl TrayApp {
         *control_flow = control_flow_for(next);
     }
 
-    /// Hands the virtual mic worker's replies to the audio, which starts the
-    /// mic path once its device exists.
-    fn handle_device_replies(&mut self) {
-        let Some(audio) = &mut self.audio else {
-            return;
-        };
-        let mut any = false;
-        while let Ok(reply) = self.device_replies.try_recv() {
+    /// Hands a virtual mic worker reply to the audio, which starts the mic
+    /// path once its device exists, and refreshes the status line. A reply
+    /// after quit is dropped.
+    fn on_device_reply(&mut self, reply: DeviceReply) {
+        if let Some(audio) = &mut self.audio {
             audio.on_reply(reply);
-            any = true;
-        }
-        if any {
             self.refresh_mic_status();
         }
     }
@@ -680,6 +685,30 @@ mod tests {
             control_flow_for(Some(deadline)),
             ControlFlow::WaitUntil(deadline)
         );
+    }
+
+    #[test]
+    fn tray_mic_status_maps_the_device_wait() {
+        // A device being created shows as starting, without asking the engine.
+        let unasked = || -> MicStatus { panic!("the engine is not asked while waiting") };
+        assert_eq!(
+            tray_mic_status(Some(DeviceWait::Pending), unasked),
+            MicStatus::Starting
+        );
+        // A failed create shows as not found for its pattern.
+        assert_eq!(
+            tray_mic_status(Some(DeviceWait::Unavailable("Sound-Babound")), unasked),
+            MicStatus::NotFound("Sound-Babound".to_string())
+        );
+        // Without a wait, the engine's status stands.
+        for engine in [
+            MicStatus::Off,
+            MicStatus::Starting,
+            MicStatus::NotFound("BlackHole".to_string()),
+        ] {
+            let expected = engine.clone();
+            assert_eq!(tray_mic_status(None, move || engine), expected);
+        }
     }
 
     #[test]
