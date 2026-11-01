@@ -416,6 +416,19 @@ impl TrayApp {
         self.refresh_mic_status();
     }
 
+    /// Re-applies the mic path if the microphone permission changed the
+    /// capture flag since it was last decided.
+    fn recheck_capture(&mut self) {
+        if let Some(audio) = &mut self.audio {
+            actions::recheck_capture(
+                audio,
+                self.board.map().mic(),
+                &mut self.capture_gate,
+                platform::microphone_access(),
+            );
+        }
+    }
+
     /// The engine's current mic status.
     fn mic_status(&self) -> MicStatus {
         self.audio
@@ -458,6 +471,7 @@ impl TrayApp {
             Instant::now(),
         );
         if refresh {
+            self.recheck_capture();
             self.refresh_mic_status();
         }
         self.next_mic_poll = next;

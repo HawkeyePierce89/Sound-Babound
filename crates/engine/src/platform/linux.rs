@@ -19,6 +19,13 @@ pub fn mic_host() -> cpal::Host {
     cpal::host_from_id(HostId::PulseAudio).unwrap_or_else(|_| cpal::default_host())
 }
 
+/// The mic paths' stream period: 10 ms. With the default buffer size cpal
+/// lets the PulseAudio server choose, and PulseAudio and pipewire-pulse then
+/// use about 2 s per fragment: the capture would arrive in 2 s blocks (far
+/// past the passthrough's high mark) and the mic sink would ask for 2 s at a
+/// time (an underrun every block).
+pub const MIC_PERIOD_MS: Option<u32> = Some(10);
+
 /// The virtual device the real-device smoke test looks for: the null sink
 /// the app creates.
 #[cfg(test)]

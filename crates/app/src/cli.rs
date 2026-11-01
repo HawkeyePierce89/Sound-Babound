@@ -14,10 +14,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use babound_engine::{BuildError, Engine, MicProbe, Sound, StreamInfo, probe_mic};
+use babound_engine::{BuildError, Engine, MicProbe, MicSettings, Sound, StreamInfo, probe_mic};
 use clap::{Parser, Subcommand};
 
-use crate::actions::mic_settings;
+use crate::actions::{mic_settings, settings_for};
 use crate::config::{MicConfig, SoundSource};
 use crate::hotkeys::resolve_mic;
 use crate::platform::{self, MicrophoneAccess};
@@ -108,14 +108,14 @@ pub fn run_play(file: Option<PathBuf>) -> Result<()> {
 /// its permission). It does not create the Linux virtual device either; that
 /// is the tray's job.
 fn play_to_end(engine: &mut Engine, sound: &Sound, mic: &MicConfig) -> Result<()> {
-    if let Some(settings) = mic_settings(mic, false)
+    if let Some(settings) = headless_mic_settings(mic)
         && let Err(err) = engine.set_mic(Some(settings))
     {
         tracing::warn!(error = %err, "cannot start the virtual mic; playing on the monitor only");
     }
     // A play queued while no stream runs is dropped, so wait for one first.
     wait_for_output(|| engine.has_output(), POLL_INTERVAL, START_TIMEOUT)?;
-    if mic.enabled && !wait_for_mic(|| engine.has_mic_output(), POLL_INTERVAL, MIC_START_TIMEOUT) {
+    if mic.enabled && !poll_until(|| engine.has_mic_output(), POLL_INTERVAL, MIC_START_TIMEOUT) {
         tracing::warn!(
             status = ?engine.mic_status(),
             "the virtual mic did not come up within {}s; playing on the monitor only",
@@ -151,6 +151,12 @@ fn play_to_end(engine: &mut Engine, sound: &Sound, mic: &MicConfig) -> Result<()
     Ok(())
 }
 
+/// The mic settings of a headless play: `None` with the mic off, and never
+/// a capture, so `play` does not open the microphone.
+fn headless_mic_settings(mic: &MicConfig) -> Option<MicSettings> {
+    mic_settings(mic, false)
+}
+
 /// Reports whether the virtual mic can work with the `[mic]` config and
 /// returns the process exit code: non-zero when it cannot.
 ///
@@ -162,12 +168,7 @@ pub fn run_mic_check() -> Result<ExitCode> {
     let access = platform::microphone_access();
     // Probe the devices even with the mic off, so the setup can be checked
     // before turning it on.
-    let enabled = MicConfig {
-        enabled: true,
-        ..mic.clone()
-    };
-    let settings = mic_settings(&enabled, access.allows_capture())
-        .context("the mic settings are missing for an enabled mic")?;
+    let settings = settings_for(&mic, access.allows_capture());
     let check = MicCheck {
         config,
         notes,
@@ -402,22 +403,17 @@ fn sound_duration(sound: &Sound) -> Duration {
 /// Polls `ready` every `poll` until it holds. Fails after `timeout`, which
 /// means no output stream came up.
 fn wait_for_output(ready: impl Fn() -> bool, poll: Duration, timeout: Duration) -> Result<()> {
-    let started = Instant::now();
-    while !ready() {
-        if started.elapsed() >= timeout {
-            bail!(
-                "no output stream within {}s: no usable output device",
-                timeout.as_secs()
-            );
-        }
-        thread::sleep(poll);
+    if !poll_until(ready, poll, timeout) {
+        bail!(
+            "no output stream within {}s: no usable output device",
+            timeout.as_secs()
+        );
     }
     Ok(())
 }
 
-/// Polls `ready` every `poll` until the mic sink is up. Returns false after
-/// `timeout`, so `play` can carry on with the monitor alone.
-fn wait_for_mic(ready: impl Fn() -> bool, poll: Duration, timeout: Duration) -> bool {
+/// Polls `ready` every `poll` until it holds. Returns false after `timeout`.
+fn poll_until(ready: impl Fn() -> bool, poll: Duration, timeout: Duration) -> bool {
     let started = Instant::now();
     while !ready() {
         if started.elapsed() >= timeout {
@@ -914,20 +910,32 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_mic_returns_true_once_up() {
+    fn a_headless_play_never_captures_the_microphone() {
+        assert_eq!(headless_mic_settings(&MicConfig::default()), None);
+        let mic = MicConfig {
+            enabled: true,
+            ..MicConfig::default()
+        };
+        let settings = headless_mic_settings(&mic).unwrap();
+        assert!(!settings.capture);
+        assert_eq!(settings.device_match, mic.virtual_device);
+    }
+
+    #[test]
+    fn poll_until_returns_true_once_ready() {
         let calls = Cell::new(0);
         let ready = || {
             calls.set(calls.get() + 1);
             calls.get() >= 3
         };
-        assert!(wait_for_mic(ready, Duration::ZERO, LONG));
+        assert!(poll_until(ready, Duration::ZERO, LONG));
         assert_eq!(calls.get(), 3);
     }
 
     #[test]
-    fn wait_for_mic_gives_up_after_the_timeout() {
+    fn poll_until_gives_up_after_the_timeout() {
         let started = Instant::now();
-        assert!(!wait_for_mic(
+        assert!(!poll_until(
             || false,
             Duration::from_millis(1),
             Duration::from_millis(20)

@@ -55,7 +55,7 @@ stop_all_hotkey = "CmdOrCtrl+Shift+0"
 # "Mic to call" turns it on and off and saves the choice here.
 #   enabled        - true or false (default false)
 #   virtual_device - the cable's playback device: the first output whose
-#                    name contains this text, ignoring case. The default is
+#                    name or id contains this text, ignoring case. The default is
 #                    "BlackHole" on macOS, "CABLE Input" (VB-CABLE) on
 #                    Windows and "sound_babound_sink" on Linux, where the app
 #                    creates the device itself.
@@ -474,6 +474,32 @@ mod tests {
             assert_eq!(fs::read_to_string(&path).unwrap(), text);
             assert_eq!(files_in(&dir), ["config.toml"]);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_mic_enabled_writes_through_a_symlink_and_keeps_the_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = TempDir::new("config-mic-symlink");
+        let target = dir.path().join("real.toml");
+        fs::write(&target, "master_gain = 0.5\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("config.toml");
+        symlink(&target, &link).unwrap();
+
+        set_mic_enabled(&link, true).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let raw = parse(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert!(raw.mic.enabled);
+        assert_eq!(raw.master_gain, 0.5);
+        let mode = fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

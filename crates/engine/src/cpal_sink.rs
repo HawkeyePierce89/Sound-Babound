@@ -11,15 +11,18 @@
 //! identity query re-queries the host (and, for a named target, re-enumerates
 //! its output devices), so a rebuild always lands on the live device.
 //!
-//! The helpers shared with the capture (error mapping, device identity and
-//! name matching) live here too.
+//! The helpers shared with the capture (error mapping, device identity, name
+//! matching and the mic paths' buffer size) live here too.
 
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{ErrorKind, I24, OutputStreamTimestamp, SampleFormat, StreamConfig, U24};
+use cpal::{
+    BufferSize, ErrorKind, I24, OutputStreamTimestamp, SampleFormat, StreamConfig,
+    SupportedBufferSize, U24,
+};
 
 use crate::convert::{OutputSample, fill_silence, write_samples};
 use crate::error::BuildError;
@@ -120,7 +123,14 @@ impl StreamFactory for CpalOutputFactory {
         let supported = device.default_output_config().map_err(build_error)?;
         let info = stream_info(&device, &supported);
         let sample_format = supported.sample_format();
-        let config = supported.config();
+        let mut config = supported.config();
+        if matches!(self.target, OutputTarget::Named(_)) {
+            config.buffer_size = mic_buffer_size(
+                supported.buffer_size(),
+                config.sample_rate,
+                platform::MIC_PERIOD_MS,
+            );
+        }
 
         // No stream exists yet, so this lock cannot contend with a callback.
         mixer
@@ -206,6 +216,24 @@ pub(crate) fn first_match<D>(
         let (name, id) = labels(device);
         name_matches(pattern, &name, id.as_deref())
     })
+}
+
+/// The buffer size a mic path stream (the mic sink or the capture) asks
+/// for: `period_ms` of frames at `rate`, clamped to the range the device
+/// supports. Without a period (the platform's default suits the
+/// passthrough), or if the device reports no range, the backend's default.
+pub(crate) fn mic_buffer_size(
+    supported: &SupportedBufferSize,
+    rate: u32,
+    period_ms: Option<u32>,
+) -> BufferSize {
+    match (period_ms, supported) {
+        (Some(ms), SupportedBufferSize::Range { min, max }) if min <= max => {
+            let frames = u32::try_from(u64::from(rate) * u64::from(ms) / 1000).unwrap_or(u32::MAX);
+            BufferSize::Fixed(frames.clamp(*min, *max))
+        }
+        _ => BufferSize::Default,
+    }
 }
 
 pub(crate) fn build_error(err: cpal::Error) -> BuildError {
@@ -352,6 +380,48 @@ mod tests {
             .map(|i| (i as f32 * 0.013).sin() * 0.7)
             .collect();
         Sound::from_interleaved(samples, rate, 1, "tone").unwrap()
+    }
+
+    #[test]
+    fn mic_buffer_size_asks_for_the_period_within_the_device_range() {
+        let range = SupportedBufferSize::Range { min: 64, max: 4096 };
+        assert_eq!(
+            mic_buffer_size(&range, 48_000, Some(10)),
+            BufferSize::Fixed(480)
+        );
+        assert_eq!(
+            mic_buffer_size(&range, 44_100, Some(10)),
+            BufferSize::Fixed(441)
+        );
+        // Clamped to what the device supports.
+        let narrow = SupportedBufferSize::Range {
+            min: 1024,
+            max: 2048,
+        };
+        assert_eq!(
+            mic_buffer_size(&narrow, 48_000, Some(10)),
+            BufferSize::Fixed(1024)
+        );
+        let small = SupportedBufferSize::Range { min: 16, max: 256 };
+        assert_eq!(
+            mic_buffer_size(&small, 48_000, Some(10)),
+            BufferSize::Fixed(256)
+        );
+    }
+
+    #[test]
+    fn mic_buffer_size_keeps_the_default_without_a_period_or_a_range() {
+        let range = SupportedBufferSize::Range { min: 64, max: 4096 };
+        assert_eq!(mic_buffer_size(&range, 48_000, None), BufferSize::Default);
+        assert_eq!(
+            mic_buffer_size(&SupportedBufferSize::Unknown, 48_000, Some(10)),
+            BufferSize::Default
+        );
+        let inverted = SupportedBufferSize::Range { min: 512, max: 64 };
+        assert_eq!(
+            mic_buffer_size(&inverted, 48_000, Some(10)),
+            BufferSize::Default
+        );
     }
 
     fn playing_mixer(sound: &Sound, rate: u32, channels: u16) -> Mixer {

@@ -11,6 +11,10 @@ pub fn mic_host() -> cpal::Host {
     cpal::default_host()
 }
 
+/// The mic paths' stream period: WASAPI's default shared-mode period
+/// (10 ms) suits the passthrough.
+pub const MIC_PERIOD_MS: Option<u32> = None;
+
 /// The virtual device the real-device smoke test looks for.
 #[cfg(test)]
 pub const SMOKE_MIC_PATTERN: &str = "CABLE Input";

@@ -88,7 +88,7 @@ sound-babound mic-check
 - whether "Mic to call" is on;
 - the virtual device pattern, and the output device it matches with its sample rate, channel count and sample format;
 - the input the microphone passthrough would use and its format, including when the default input is the virtual device itself and the app would refuse it;
-- the microphone permission (on macOS);
+- the microphone permission (on macOS). This is the permission of the terminal you run `mic-check` from, not of `Sound-Babound.app`; the tray status line shows the app's own. Before macOS 14 the permission cannot be read and is reported as unknown;
 - a final verdict, "available", "sounds only" (the call would hear the sounds but not your voice) or "unavailable", with the reasons and what to do about them.
 
 It exits with code 0 when the virtual device is found and the microphone can be captured, and with a non-zero code otherwise. It does not check whether "Mic to call" is on: a setup that would work while it is off still exits with 0.
@@ -104,7 +104,7 @@ RUST_LOG=debug sound-babound play
 RUST_LOG=babound_engine=debug,info sound-babound
 ```
 
-On Windows, tray mode (no arguments) has no console, so its logs and startup errors are not visible anywhere.
+On Windows, tray mode (no arguments) has no console, so its logs and startup errors are not visible anywhere. On macOS the app bundle started from Finder has no visible log either. To read it and still keep the bundle's microphone permission, start the bundle with `open --stderr /tmp/sound-babound.log --env RUST_LOG=info target/release/Sound-Babound.app` and read that file.
 
 At `info` you can see every stream rebuild with its device name, sample rate, channel count and sample format: the default output, and with the virtual microphone on, the virtual device and the microphone input too. At `debug` you also see device events that were checked and dropped because the stream's device did not change, and the "device changed" stream errors that some backends report when you switch the default device, which the app expects and handles by rebuilding. A device that keeps failing to open is warned about once, and again only when the error changes; the retries are logged at `debug`.
 
@@ -118,9 +118,9 @@ The config file is `config.toml` in a `sound-babound` folder under the OS config
 | Windows | `%APPDATA%\sound-babound\config.toml`                        |
 | Linux   | `$XDG_CONFIG_HOME/sound-babound/config.toml` (default `~/.config/sound-babound/config.toml`) |
 
-The file is created with defaults on first start and is never overwritten after that. "Open config folder" in the tray menu opens its folder. After editing, choose "Reload config". New sounds, hotkeys and gains apply right away, and sounds that are already playing keep playing. If the new file does not parse, the error is logged and the old config stays in effect.
+The file is created with defaults on first start. After that the app changes it in one case only: the "Mic to call" tray item rewrites the `enabled` value of `[mic]`, keeping your comments and other keys. If you have unsaved edits to the file, save them before using the toggle. "Open config folder" in the tray menu opens its folder. After editing, choose "Reload config". New sounds, hotkeys and gains apply right away, and sounds that are already playing keep playing. If the new file does not parse, the error is logged and the old config stays in effect.
 
-At startup, the tray always comes up. If the config file does not parse, the app logs the parse error at error level, with the file's path, and starts with the built-in default config (the demo chime). The tray menu still works: fix the file, then choose "Reload config" to load it. If the file cannot be read at all, the built-in default config is used too, with a warning in the log. The log goes to stderr (see [Logging](#logging)), so on macOS and Linux start the app from a terminal to read it. On Windows tray mode has no console, so the log is not visible; if the demo chime shows up instead of your sounds, check the file for TOML syntax errors.
+At startup, the tray always comes up. If the config file does not parse, the app logs the parse error at error level, with the file's path, and starts with the built-in default config (the demo chime). The tray menu still works: fix the file, then choose "Reload config" to load it. If the file cannot be read at all, the built-in default config is used too, with a warning in the log. The log goes to stderr (see [Logging](#logging)), so on macOS and Linux start the app from a terminal to read it (for the macOS app bundle, see [Logging](#logging)). On Windows tray mode has no console, so the log is not visible; if the demo chime shows up instead of your sounds, check the file for TOML syntax errors.
 
 Example:
 
@@ -161,7 +161,7 @@ mic_gain = 1.0                 # volume of your microphone in the call, 0.0 to 4
 | Key              | Default | Meaning |
 |------------------|---------|---------|
 | `enabled`        | `false` | Turns the virtual microphone on. The tray's "Mic to call" item flips this value in the file, keeping your comments and other keys. |
-| `virtual_device` | `"BlackHole"` on macOS, `"CABLE Input"` on Windows, `"sound_babound_sink"` on Linux | The output device the call mix is written to: the first output whose name or id contains this text, ignoring case. A missing or blank value means the default. |
+| `virtual_device` | `"BlackHole"` on macOS, `"CABLE Input"` on Windows, `"sound_babound_sink"` on Linux | The output device the call mix is written to: the first output whose name or id contains this text, ignoring case. A missing or blank value means the default. On Linux the app creates its own devices whatever this says (see [Linux](#linux)). |
 | `sound_gain`     | `1.0`   | Volume of the sounds in the call, on top of their own gain and `master_gain`. It does not change what you hear. |
 | `mic_gain`       | `1.0`   | Volume of your microphone in the call. |
 
@@ -179,7 +179,7 @@ All sounds are decoded into memory when the config is loaded. A file that cannot
 
 With "Mic to call" on, the app writes a second mix into a virtual audio cable: the sounds you play plus your real microphone. In the call app (Zoom, Teams, Discord, Google Meet and so on) you choose the cable as your microphone, so the other participants hear both your voice and the sounds. You keep hearing the sounds on your default output as before, but not your own voice.
 
-The app follows your system default input as the microphone and keeps up with it when it changes, just like the default output. If the default input is the virtual device itself, the app refuses to capture it, since that would feed the call mix back into itself. It falls back to the last real microphone that was the default input while it ran, if that is still connected, and logs a warning. Otherwise the call hears the sounds only until you choose a real microphone as the default input.
+The app follows your system default input as the microphone and keeps up with it when it changes, just like the default output. If the default input is the virtual device itself, the app refuses to capture it, since that would feed the call mix back into itself. It falls back to the last real microphone that was the default input while it ran, if that is still connected, and logs a warning. Otherwise the call hears the sounds only until you choose a real microphone as the default input. On Linux there is one limit: the app does not notice a change of the default input, so it keeps capturing the microphone it opened until that device goes away or "Mic to call" is turned off and on again.
 
 The virtual microphone is off by default, and while it is off the app opens no extra audio device. Turn it on with the "Mic to call" tray item or `[mic] enabled = true`, then run `sound-babound mic-check` to see whether everything is in place.
 
@@ -196,7 +196,9 @@ The virtual microphone is off by default, and while it is off the app opens no e
 3. Turn on "Mic to call". The first time the app opens the microphone, macOS asks for permission. Allow it.
 4. In the call app, choose "BlackHole 2ch" as the microphone. Keep the call app's speaker on your headphones or speakers, not on BlackHole.
 
-If you denied the permission, the call hears the sounds but not your voice, and the tray status says "microphone access denied". To allow it later, open System Settings > Privacy & Security > Microphone, turn on Sound-Babound, then quit and restart the app. If Sound-Babound is not in that list, `tccutil reset Microphone io.github.hawkeyepierce89.sound-babound` makes macOS ask again on the next start.
+If you denied the permission, the call hears the sounds but not your voice, and the tray status says "microphone access denied". To allow it later, open System Settings > Privacy & Security > Microphone and turn on Sound-Babound. While "Mic to call" is on, the app checks the permission about once a second and opens the microphone as soon as it is allowed; if the call still does not hear you, quit and restart the app. If Sound-Babound is not in that list, `tccutil reset Microphone io.github.hawkeyepierce89.sound-babound` makes macOS ask again on the next start. Each rebuild of the bundle changes its ad hoc signature, so macOS may ask again after a rebuild; if it refuses without asking, use the same `tccutil reset` command.
+
+Reading the permission needs macOS 14 or later. On older macOS the app always tries to open the microphone. If access was denied, the call hears silence instead of your voice, and the tray does not say so: check System Settings > Privacy & Security > Microphone.
 
 If you use another virtual cable (Loopback, for example), set `virtual_device` to the name of its output device.
 
@@ -210,7 +212,7 @@ Keep your real microphone as the Windows default input. If "CABLE Output" become
 
 ### Linux
 
-The app creates the virtual microphone itself while "Mic to call" is on: a "Sound-Babound Mic" input (`sound_babound_mic`), fed by an output named "Sound-Babound Sink" (`sound_babound_sink`) that the app writes the call mix to. Do not choose either one as your default device. The app removes both when you turn "Mic to call" off or quit, and removes any that a crashed run left behind before it creates them again. There is nothing to install apart from `pactl`, which it uses to create the devices: install `pulseaudio-utils` on Debian or Ubuntu, or `libpulse` on Arch. This works with both PulseAudio and PipeWire (through `pipewire-pulse`). On Linux the virtual microphone and the microphone passthrough use the PulseAudio API; the sounds you hear still play through ALSA's `default` device.
+The app creates the virtual microphone itself while "Mic to call" is on: a "Sound-Babound Mic" input (`sound_babound_mic`), fed by an output named "Sound-Babound Sink" (`sound_babound_sink`) that the app writes the call mix to. Do not choose either one as your default device. The app removes both when you turn "Mic to call" off or quit, and removes any that a crashed run left behind before it creates them again. It creates them whenever "Mic to call" is on, even if `virtual_device` names another output. There is nothing to install apart from `pactl`, which it uses to create the devices: install `pulseaudio-utils` on Debian or Ubuntu, or `libpulse` on Arch. This works with both PulseAudio and PipeWire (through `pipewire-pulse`). On Linux the virtual microphone and the microphone passthrough use the PulseAudio API; the sounds you hear still play through ALSA's `default` device.
 
 In the call app, choose "Sound-Babound Mic" as the microphone. `mic-check` does not create the device, so it reports it as not found unless the tray app is running with "Mic to call" on.
 
@@ -226,7 +228,7 @@ The greyed-out status line in the tray menu shows the state of the virtual micro
 | Virtual mic: … (active, microphone access denied) | The call hears the sounds only. On macOS, allow the microphone as described above. |
 | Virtual mic: … (active, microphone unavailable) | The microphone cannot be opened (no input device, or the default input is the virtual device itself); the call hears the sounds only. The log has the reason. |
 | Virtual mic: not found, install BlackHole / install VB-CABLE | No output device matches `virtual_device`. The app keeps looking, so installing or plugging in the device is enough. |
-| Virtual mic: could not create it, see log | Linux only: `pactl` failed or is missing. |
+| Virtual mic: could not create it, see log | Linux only: `pactl` failed or is missing, or no output matches a custom `virtual_device`. |
 | Virtual mic: error, see log | The virtual device was found but could not be opened. The app keeps retrying. |
 
 ## Hotkey syntax

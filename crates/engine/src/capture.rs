@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 use crate::convert::InputSample;
 use crate::cpal_sink::{
     CpalStream, OPEN_TIMEOUT, build_error, device_labels, forward_errors, identity_of,
-    name_matches, stream_info,
+    mic_buffer_size, name_matches, stream_info,
 };
 use crate::error::BuildError;
 use crate::passthrough::PassthroughShared;
@@ -103,6 +103,49 @@ pub fn choose_input(
         .map_or(InputChoice::Excluded, InputChoice::Fallback)
 }
 
+/// [`choose_input`] with its memory: the most recent default input that no
+/// exclusion named, which is what an excluded default falls back to. Pure.
+#[derive(Debug)]
+pub struct InputSelector {
+    exclusions: Vec<String>,
+    last_physical: Option<DeviceIdentity>,
+}
+
+impl InputSelector {
+    /// A selector refusing `exclusions`, with no physical input known yet.
+    pub fn new(exclusions: Vec<String>) -> InputSelector {
+        InputSelector {
+            exclusions,
+            last_physical: None,
+        }
+    }
+
+    /// Whether the selector needs the input list to choose: only an excluded
+    /// default looks for a fallback.
+    pub fn needs_list(&self, default: Option<&InputCandidate>) -> bool {
+        default.is_some_and(|d| d.is_excluded(&self.exclusions))
+    }
+
+    /// Apply [`choose_input`], and remember the default input as the last
+    /// physical one when it is chosen.
+    pub fn choose(
+        &mut self,
+        default: Option<&InputCandidate>,
+        available: &[InputCandidate],
+    ) -> InputChoice {
+        let choice = choose_input(
+            default,
+            available,
+            self.last_physical.as_ref(),
+            &self.exclusions,
+        );
+        if let (InputChoice::Default, Some(default)) = (choice, default) {
+            self.last_physical = Some(default.identity.clone());
+        }
+        choice
+    }
+}
+
 /// A capture decision worth a warning: the default input was replaced or
 /// refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,9 +205,7 @@ enum Selection {
 /// Builds cpal capture streams on the default input, minus the exclusions.
 #[derive(Debug)]
 pub struct CpalCaptureFactory {
-    exclusions: Vec<String>,
-    /// The most recent default input no exclusion named.
-    last_physical: Option<DeviceIdentity>,
+    selector: InputSelector,
     notices: NoticeLog,
 }
 
@@ -173,8 +214,7 @@ impl CpalCaptureFactory {
     /// case-insensitive substring of the display name or id).
     pub fn new(exclusions: Vec<String>) -> CpalCaptureFactory {
         CpalCaptureFactory {
-            exclusions,
-            last_physical: None,
+            selector: InputSelector::new(exclusions),
             notices: NoticeLog::default(),
         }
     }
@@ -216,10 +256,7 @@ impl CpalCaptureFactory {
         let default = default_device.as_ref().map(InputCandidate::of);
         // Listing is only needed to find a fallback.
         let mut devices = Vec::new();
-        if default
-            .as_ref()
-            .is_some_and(|d| d.is_excluded(&self.exclusions))
-        {
+        if self.selector.needs_list(default.as_ref()) {
             match host.input_devices() {
                 Ok(list) => devices.extend(list),
                 Err(err) => debug!(error = %err, "cannot list input devices"),
@@ -227,15 +264,9 @@ impl CpalCaptureFactory {
         }
         let available: Vec<InputCandidate> = devices.iter().map(InputCandidate::of).collect();
 
-        let choice = choose_input(
-            default.as_ref(),
-            &available,
-            self.last_physical.as_ref(),
-            &self.exclusions,
-        );
+        let choice = self.selector.choose(default.as_ref(), &available);
         match (choice, default_device, default) {
-            (InputChoice::Default, Some(device), Some(default)) => {
-                self.last_physical = Some(default.identity);
+            (InputChoice::Default, Some(device), Some(_)) => {
                 let selection = Selection::Device {
                     device: Box::new(device),
                     replaces: None,
@@ -308,7 +339,12 @@ impl StreamFactory for CpalCaptureFactory {
         let supported = device.default_input_config().map_err(build_error)?;
         let info = stream_info(&device, &supported);
         let sample_format = supported.sample_format();
-        let config = supported.config();
+        let mut config = supported.config();
+        config.buffer_size = mic_buffer_size(
+            supported.buffer_size(),
+            config.sample_rate,
+            platform::MIC_PERIOD_MS,
+        );
 
         // No stream exists yet, so nothing writes the ring while it resets.
         passthrough.begin_capture(config.sample_rate);
@@ -380,6 +416,48 @@ mod tests {
             "Sound-Babound Mic".into(),
             "sound_babound_sink.monitor".into(),
         ]
+    }
+
+    #[test]
+    fn the_selector_falls_back_to_the_physical_input_it_remembers() {
+        let virtual_mic = input("Sound-Babound Mic");
+        let headset = input("USB Headset");
+        let webcam = input("Webcam");
+        let mut selector = InputSelector::new(exclusions());
+        assert!(!selector.needs_list(Some(&headset)));
+        assert!(selector.needs_list(Some(&virtual_mic)));
+
+        // Nothing physical seen yet: the virtual default is refused.
+        let all = [virtual_mic.clone(), headset.clone(), webcam.clone()];
+        assert_eq!(
+            selector.choose(Some(&virtual_mic), &all),
+            InputChoice::Excluded
+        );
+        // A physical default is used and remembered.
+        assert_eq!(selector.choose(Some(&headset), &[]), InputChoice::Default);
+        assert_eq!(selector.choose(Some(&webcam), &[]), InputChoice::Default);
+        // The virtual default falls back to the latest physical one.
+        assert_eq!(
+            selector.choose(Some(&virtual_mic), &all),
+            InputChoice::Fallback(2)
+        );
+        // A fallback does not change what is remembered.
+        assert_eq!(
+            selector.choose(Some(&virtual_mic), &all),
+            InputChoice::Fallback(2)
+        );
+        // The remembered input is unplugged: refused.
+        let unplugged = [virtual_mic.clone(), headset];
+        assert_eq!(
+            selector.choose(Some(&virtual_mic), &unplugged),
+            InputChoice::Excluded
+        );
+        // No default input at all remembers nothing.
+        assert_eq!(selector.choose(None, &all), InputChoice::NoDevice);
+        assert_eq!(
+            selector.choose(Some(&virtual_mic), &all),
+            InputChoice::Fallback(2)
+        );
     }
 
     #[test]

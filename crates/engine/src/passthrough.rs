@@ -570,6 +570,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn downsampling_interpolates_linearly() {
+        let shared = shared_at(48_000);
+        let mut reader = shared.reader();
+        reader.set_sink_rate(24_000);
+        let target = target_samples(48_000);
+        let ramp: Vec<f32> = (0..target * 2).map(|i| i as f32 * 1e-4).collect();
+        shared.write(&ramp, 1);
+        let mut out = [0.0f32; 200];
+        reader.read(&mut out);
+        // One output sample per two input samples: the steps are twice the
+        // ramp's.
+        for pair in out.windows(2) {
+            let step = pair[1] - pair[0];
+            assert!((step - 2e-4).abs() < 1e-6, "{step}");
+        }
+    }
+
     /// Two simulated device clocks, no threads and no devices.
     struct Clocks {
         capture_rate: u32,
@@ -702,6 +720,18 @@ mod tests {
                 capture_clock: 44_100.0,
                 sink_rate: 48_000,
                 sink_clock,
+            });
+        }
+    }
+
+    #[test]
+    fn drift_48k_to_44k1_holds_the_target() {
+        for sink_clock in SINK_CLOCKS {
+            assert_holds_the_target(Clocks {
+                capture_rate: 48_000,
+                capture_clock: 48_000.0,
+                sink_rate: 44_100,
+                sink_clock: sink_clock * 44_100.0 / 48_000.0,
             });
         }
     }

@@ -167,17 +167,23 @@ impl AudioControl for Engine {
 }
 
 /// The engine's mic settings for `mic`: `None` when the mic is off.
+/// See [`settings_for`].
+pub fn mic_settings(mic: &MicConfig, capture: bool) -> Option<MicSettings> {
+    mic.enabled.then(|| settings_for(mic, capture))
+}
+
+/// The engine's mic settings for `mic`, whether or not it is enabled.
 /// The capture refuses the platform's virtual inputs for the configured
 /// device. `capture` is false when the microphone may not be opened, so the
 /// mic sink carries the sounds only.
-pub fn mic_settings(mic: &MicConfig, capture: bool) -> Option<MicSettings> {
-    mic.enabled.then(|| MicSettings {
+pub fn settings_for(mic: &MicConfig, capture: bool) -> MicSettings {
+    MicSettings {
         device_match: mic.virtual_device.clone(),
         excluded_inputs: platform::virtual_input_exclusions(&mic.virtual_device),
         sound_gain: mic.sound_gain,
         mic_gain: mic.mic_gain,
         capture,
-    })
+    }
 }
 
 /// Turns the OS microphone permission into the `capture` flag of
@@ -188,12 +194,15 @@ pub fn mic_settings(mic: &MicConfig, capture: bool) -> Option<MicSettings> {
 #[derive(Debug, Default)]
 pub struct CaptureGate {
     denial_logged: bool,
+    /// The last decision, which the caller applied.
+    decided: Option<bool>,
 }
 
 impl CaptureGate {
     /// Whether the capture may be opened for `mic` under `access`.
     pub fn capture(&mut self, access: MicrophoneAccess, mic: &MicConfig) -> bool {
         let allowed = access.allows_capture();
+        self.decided = Some(allowed);
         if allowed {
             self.denial_logged = false;
         } else if mic.enabled && !self.denial_logged {
@@ -205,6 +214,30 @@ impl CaptureGate {
         }
         allowed
     }
+}
+
+/// Re-reads the microphone permission (`access`) while `mic` is enabled and,
+/// if it changed the capture flag since the gate's last decision, re-applies
+/// the mic path with the new flag. The tray calls it on every mic poll, so a
+/// permission granted or denied while the app runs (including the answer to
+/// the first-run prompt) takes effect without a toggle or a reload. Returns
+/// whether the mic path was re-applied.
+pub fn recheck_capture(
+    control: &mut impl AudioControl,
+    mic: &MicConfig,
+    gate: &mut CaptureGate,
+    access: MicrophoneAccess,
+) -> bool {
+    if !mic.enabled {
+        return false;
+    }
+    let before = gate.decided;
+    let capture = gate.capture(access, mic);
+    if before == Some(capture) {
+        return false;
+    }
+    apply_mic(control, mic, capture);
+    true
 }
 
 /// Applies the engine-wide parts of a config: the master gain and the mic
@@ -980,6 +1013,66 @@ mod tests {
 
         assert!(gate.capture(MicrophoneAccess::Granted, &on));
         assert!(!gate.denial_logged, "a grant re-arms the warning");
+    }
+
+    #[test]
+    fn recheck_reapplies_the_mic_only_when_the_capture_flag_changes() {
+        let mut fake = FakeAudio::new();
+        let mut gate = CaptureGate::default();
+        let on = mic_on("Cable");
+        // Startup: the permission is not asked yet, so the capture opens.
+        assert!(gate.capture(MicrophoneAccess::Undetermined, &on));
+
+        // Still allowed (the prompt was answered "allow"): nothing to do.
+        assert!(!recheck_capture(
+            &mut fake,
+            &on,
+            &mut gate,
+            MicrophoneAccess::Granted
+        ));
+        assert!(fake.mics.is_empty());
+
+        // Denied at the prompt: the mic path restarts without the capture.
+        assert!(recheck_capture(
+            &mut fake,
+            &on,
+            &mut gate,
+            MicrophoneAccess::Denied
+        ));
+        assert_eq!(fake.mics, [mic_settings(&on, false)]);
+        assert!(gate.denial_logged);
+        assert!(!recheck_capture(
+            &mut fake,
+            &on,
+            &mut gate,
+            MicrophoneAccess::Denied
+        ));
+        assert_eq!(fake.mics.len(), 1);
+
+        // Allowed later in System Settings: the capture comes back.
+        assert!(recheck_capture(
+            &mut fake,
+            &on,
+            &mut gate,
+            MicrophoneAccess::Granted
+        ));
+        assert_eq!(fake.mics[1], mic_settings(&on, true));
+    }
+
+    #[test]
+    fn recheck_does_nothing_with_the_mic_off() {
+        let mut fake = FakeAudio::new();
+        let mut gate = CaptureGate::default();
+        let off = MicConfig::default();
+        assert!(gate.capture(MicrophoneAccess::Granted, &off));
+        assert!(!recheck_capture(
+            &mut fake,
+            &off,
+            &mut gate,
+            MicrophoneAccess::Denied
+        ));
+        assert!(fake.mics.is_empty());
+        assert!(!gate.denial_logged);
     }
 
     #[test]

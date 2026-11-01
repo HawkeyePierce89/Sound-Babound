@@ -1409,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn render_with_a_reader_allocates_nothing_and_matches_render_scratch() {
+    fn render_with_a_reader_keeps_its_scratch_buffers_and_matches_render_scratch() {
         fn sine_mixer() -> (Mixer, Arc<PassthroughShared>) {
             let passthrough = Arc::new(PassthroughShared::new());
             passthrough.begin_capture(48_000);

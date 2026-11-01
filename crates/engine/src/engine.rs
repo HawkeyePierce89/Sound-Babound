@@ -13,6 +13,7 @@
 //! while a supervisor thread is joined.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -295,6 +296,9 @@ pub struct Engine {
     mic: Option<MicPath>,
     shared: Arc<MixerShared>,
     supervisor: SupervisorHandle,
+    /// The last master gain passed to [`Engine::set_master_gain`] (`f32`
+    /// bits), so a mic path started later gets it too.
+    master_gain: AtomicU32,
 }
 
 impl Engine {
@@ -343,6 +347,7 @@ impl Engine {
             mic: None,
             shared,
             supervisor,
+            master_gain: AtomicU32::new(1.0f32.to_bits()),
         })
     }
 
@@ -366,10 +371,14 @@ impl Engine {
         if let Some(mic) = self.mic.as_mut()
             && mic.settings.same_streams(&settings)
         {
-            if mic.settings != settings && !push(&mic.shared, settings.path_gains()) {
-                warn!("mic command queue is full; mic gains not applied");
+            if mic.settings != settings {
+                if push(&mic.shared, settings.path_gains()) {
+                    mic.settings = settings;
+                } else {
+                    // The old settings stay, so the next call retries.
+                    warn!("mic command queue is full; mic gains not applied");
+                }
             }
-            mic.settings = settings;
             return Ok(());
         }
         if let Some(mic) = self.mic.take() {
@@ -383,7 +392,9 @@ impl Engine {
     fn start_mic(&self, settings: MicSettings) -> Result<MicPath, StartError> {
         let shared = Arc::new(MixerShared::new());
         // Applied before the first build (offline) or by the first render.
-        // The queue is empty, so the push cannot fail.
+        // The queue is empty, so the pushes cannot fail.
+        let master_gain = f32::from_bits(self.master_gain.load(Ordering::Relaxed));
+        let _ = push(&shared, Command::SetMasterGain(master_gain));
         let _ = push(&shared, settings.path_gains());
 
         let (endpoint, passthrough) = if settings.capture {
@@ -456,8 +467,10 @@ impl Engine {
 
     /// Queue a new master gain on every path. Non-finite values mean
     /// silence, negative values clamp to 0. Returns false if a path's queue
-    /// is full.
+    /// is full. A mic path started later starts at this gain too, even if
+    /// this push was rejected.
     pub fn set_master_gain(&self, gain: f32) -> bool {
+        self.master_gain.store(gain.to_bits(), Ordering::Relaxed);
         self.push_all(|| Command::SetMasterGain(gain))
     }
 
@@ -988,6 +1001,55 @@ mod tests {
     }
 
     #[test]
+    fn a_new_mic_path_starts_at_the_current_master_gain() {
+        let (mut engine, backends) = mic_rig();
+        assert!(engine.set_master_gain(0.25));
+        mic_on(&mut engine, &backends, mic_settings());
+        let mixer = backends.mic_sink.mixer().unwrap();
+        render(&mixer);
+        assert_eq!(mixer.lock().unwrap().master_gain(), 0.25);
+
+        // A restarted mic path (another device) gets it too.
+        let other = MicSettings {
+            device_match: "loopback".into(),
+            ..mic_settings()
+        };
+        mic_on(&mut engine, &backends, other);
+        let mixer = backends.mic_sink.mixer().unwrap();
+        render(&mixer);
+        assert_eq!(mixer.lock().unwrap().master_gain(), 0.25);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_gain_change_dropped_by_a_full_queue_is_retried() {
+        let (mut engine, backends) = mic_rig();
+        mic_on(&mut engine, &backends, mic_settings());
+        let mixer = backends.mic_sink.mixer().unwrap();
+        render(&mixer);
+        let quieter = MicSettings {
+            sound_gain: 0.5,
+            ..mic_settings()
+        };
+        {
+            let mic = engine.mic.as_ref().unwrap();
+            while mic.shared.push(Command::StopAll).is_ok() {}
+        }
+        engine.set_mic(Some(quieter.clone())).unwrap();
+        // Drain the queue: the gains did not make it in.
+        for _ in 0..4 {
+            render(&mixer);
+        }
+        assert_eq!(mixer.lock().unwrap().path_gains(), (1.0, 1.0));
+
+        engine.set_mic(Some(quieter)).unwrap();
+        render(&mixer);
+        assert_eq!(mixer.lock().unwrap().path_gains(), (0.5, 1.0));
+        assert_eq!(backends.mic_sink.builds().len(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
     fn device_change_restarts_only_the_mic_path() {
         let (mut engine, backends) = mic_rig();
         mic_on(&mut engine, &backends, mic_settings());
@@ -1039,7 +1101,9 @@ mod tests {
         assert!(!is_silent(&render(&monitor)));
         assert!(!is_silent(&render(&mic)));
         assert_eq!(engine.active_voices(), 2);
-        assert_eq!(engine.commands_applied(), 3);
+        // The play on each path, plus the mic path's initial master and
+        // path gains.
+        assert_eq!(engine.commands_applied(), 4);
 
         // Stop and gain go to both paths.
         assert!(engine.set_master_gain(0.0));
@@ -1049,6 +1113,60 @@ mod tests {
         render(&monitor);
         render(&mic);
         assert_eq!(engine.active_voices(), 0);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_play_only_the_mic_path_accepts_is_accepted() {
+        let (mut engine, backends) = mic_rig();
+        mic_on(&mut engine, &backends, mic_settings());
+        // The monitor has no stream and no open grace window.
+        engine.shared.set_output_active(false);
+        engine.shared.close_play_grace();
+        let sound = tone();
+        assert!(engine.play(&sound, 1.0));
+        // Only the mic copy was queued.
+        assert_eq!(sound.handle_count(), 2);
+        assert!(!is_silent(&render(&backends.mic_sink.mixer().unwrap())));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn output_latency_is_the_longest_over_the_paths() {
+        let (mut engine, backends) = mic_rig();
+        mic_on(&mut engine, &backends, mic_settings());
+        let monitor = backends.monitor.mixer().unwrap();
+        let mic = backends.mic_sink.mixer().unwrap();
+        let set = |mixer: &Mutex<Mixer>, ms| {
+            mixer
+                .lock()
+                .unwrap()
+                .record_output_latency(Duration::from_millis(ms));
+        };
+        set(&monitor, 10);
+        set(&mic, 30);
+        assert_eq!(engine.output_latency(), Duration::from_millis(30));
+        set(&monitor, 50);
+        assert_eq!(engine.output_latency(), Duration::from_millis(50));
+        engine.shutdown();
+    }
+
+    #[test]
+    fn a_failed_capture_leaves_the_mic_sink_playing() {
+        let (mut engine, backends) = mic_rig();
+        backends.capture.set_default(None);
+        engine.set_mic(Some(mic_settings())).unwrap();
+        assert!(wait_until(TIMEOUT, || matches!(
+            engine.mic_status(),
+            MicStatus::Active {
+                capture: CaptureStatus::Unavailable(_),
+                ..
+            }
+        )));
+        assert!(engine.has_mic_output());
+        assert!(engine.play(&tone(), 1.0));
+        assert!(!is_silent(&render(&backends.mic_sink.mixer().unwrap())));
+        assert_monitor_untouched(&backends);
         engine.shutdown();
     }
 
