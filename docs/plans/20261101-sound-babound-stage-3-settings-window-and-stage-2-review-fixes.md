@@ -108,26 +108,26 @@ Part B fixes the five findings from the stage 2 acceptance review:
 **Files:**
 - Modify: `crates/engine/src/{engine.rs, cpal_sink.rs, test_support.rs}`, the `Backends` trait (`engine.rs`), `crates/app/src/{config.rs, hotkeys.rs, actions.rs, cli.rs}`, `crates/app/src/platform/{mod,macos,windows,linux}.rs`
 
-- [ ] Engine:
+- [x] Engine:
   - `MicSettings` gets `device_prefer: Option<String>`, which counts in `same_streams`.
   - `OutputTarget::Named` carries the pattern and the preference.
   - `first_match` becomes a pure `best_match`: among the devices the pattern names (unchanged `name_matches`), the first, in enumeration order, whose name or id also contains the preference (ignoring case); otherwise the first match.
   - Builds, identity queries and `probe` all use it. `Backends::mic_sink` takes the preference.
-- [ ] App:
+- [x] App:
   - `platform::default_virtual_device_preference()`: `Some("2ch")` on macOS, `None` elsewhere.
   - `MicConfig` gets the preference. It is set only when `virtual_device` is missing or blank (the platform default), so a user-set pattern keeps first-match semantics.
   - `settings_for` passes it on.
-- [ ] Wording:
+- [x] Wording:
   - the template comment, and the macOS `default_virtual_device` doc comment;
   - the `mic-check` "Virtual device pattern" line names the preference when there is one, for example `"BlackHole" (prefers a "2ch" device)`.
-- [ ] Tests:
+- [x] Tests:
   - `best_match` on ["BlackHole 16ch", "BlackHole 2ch"]: it picks the 2ch device with the preference and the 16ch device without one;
   - a preference no device matches falls back to the first match;
   - a blank pattern still matches nothing;
   - `resolve_mic` sets the preference only for a missing or blank `virtual_device`;
   - a changed preference restarts the mic streams (`same_streams`);
   - the `mic-check` line.
-- [ ] Run the verification gates. All must pass before Task 3.
+- [x] Run the verification gates. All must pass before Task 3.
 
 ### Task 3: Adaptive passthrough target and 10 ms macOS period (B.1)
 

@@ -26,6 +26,11 @@ pub fn default_virtual_device() -> &'static str {
     super::PACTL_SINK_NAME
 }
 
+/// No preference: the default pattern names the app's own sink.
+pub fn default_virtual_device_preference() -> Option<&'static str> {
+    None
+}
+
 /// The inputs the capture must never open: the pattern (which also matches
 /// the null sink's monitor) and the remapped source that call apps record.
 pub fn virtual_input_exclusions(pattern: &str) -> Vec<String> {
@@ -138,6 +143,7 @@ mod tests {
     #[test]
     fn mic_defaults_target_the_pactl_device() {
         assert_eq!(default_virtual_device(), "sound_babound_sink");
+        assert_eq!(default_virtual_device_preference(), None);
         assert_eq!(
             virtual_input_exclusions("sound_babound_sink"),
             ["sound_babound_sink", "sound_babound_mic"]

@@ -282,7 +282,12 @@ fn format_mic_check(check: &MicCheck, missing_hint: &str) -> MicReport {
     });
 
     let pattern = &check.mic.virtual_device;
-    line(format!("Virtual device pattern: {pattern:?}"));
+    line(match &check.mic.device_prefer {
+        Some(prefer) => {
+            format!("Virtual device pattern: {pattern:?} (prefers a {prefer:?} device)")
+        }
+        None => format!("Virtual device pattern: {pattern:?}"),
+    });
     line(match &check.probe.sink {
         Ok(info) => format!("Virtual device: {}", describe(info)),
         Err(BuildError::DeviceNotFound(_)) => {
@@ -756,6 +761,7 @@ mod tests {
             mic: MicConfig {
                 enabled: true,
                 virtual_device: "BlackHole".to_string(),
+                device_prefer: None,
                 ..MicConfig::default()
             },
             access,
@@ -790,6 +796,23 @@ mod tests {
         assert!(text.contains("Microphone permission: granted"), "{text}");
         assert!(text.contains("Virtual mic: available"), "{text}");
         assert!(!text.contains("  - "), "{text}");
+    }
+
+    #[test]
+    fn the_pattern_line_names_the_preference() {
+        let mut preferring = check(found(), MicrophoneAccess::Granted);
+        preferring.mic.device_prefer = Some("2ch".into());
+        let text = format_mic_check(&preferring, HINT).text;
+        assert!(
+            text.contains("Virtual device pattern: \"BlackHole\" (prefers a \"2ch\" device)\n"),
+            "{text}"
+        );
+
+        let text = format_mic_check(&check(found(), MicrophoneAccess::Granted), HINT).text;
+        assert!(
+            text.contains("Virtual device pattern: \"BlackHole\"\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -919,6 +942,7 @@ mod tests {
         let settings = headless_mic_settings(&mic).unwrap();
         assert!(!settings.capture);
         assert_eq!(settings.device_match, mic.virtual_device);
+        assert_eq!(settings.device_prefer, mic.device_prefer);
     }
 
     #[test]

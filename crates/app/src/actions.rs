@@ -200,6 +200,7 @@ pub fn mic_settings(mic: &MicConfig, capture: bool) -> Option<MicSettings> {
 pub fn settings_for(mic: &MicConfig, capture: bool) -> MicSettings {
     MicSettings {
         device_match: mic.virtual_device.clone(),
+        device_prefer: mic.device_prefer.clone(),
         excluded_inputs: platform::virtual_input_exclusions(&mic.virtual_device),
         sound_gain: mic.sound_gain,
         mic_gain: mic.mic_gain,
@@ -913,6 +914,7 @@ mod tests {
         MicConfig {
             enabled: true,
             virtual_device: device.into(),
+            device_prefer: None,
             sound_gain: 0.5,
             mic_gain: 2.0,
         }
@@ -1200,6 +1202,7 @@ mod tests {
                 mic_settings(&mic_on("My Cable"), capture),
                 Some(MicSettings {
                     device_match: "My Cable".into(),
+                    device_prefer: None,
                     excluded_inputs: platform::virtual_input_exclusions("My Cable"),
                     sound_gain: 0.5,
                     mic_gain: 2.0,
@@ -1207,6 +1210,18 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn mic_settings_carry_the_device_preference() {
+        let preferring = MicConfig {
+            device_prefer: Some("2ch".into()),
+            ..mic_on("BlackHole")
+        };
+        let settings = settings_for(&preferring, true);
+        assert_eq!(settings.device_match, "BlackHole");
+        assert_eq!(settings.device_prefer.as_deref(), Some("2ch"));
+        assert_eq!(settings_for(&mic_on("BlackHole"), true).device_prefer, None);
     }
 
     #[test]

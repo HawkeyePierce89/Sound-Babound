@@ -94,23 +94,26 @@ impl HotkeyRegistry {
 }
 
 /// Validates the `[mic]` table: gains are clamped like every other gain,
-/// a missing `virtual_device` selects the platform default, and a blank one
-/// does too, with a warning.
+/// a missing `virtual_device` selects the platform default (with the
+/// platform's device preference), and a blank one does too, with a warning.
+/// A pattern the user set has no preference.
 pub fn resolve_mic(raw: &RawMic, warnings: &mut Vec<String>) -> MicConfig {
     let default_device = platform::default_virtual_device();
-    let virtual_device = match raw.virtual_device.as_deref().map(str::trim) {
-        None => default_device.to_string(),
+    let default_prefer = || platform::default_virtual_device_preference().map(str::to_owned);
+    let (virtual_device, device_prefer) = match raw.virtual_device.as_deref().map(str::trim) {
+        None => (default_device.to_string(), default_prefer()),
         Some("") => {
             warnings.push(format!(
                 "mic.virtual_device is empty, using the default {default_device:?}"
             ));
-            default_device.to_string()
+            (default_device.to_string(), default_prefer())
         }
-        Some(pattern) => pattern.to_string(),
+        Some(pattern) => (pattern.to_string(), None),
     };
     MicConfig {
         enabled: raw.enabled,
         virtual_device,
+        device_prefer,
         sound_gain: clamp_gain(raw.sound_gain, "mic.sound_gain", warnings),
         mic_gain: clamp_gain(raw.mic_gain, "mic.mic_gain", warnings),
     }
@@ -443,10 +446,12 @@ mod tests {
             MicConfig {
                 enabled: false,
                 virtual_device: platform::default_virtual_device().to_string(),
+                device_prefer: platform::default_virtual_device_preference().map(str::to_owned),
                 sound_gain: 1.0,
                 mic_gain: 1.0,
             }
         );
+        assert_eq!(resolved.mic, MicConfig::default());
     }
 
     #[test]
@@ -463,6 +468,7 @@ mod tests {
             MicConfig {
                 enabled: true,
                 virtual_device: "My Cable".into(),
+                device_prefer: None,
                 sound_gain: 0.5,
                 mic_gain: 2.0,
             }
@@ -499,6 +505,25 @@ mod tests {
     }
 
     #[test]
+    fn only_the_platform_default_device_carries_the_preference() {
+        let missing = resolve_mic(&RawMic::default(), &mut Vec::new());
+        assert_eq!(
+            missing.device_prefer.as_deref(),
+            platform::default_virtual_device_preference()
+        );
+        // A user-set pattern keeps first-match semantics, even when it is
+        // the default pattern spelled out.
+        for pattern in ["My Cable", platform::default_virtual_device()] {
+            let raw = RawMic {
+                virtual_device: Some(pattern.into()),
+                ..RawMic::default()
+            };
+            let set = resolve_mic(&raw, &mut Vec::new());
+            assert_eq!(set.device_prefer, None, "{pattern:?}");
+        }
+    }
+
+    #[test]
     fn blank_virtual_device_falls_back_to_the_default_with_a_warning() {
         for blank in ["", "   "] {
             let raw = RawConfig {
@@ -512,6 +537,10 @@ mod tests {
             assert_eq!(
                 resolved.mic.virtual_device,
                 platform::default_virtual_device()
+            );
+            assert_eq!(
+                resolved.mic.device_prefer.as_deref(),
+                platform::default_virtual_device_preference()
             );
             assert_eq!(warnings.len(), 1, "{warnings:?}");
             assert!(warnings[0].contains("mic.virtual_device"), "{warnings:?}");

@@ -161,7 +161,7 @@ mic_gain = 1.0                 # volume of your microphone in the call, 0.0 to 4
 | Key              | Default | Meaning |
 |------------------|---------|---------|
 | `enabled`        | `false` | Turns the virtual microphone on. The tray's "Mic to call" item flips this value in the file, keeping your comments and other keys. |
-| `virtual_device` | `"BlackHole"` on macOS, `"CABLE Input"` on Windows, `"sound_babound_sink"` on Linux | The output device the call mix is written to: the first output whose name or id contains this text, ignoring case. A missing or blank value means the default. On Linux the app creates its own devices whatever this says (see [Linux](#linux)). |
+| `virtual_device` | `"BlackHole"` on macOS, `"CABLE Input"` on Windows, `"sound_babound_sink"` on Linux | The output device the call mix is written to: the first output whose name or id contains this text, ignoring case. A missing or blank value means the default; on macOS the default prefers "BlackHole 2ch" when several BlackHole devices are installed. On Linux the app creates its own devices whatever this says (see [Linux](#linux)). |
 | `sound_gain`     | `1.0`   | Volume of the sounds in the call, on top of their own gain and `master_gain`. It does not change what you hear. |
 | `mic_gain`       | `1.0`   | Volume of your microphone in the call. |
 

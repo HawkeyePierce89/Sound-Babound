@@ -57,9 +57,10 @@ stop_all_hotkey = "CmdOrCtrl+Shift+0"
 #   enabled        - true or false (default false)
 #   virtual_device - the cable's playback device: the first output whose
 #                    name or id contains this text, ignoring case. The default is
-#                    "BlackHole" on macOS, "CABLE Input" (VB-CABLE) on
-#                    Windows and "sound_babound_sink" on Linux, where the app
-#                    creates the device itself.
+#                    "BlackHole" on macOS (preferring "BlackHole 2ch" when
+#                    several BlackHole devices are installed), "CABLE Input"
+#                    (VB-CABLE) on Windows and "sound_babound_sink" on Linux,
+#                    where the app creates the device itself.
 #   sound_gain     - volume of the sounds in the call, 0.0 to 4.0 (default 1.0)
 #   mic_gain       - volume of your microphone in the call, 0.0 to 4.0
 #                    (default 1.0)
@@ -239,6 +240,11 @@ pub struct MicConfig {
     pub enabled: bool,
     /// The mic sink's device pattern, trimmed and never blank.
     pub virtual_device: String,
+    /// Which of the devices `virtual_device` names to prefer: the
+    /// platform's preference when `virtual_device` is the platform default
+    /// (missing or blank in the file), `None` for a pattern the user set,
+    /// which keeps first-match semantics.
+    pub device_prefer: Option<String>,
     /// Clamped to [`crate::hotkeys::MIN_GAIN`, `crate::hotkeys::MAX_GAIN`].
     pub sound_gain: f32,
     /// Clamped to [`crate::hotkeys::MIN_GAIN`, `crate::hotkeys::MAX_GAIN`].
@@ -251,6 +257,7 @@ impl Default for MicConfig {
         MicConfig {
             enabled: false,
             virtual_device: platform::default_virtual_device().to_string(),
+            device_prefer: platform::default_virtual_device_preference().map(str::to_owned),
             sound_gain: default_gain(),
             mic_gain: default_gain(),
         }

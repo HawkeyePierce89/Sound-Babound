@@ -13,19 +13,19 @@ mod windows;
 #[cfg(target_os = "linux")]
 pub use linux::{
     VirtualMic, attach_parent_console, create_virtual_mic, default_virtual_device,
-    global_hotkeys_supported, virtual_device_missing_hint, virtual_input_exclusions,
-    virtual_mic_hint, virtual_mic_not_found,
+    default_virtual_device_preference, global_hotkeys_supported, virtual_device_missing_hint,
+    virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
-    attach_parent_console, default_virtual_device, microphone_access, prepare_event_loop,
-    virtual_device_missing_hint, virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found,
-    with_tray_icon,
+    attach_parent_console, default_virtual_device, default_virtual_device_preference,
+    microphone_access, prepare_event_loop, virtual_device_missing_hint, virtual_input_exclusions,
+    virtual_mic_hint, virtual_mic_not_found, with_tray_icon,
 };
 #[cfg(target_os = "windows")]
 pub use windows::{
-    attach_parent_console, default_virtual_device, virtual_device_missing_hint,
-    virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found,
+    attach_parent_console, default_virtual_device, default_virtual_device_preference,
+    virtual_device_missing_hint, virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found,
 };
 
 /// Fallback for every other OS: nothing to attach.
@@ -37,6 +37,12 @@ pub fn attach_parent_console() {}
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn default_virtual_device() -> &'static str {
     ""
+}
+
+/// Fallback for every other OS: no preference.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn default_virtual_device_preference() -> Option<&'static str> {
+    None
 }
 
 /// Fallback for every other OS: only the configured pattern is excluded.

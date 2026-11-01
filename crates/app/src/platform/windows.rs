@@ -20,6 +20,11 @@ pub fn default_virtual_device() -> &'static str {
     "CABLE Input"
 }
 
+/// No preference: the default pattern names one device.
+pub fn default_virtual_device_preference() -> Option<&'static str> {
+    None
+}
+
 /// The inputs the capture must never open, since they carry what the mic
 /// sink plays: the pattern, VB-CABLE's recording side, and the recording
 /// side of the cable the pattern names (see [`recording_side`]).
@@ -69,6 +74,7 @@ mod tests {
     #[test]
     fn mic_defaults_target_vb_cable() {
         assert_eq!(default_virtual_device(), "CABLE Input");
+        assert_eq!(default_virtual_device_preference(), None);
         assert_eq!(
             virtual_input_exclusions("CABLE Input"),
             ["CABLE Input", "CABLE Output"]
