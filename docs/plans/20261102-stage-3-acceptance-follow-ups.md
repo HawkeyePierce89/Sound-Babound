@@ -154,6 +154,7 @@ Item 9, `WORKER_FINISH_TIMEOUT`:
 - [x] `finish_within`'s warning says the same in one sentence. The value stays 10 s.
 - [x] Run `cargo test -p sound-babound`; it must pass before Task 4.
 
+### Task 4: Verify acceptance criteria
 
 - [x] `cargo fmt --all -- --check`
 - [x] `cargo clippy --workspace --all-targets` with zero warnings

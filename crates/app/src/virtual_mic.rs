@@ -253,7 +253,10 @@ pub enum DeviceWait<'a> {
 /// [`AudioControl::mic_stopped`] says the stream has ended
 /// ([`WithVirtualMic::release_retired`]); unloading it under a live stream
 /// would let the server move the stream, the live microphone included, to
-/// the speakers. A mic turned on again meanwhile reuses it.
+/// the speakers. A mic turned on again meanwhile reuses it, unless the
+/// device vanished (a [`DeviceReply::Checked`] found it gone while the stream
+/// still ran): that one is released and created again with a new epoch once
+/// the stream has ended.
 ///
 /// The mic path runs only while this process owns the device: a device that
 /// cannot be created is logged and the mic path stays stopped, waiting for
@@ -1734,6 +1737,20 @@ mod tests {
             offs
         );
         assert_eq!(audio.waiting_for_device(), Some(DeviceWait::Pending));
+
+        // Once epoch 2's device exists, the same late answer still changes
+        // nothing: only its epoch tells it apart.
+        run(&mut audio, &mut host);
+        assert!(audio.has_device());
+        let sent = audio.requests.sent().len();
+        audio.on_reply(gone(1));
+        assert_eq!(audio.requests.sent().len(), sent);
+        assert_eq!(
+            log.borrow().iter().filter(|e| **e == "mic off").count(),
+            offs
+        );
+        assert!(audio.has_device());
+        assert_eq!(log.borrow().last(), Some(&"mic on"));
     }
 
     #[test]

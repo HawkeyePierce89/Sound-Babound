@@ -30,7 +30,8 @@
 //!   BLOCK_MARGIN)`.
 //! - The reader side ([`PassthroughReader::read`]) runs in the mic sink
 //!   callback. It outputs silence until the ring holds the effective target
-//!   (priming), and re-primes after an underrun or when a new capture starts.
+//!   (priming), and re-primes after an underrun, when a new capture starts,
+//!   or when the mic sink is reconfigured ([`PassthroughReader::set_sink_rate`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -895,11 +896,14 @@ mod tests {
         reader.read(&mut out);
         assert!(reader.is_primed());
         let correction = reader.correction();
+        let integral = reader.integral;
         assert!(correction > 0.0, "the controller learned something");
+        assert!(integral > 0.0);
 
         reader.set_sink_rate(48_000);
         assert!(!reader.is_primed(), "the same rate re-primes");
         assert_eq!(reader.correction(), correction, "and keeps the correction");
+        assert_eq!(reader.integral, integral, "and the integral");
 
         // A 2048-frame sink callback raises the target above the fill.
         reader.note_block(2_048);
@@ -919,6 +923,10 @@ mod tests {
         reader.read(&mut long);
         assert!(reader.is_primed());
         assert_eq!(shared.underruns(), 0);
+        assert!(
+            reader.integral >= integral,
+            "the first step after priming builds on the learned integral"
+        );
     }
 
     #[test]
@@ -926,6 +934,7 @@ mod tests {
         assert_eq!(fallback_target(48_000, 480), 1_440);
         assert_eq!(fallback_target(48_000, 2_048), 2_288);
         assert_eq!(fallback_target(48_000, 4_096), 4_336);
+        assert_eq!(fallback_target(MAX_CAPTURE_RATE, 60_000), MAX_TARGET);
 
         for (block, fill) in [(2_048usize, 4_096usize), (4_096, 8_192)] {
             let shared = shared_at(48_000);
@@ -1091,7 +1100,9 @@ mod tests {
         /// spread it out from the order of the callbacks alone.
         ///
         /// For a 2048-frame capture block at 48 kHz the tolerance is 20 ppm
-        /// plus one capture block over the 540 s span, about 99 ppm. The
+        /// plus one capture block over the 540 s span, about 99 ppm; for a
+        /// 4096-frame block about 178 ppm, so there the deviation and
+        /// overrun/underrun asserts do most of the checking. The
         /// ±200 ppm sink clocks prove the controller alive: without a
         /// correction the fill would drift 9.6 samples/s, past one block in
         /// about 3.5 minutes, and the deviation and overrun/underrun asserts
