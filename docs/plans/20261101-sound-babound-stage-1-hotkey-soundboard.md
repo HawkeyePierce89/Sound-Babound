@@ -64,18 +64,18 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
 **Files:**
 - Create: `Cargo.toml`, `crates/engine/Cargo.toml`, `crates/engine/src/lib.rs`, `crates/app/Cargo.toml`, `crates/app/src/main.rs`, `crates/app/src/cli.rs`, `crates/app/src/logging.rs`
 
-- [ ] Workspace `Cargo.toml`:
+- [x] Workspace `Cargo.toml`:
   - members `crates/engine` and `crates/app`
   - shared `[workspace.package]` (edition 2024, MIT license, rust-version 1.98)
   - `[workspace.dependencies]` with the versions listed in Context
   - the release profile from Development Approach (`lto = true`, `codegen-units = 1`, `strip = true`, no `opt-level` override)
-- [ ] `babound-engine` library crate with an empty public module skeleton. It has no UI dependencies.
-- [ ] `sound-babound` binary crate depending on `babound-engine`.
-- [ ] `cli.rs`: clap derive with no subcommand (meaning tray mode) and `play [FILE]` (no FILE means the embedded demo). Both branches are stubs for now.
-- [ ] `logging.rs`: `tracing-subscriber` with `EnvFilter`, read from `RUST_LOG` and defaulting to `info`.
-- [ ] Add `#![cfg_attr(windows, windows_subsystem = "windows")]` in `main.rs`.
-- [ ] Write tests: CLI parsing of no args, `play`, and `play path.wav` (clap `try_parse_from`).
-- [ ] Run fmt, clippy, test and the Windows-target check. All must pass before Task 2.
+- [x] `babound-engine` library crate with an empty public module skeleton. It has no UI dependencies.
+- [x] `sound-babound` binary crate depending on `babound-engine`.
+- [x] `cli.rs`: clap derive with no subcommand (meaning tray mode) and `play [FILE]` (no FILE means the embedded demo). Both branches are stubs for now.
+- [x] `logging.rs`: `tracing-subscriber` with `EnvFilter`, read from `RUST_LOG` and defaulting to `info`.
+- [x] Add `#![cfg_attr(windows, windows_subsystem = "windows")]` in `main.rs`.
+- [x] Write tests: CLI parsing of no args, `play`, and `play path.wav` (clap `try_parse_from`).
+- [x] Run fmt, clippy, test and the Windows-target check. All must pass before Task 2.
 
 ### Task 2: Sound decoding and embedded demo asset
 
