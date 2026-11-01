@@ -353,20 +353,31 @@ impl<M: HotkeyBackend> Hotkeys<M> {
 }
 
 /// Starts the settings window and pauses the hotkeys while it is open, so
-/// it can see the tray's combinations. `snapshot` is the config file's
-/// bytes from before the spawn.
+/// it can see the tray's combinations. The pause comes before the spawn, so
+/// the window never runs while the tray still holds them; a failed spawn
+/// registers `board` (the current board's hotkeys) again. `snapshot` is the
+/// config file's bytes from before the spawn.
 fn open_settings<S: SettingsSpawner, M: HotkeyBackend>(
     launcher: &mut SettingsLauncher<S>,
     hotkeys: &mut Hotkeys<M>,
+    board: &[HotKey],
     snapshot: Option<Vec<u8>>,
 ) {
+    if launcher.is_open() {
+        // Already paused for the running window.
+        tracing::info!("the settings window is already open");
+        return;
+    }
+    hotkeys.pause();
     match launcher.open(snapshot) {
         OpenOutcome::Launched => {
-            hotkeys.pause();
             tracing::info!("settings window opened; hotkeys are paused until it closes");
         }
         OpenOutcome::AlreadyOpen => tracing::info!("the settings window is already open"),
-        OpenOutcome::Failed(err) => tracing::error!("{err:#}"),
+        OpenOutcome::Failed(err) => {
+            hotkeys.resume(board);
+            tracing::error!("{err:#}");
+        }
     }
 }
 
@@ -436,6 +447,7 @@ impl TrayApp {
             Action::OpenSettings => open_settings(
                 &mut self.settings,
                 &mut self.hotkeys,
+                self.board.map().hotkeys(),
                 config_snapshot(self.config_path.as_deref()),
             ),
             Action::Reload => self.reload(),
@@ -649,6 +661,7 @@ fn open_config_folder() {
 mod tests {
     use std::cell::RefCell;
     use std::collections::HashSet;
+    use std::rc::Rc;
 
     use global_hotkey::hotkey::{Code, Modifiers};
 
@@ -657,7 +670,8 @@ mod tests {
     /// Tracks what the OS would have registered, and rejects like it does.
     #[derive(Default)]
     struct FakeBackend {
-        live: RefCell<HashSet<HotKey>>,
+        /// Shared, so a fake spawner can look at it.
+        live: Rc<RefCell<HashSet<HotKey>>>,
         /// Hotkeys the "OS" refuses (taken by another app).
         taken: HashSet<HotKey>,
     }
@@ -690,15 +704,21 @@ mod tests {
         Hotkeys::with_manager(Some(backend))
     }
 
-    /// Counts spawns; fails while `fail` is set.
+    /// Counts spawns; fails while `fail` is set. With `watch`, records what
+    /// the backend had registered at each spawn.
     #[derive(Default)]
     struct FakeSpawner {
         spawns: usize,
         fail: bool,
+        watch: Option<Rc<RefCell<HashSet<HotKey>>>>,
+        live_at_spawn: Vec<HashSet<HotKey>>,
     }
 
     impl SettingsSpawner for FakeSpawner {
         fn spawn(&mut self) -> Result<()> {
+            if let Some(watch) = &self.watch {
+                self.live_at_spawn.push(watch.borrow().clone());
+            }
             if self.fail {
                 anyhow::bail!("cannot launch");
             }
@@ -767,16 +787,23 @@ mod tests {
     fn hotkeys_pause_while_the_settings_window_is_open() {
         let (a, b) = (key(Code::Digit1), key(Code::Digit2));
         let board = [a, b];
-        let mut hotkeys = with_backend(FakeBackend::default());
+        let backend = FakeBackend::default();
+        let watch = Rc::clone(&backend.live);
+        let mut hotkeys = with_backend(backend);
         hotkeys.register(&board);
-        let mut launcher = SettingsLauncher::new(FakeSpawner::default());
+        let mut launcher = SettingsLauncher::new(FakeSpawner {
+            watch: Some(watch),
+            ..FakeSpawner::default()
+        });
         let snapshot = Some(b"config".to_vec());
 
-        open_settings(&mut launcher, &mut hotkeys, snapshot.clone());
+        open_settings(&mut launcher, &mut hotkeys, &board, snapshot.clone());
         assert!(launcher.is_open());
         assert!(live(&hotkeys).is_empty());
+        // Paused before the window started.
+        assert_eq!(launcher.spawner().live_at_spawn, [HashSet::new()]);
         // A second click starts nothing and keeps the pause.
-        open_settings(&mut launcher, &mut hotkeys, snapshot.clone());
+        open_settings(&mut launcher, &mut hotkeys, &board, snapshot.clone());
         assert!(live(&hotkeys).is_empty());
         assert_eq!(launcher.spawner().spawns, 1);
 
@@ -795,7 +822,7 @@ mod tests {
             fail: true,
             ..FakeSpawner::default()
         });
-        open_settings(&mut launcher, &mut hotkeys, None);
+        open_settings(&mut launcher, &mut hotkeys, &[a], None);
         assert!(!launcher.is_open());
         assert!(!hotkeys.paused);
         assert_eq!(live(&hotkeys), HashSet::from([a]));
