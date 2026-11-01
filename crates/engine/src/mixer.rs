@@ -168,6 +168,7 @@ impl Mixer {
     }
 
     /// The shared state this mixer reads commands from.
+    #[cfg(test)]
     pub fn shared(&self) -> &Arc<MixerShared> {
         &self.shared
     }
@@ -184,6 +185,7 @@ impl Mixer {
     }
 
     /// Output sample rate in Hz (0 while unconfigured).
+    #[cfg(test)]
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
@@ -194,6 +196,7 @@ impl Mixer {
     }
 
     /// Current master gain.
+    #[cfg(test)]
     pub fn master_gain(&self) -> f32 {
         self.master_gain
     }
@@ -204,7 +207,8 @@ impl Mixer {
     }
 
     /// Source positions (in source frames) of the voices that are still
-    /// audible, in voice-slot order. For diagnostics and tests.
+    /// audible, in voice-slot order.
+    #[cfg(test)]
     pub fn voice_positions(&self) -> impl Iterator<Item = f64> + '_ {
         self.voices
             .iter()
@@ -233,7 +237,7 @@ impl Mixer {
     pub fn render(&mut self, out: &mut [f32]) {
         self.retry_pending();
         self.release_finished();
-        self.apply_commands();
+        let applied = self.apply_commands();
 
         out.fill(0.0);
         if self.channels > 0 && self.sample_rate > 0 {
@@ -243,6 +247,13 @@ impl Mixer {
 
         let active = self.voices.iter().flatten().filter(|v| !v.finished).count();
         self.shared.active_voices.store(active, Ordering::Release);
+        // Published after `active_voices`: a reader that sees this render's
+        // command count (Acquire) also sees this render's voice count.
+        if applied > 0 {
+            self.shared
+                .commands_applied
+                .fetch_add(applied, Ordering::Release);
+        }
         self.shared
             .callback_heartbeat
             .fetch_add(1, Ordering::Release);
@@ -315,14 +326,17 @@ impl Mixer {
         }
     }
 
-    fn apply_commands(&mut self) {
+    /// Apply queued commands; returns how many were applied.
+    fn apply_commands(&mut self) -> u64 {
+        let mut applied = 0;
         while PENDING_RELEASE - self.pending_used >= MAX_VOICES {
             let Some(command) = self.shared.commands.pop() else {
                 break;
             };
             self.apply(command);
-            self.shared.commands_applied.fetch_add(1, Ordering::Release);
+            applied += 1;
         }
+        applied
     }
 
     fn apply(&mut self, command: Command) {
@@ -819,6 +833,76 @@ mod tests {
         assert_eq!(m.pending_used, 0);
         assert_eq!(m.shared().commands_applied(), 1);
         assert!(out.iter().all(|&x| (x - 0.5).abs() < 1e-6));
+    }
+
+    /// `MAX_VOICES` long voices of distinct sounds, all playing, then a full
+    /// garbage queue.
+    fn full_board_with_full_garbage(m: &mut Mixer) -> Vec<Sound> {
+        let sounds: Vec<Sound> = (0..MAX_VOICES)
+            .map(|_| constant(0.01, 48_000, 48_000, 1))
+            .collect();
+        for s in &sounds {
+            play(m, s, 1.0);
+        }
+        render(m, 1);
+        assert_eq!(m.shared().active_voices(), MAX_VOICES);
+        let filler = constant(0.0, 1, 48_000, 1);
+        for _ in 0..GARBAGE_CAPACITY {
+            m.shared().garbage.push(filler.clone()).unwrap();
+        }
+        sounds
+    }
+
+    #[test]
+    fn stop_all_with_full_garbage_parks_every_voice() {
+        let mut m = mixer(48_000, 1);
+        let sounds = full_board_with_full_garbage(&mut m);
+        let applied = m.shared().commands_applied();
+
+        m.shared().push(Command::StopAll).unwrap();
+        render(&mut m, 1);
+        assert_eq!(m.shared().commands_applied(), applied + 1);
+        assert_eq!(m.pending_used, MAX_VOICES);
+        assert_eq!(m.shared().active_voices(), 0);
+        // Nothing was freed on the render thread: each sound is held by the
+        // test and by its pending slot.
+        assert!(sounds.iter().all(|s| s.handle_count() == 2));
+
+        // Exactly MAX_VOICES slots are still free, so a new play is applied.
+        let next = constant(0.5, 1000, 48_000, 1);
+        play(&m, &next, 1.0);
+        let out = render(&mut m, 4);
+        assert_eq!(m.shared().commands_applied(), applied + 2);
+        assert!(out.iter().all(|&x| (x - 0.5).abs() < 1e-6));
+
+        // Once the garbage queue drains, the parked sounds move on and are
+        // freed off the render thread.
+        m.shared().drain_garbage();
+        render(&mut m, 1);
+        assert_eq!(m.pending_used, 0);
+        m.shared().drain_garbage();
+        assert!(sounds.iter().all(|s| s.handle_count() == 1));
+    }
+
+    #[test]
+    fn eviction_with_full_garbage_parks_the_oldest_voice() {
+        let mut m = mixer(48_000, 1);
+        let sounds = full_board_with_full_garbage(&mut m);
+
+        let newest = constant(0.5, 1000, 48_000, 1);
+        play(&m, &newest, 1.0);
+        render(&mut m, 1);
+        assert_eq!(m.pending_used, 1);
+        assert_eq!(m.shared().active_voices(), MAX_VOICES);
+        // The oldest voice was evicted into a slot, not freed.
+        assert_eq!(sounds[0].handle_count(), 2);
+        assert!(sounds[1..].iter().all(|s| s.handle_count() == 2));
+        assert_eq!(newest.handle_count(), 2);
+
+        m.shared().drain_garbage();
+        render(&mut m, 1);
+        m.shared().drain_garbage();
+        assert_eq!(sounds[0].handle_count(), 1);
     }
 
     #[test]

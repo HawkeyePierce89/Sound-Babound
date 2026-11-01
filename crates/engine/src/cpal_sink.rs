@@ -23,16 +23,7 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Builds cpal output streams on the current default output device.
 #[derive(Debug, Default)]
-pub struct CpalSinkFactory {
-    _private: (),
-}
-
-impl CpalSinkFactory {
-    /// Create a factory for the platform's default cpal host.
-    pub fn new() -> CpalSinkFactory {
-        CpalSinkFactory::default()
-    }
-}
+pub struct CpalSinkFactory;
 
 /// A running cpal stream. Dropping it stops the stream.
 struct CpalSink {
@@ -308,7 +299,7 @@ mod tests {
     #[test]
     #[ignore = "needs a real audio output device"]
     fn smoke_builds_a_real_stream() {
-        let mut factory = CpalSinkFactory::new();
+        let mut factory = CpalSinkFactory;
         let shared = Arc::new(MixerShared::new());
         let mixer = Arc::new(Mutex::new(Mixer::new(Arc::clone(&shared))));
         let (tx, _rx) = mpsc::channel();

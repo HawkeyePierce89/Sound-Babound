@@ -81,20 +81,6 @@ pub trait SinkFactory: Send + 'static {
     fn current_default_identity(&mut self) -> Option<DeviceIdentity>;
 }
 
-impl<T: SinkFactory + ?Sized> SinkFactory for Box<T> {
-    fn build(
-        &mut self,
-        mixer: Arc<Mutex<Mixer>>,
-        on_error: Sender<SupervisorMsg>,
-    ) -> Result<BuiltSink, BuildError> {
-        (**self).build(mixer, on_error)
-    }
-
-    fn current_default_identity(&mut self) -> Option<DeviceIdentity> {
-        (**self).current_default_identity()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

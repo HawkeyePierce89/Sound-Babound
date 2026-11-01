@@ -2,18 +2,18 @@
 
 A cross-platform tray soundboard written in Rust. A global hotkey plays a preloaded sound through the system default output device.
 
-Playback keeps going when the default output changes. Switch it in the OS settings, or unplug and replug a headset, and the sounds that are playing move to the new default device and continue from where they were. Plugging in a device that does not become the default causes no audible gap.
+Playback keeps going when the default output changes. Switch it in the OS settings, or unplug and replug a headset, and the sounds that are playing move to the new default device and continue from where they were. Plugging in a device that does not become the default causes no audible gap. On Linux the app plays through ALSA's `default` device and relies on PipeWire or PulseAudio to move the stream when the default output changes. On bare ALSA a default switch is not followed; only losing the device triggers a rebuild.
 
 Features:
 
 - a tray icon with a menu listing every configured sound, plus "Stop all", "Reload config", "Open config folder" and "Quit"
 - one global hotkey per sound and an optional stop-all hotkey
 - overlapping playback (up to 32 voices; the oldest voice is evicted beyond that)
-- WAV, FLAC, OGG Vorbis and MP3, at any sample rate (resampled to the device rate), mono or stereo
+- WAV, FLAC, OGG Vorbis and MP3, at any sample rate (resampled to the device rate), mono or stereo (files with more channels play their first two)
 - per-sound gain and a master gain
 - a headless `play` command for one-off playback from a terminal
 
-Supported platforms: macOS, Windows 10/11 (x64 and arm64), and Linux (X11; see the Wayland limitation below).
+Supported platforms: macOS, Windows 10/11 (x64 and arm64), and Linux (X11; see the Wayland limitation below). So far only macOS has been run on real hardware. Windows x64 and Linux x64 are compile-checked; Windows arm64 and Linux aarch64 builds have not been tried yet.
 
 ## Building
 
@@ -63,9 +63,9 @@ sound-babound play               # plays the embedded demo chime
 sound-babound play path/to/file.mp3
 ```
 
-`play` decodes the file first, so a bad file fails right away with an error that names it. It then plays the sound through the default output device and exits when the sound has finished. Ctrl+C stops it. If no output stream comes up within 10 seconds, it exits with an error. Any failure prints a readable message and exits with code 1.
+`play` decodes the file first, so a bad file fails right away with an error that names it. It then plays the sound through the default output device and exits when the sound has finished. Ctrl+C stops it. If no output stream comes up within 10 seconds, it exits with an error. If the sound is still playing 10 seconds after its own length (for example because the output device went away and no other device took over), it exits with an error too. Any failure prints a readable message and exits with code 1.
 
-On Windows the binary uses the GUI subsystem, so it attaches to the console it was started from whenever arguments are given. That way `play`, `--help` and `--version` output shows up in the terminal.
+On Windows the binary uses the GUI subsystem, so it attaches to the console it was started from whenever arguments are given. That way `play`, `--help` and `--version` output shows up in the terminal. Because it is a GUI-subsystem binary, `cmd.exe` returns to the prompt without waiting for it. Use `start /wait sound-babound play ...` to wait for `play` to finish and read its exit code from `%ERRORLEVEL%`.
 
 ### Logging
 
@@ -75,6 +75,8 @@ Logs go to stderr through `tracing`. The default level is `info`. Use `RUST_LOG`
 RUST_LOG=debug sound-babound play
 RUST_LOG=babound_engine=debug,info sound-babound
 ```
+
+On Windows, tray mode (no arguments) has no console, so its logs and startup errors are not visible anywhere.
 
 At `info` you can see every output-stream rebuild with its device name, sample rate, channel count and sample format. At `debug` you also see device events that were checked and dropped because the default output did not change.
 
@@ -89,6 +91,8 @@ The config file is `config.toml` in a `sound-babound` folder under the OS config
 | Linux   | `$XDG_CONFIG_HOME/sound-babound/config.toml` (default `~/.config/sound-babound/config.toml`) |
 
 The file is created with defaults on first start and is never overwritten after that. "Open config folder" in the tray menu opens its folder. After editing, choose "Reload config". New sounds, hotkeys and gains apply right away, and sounds that are already playing keep playing. If the new file does not parse, the error is logged and the old config stays in effect.
+
+At startup, a config that does not parse is fatal: the app logs the error and exits with code 1. If the file cannot be read at all, the built-in default config (the demo chime) is used and a warning is logged.
 
 Example:
 
@@ -126,7 +130,7 @@ All sounds are decoded into memory when the config is loaded. A file that cannot
 
 ## Hotkey syntax
 
-A hotkey is any number of modifiers and one key, joined with `+`, for example `CmdOrCtrl+Shift+1`, `Ctrl+Alt+F5`, `Cmd+Shift+A` or `Alt+Space`. Names are case-insensitive, and spaces around `+` are ignored.
+A hotkey is any number of modifiers followed by exactly one key, joined with `+`. The key must come last: `Shift+Ctrl+1` works, `1+Ctrl` does not. Examples: `CmdOrCtrl+Shift+1`, `Ctrl+Alt+F5`, `Cmd+Shift+A` or `Alt+Space`. Names are case-insensitive, and spaces around `+` are ignored.
 
 Modifiers:
 
@@ -151,7 +155,7 @@ A hotkey that does not parse, or that is already used by an earlier entry, is sk
 
 ## Wayland limitation
 
-Global hotkeys on Linux are X11 key grabs. Wayland compositors do not deliver those to other applications. In a Wayland session (detected from `XDG_SESSION_TYPE`, or `WAYLAND_DISPLAY` when that is unset), the app does not register hotkeys and logs a warning. The tray menu still works, so sounds can be played from it. To use hotkeys, log in to an X11 session.
+Global hotkeys on Linux are X11 key grabs. Wayland compositors do not deliver those to other applications. In a Wayland session (detected from `XDG_SESSION_TYPE`, or from a non-empty `WAYLAND_DISPLAY` when `XDG_SESSION_TYPE` is unset or not `wayland`, `x11` or `tty`), the app does not register hotkeys and logs a warning. The tray menu still works, so sounds can be played from it. To use hotkeys, log in to an X11 session.
 
 ## Project layout
 

@@ -115,13 +115,8 @@ pub struct SupervisorCore {
 }
 
 impl SupervisorCore {
-    /// A core with the default timings that wants to build at `now`.
-    pub fn new(now: Instant) -> SupervisorCore {
-        SupervisorCore::with_timings(Timings::default(), now)
-    }
-
-    /// A core with custom timings that wants to build at `now`.
-    pub fn with_timings(timings: Timings, now: Instant) -> SupervisorCore {
+    /// A core with `timings` that wants to build at `now`.
+    pub fn new(timings: Timings, now: Instant) -> SupervisorCore {
         SupervisorCore {
             timings,
             stream: None,
@@ -231,11 +226,13 @@ impl SupervisorCore {
     }
 
     /// Whether a stream is supposed to be running.
+    #[cfg(test)]
     pub fn has_stream(&self) -> bool {
         self.stream.is_some()
     }
 
     /// The identity the running stream was built on.
+    #[cfg(test)]
     pub fn built_on(&self) -> Option<&DeviceIdentity> {
         self.stream.as_ref().map(|s| &s.identity)
     }
@@ -286,24 +283,11 @@ impl Drop for SupervisorHandle {
     }
 }
 
-/// Start the supervisor thread with the default timings.
+/// Start the supervisor thread.
 ///
 /// The thread creates the mixer on `shared`, starts `watcher`, builds the
 /// first stream immediately and then supervises it until shutdown.
-pub fn spawn_supervisor<F, W>(
-    factory: F,
-    watcher: W,
-    shared: Arc<MixerShared>,
-) -> std::io::Result<SupervisorHandle>
-where
-    F: SinkFactory,
-    W: DeviceWatcher,
-{
-    spawn_with_timings(factory, watcher, shared, Timings::default())
-}
-
-/// [`spawn_supervisor`] with custom timings.
-pub(crate) fn spawn_with_timings<F, W>(
+pub(crate) fn spawn_supervisor<F, W>(
     factory: F,
     watcher: W,
     shared: Arc<MixerShared>,
@@ -348,7 +332,7 @@ impl<F: SinkFactory> Worker<F> {
             mixer: Arc::new(Mutex::new(Mixer::new(Arc::clone(&shared)))),
             shared,
             sender,
-            core: SupervisorCore::with_timings(timings, Instant::now()),
+            core: SupervisorCore::new(timings, Instant::now()),
             sink: None,
         }
     }
@@ -468,7 +452,7 @@ mod tests {
 
     /// A core with a stream built on `name` at `t0`.
     fn running(t0: Instant, name: &str) -> SupervisorCore {
-        let mut core = SupervisorCore::new(t0);
+        let mut core = SupervisorCore::new(Timings::default(), t0);
         assert_eq!(core.poll(t0), Some(Action::Rebuild));
         core.on_build_result(Some(id(name)), t0);
         core
@@ -511,7 +495,7 @@ mod tests {
     #[test]
     fn builds_immediately_on_start() {
         let t0 = Instant::now();
-        let mut core = SupervisorCore::new(t0);
+        let mut core = SupervisorCore::new(Timings::default(), t0);
         assert!(!core.has_stream());
         assert_eq!(core.next_deadline(), Some(t0));
         assert_eq!(core.poll(t0), Some(Action::Rebuild));
@@ -551,7 +535,7 @@ mod tests {
     #[test]
     fn failed_builds_retry_until_success() {
         let t0 = Instant::now();
-        let mut core = SupervisorCore::new(t0);
+        let mut core = SupervisorCore::new(Timings::default(), t0);
         assert_eq!(core.poll(t0), Some(Action::Rebuild));
         core.on_build_result(None, t0);
         assert!(!core.has_stream());
@@ -579,7 +563,7 @@ mod tests {
     #[test]
     fn events_during_backoff_still_debounce_and_rebuild() {
         let t0 = Instant::now();
-        let mut core = SupervisorCore::new(t0);
+        let mut core = SupervisorCore::new(Timings::default(), t0);
         assert_eq!(core.poll(t0), Some(Action::Rebuild));
         core.on_build_result(None, t0);
         core.on_event(RebuildPolicy::IfDefaultOutputChanged, t0 + ms(100));
@@ -714,7 +698,7 @@ mod tests {
     const WAIT: Duration = Duration::from_secs(5);
 
     fn spawn(factory: &FakeSinkFactory, watcher: &FakeWatcher) -> SupervisorHandle {
-        spawn_with_timings(
+        spawn_supervisor(
             factory.clone(),
             watcher.clone(),
             Arc::new(MixerShared::new()),
@@ -778,9 +762,54 @@ mod tests {
         let handle = spawn(&factory, &watcher);
         assert!(wait_until(WAIT, || factory.builds().len() == 1));
         assert!(watcher.send(DeviceEvent::DefaultInputChanged));
+        // Events are handled in order: once the later list change has been
+        // checked, the input event has been handled too.
+        assert!(watcher.send(DeviceEvent::DeviceListChanged));
+        assert!(wait_until(WAIT, || factory.identity_queries() == 1));
         thread::sleep(ms(200));
+        // Only the list change queried the default; nothing rebuilt.
+        assert_eq!(factory.identity_queries(), 1);
         assert_eq!(factory.attempts(), 1);
-        assert_eq!(factory.identity_queries(), 0);
+        handle.shutdown();
+    }
+
+    fn spawn_with_stall(factory: &FakeSinkFactory, stall: Duration) -> SupervisorHandle {
+        spawn_supervisor(
+            factory.clone(),
+            FakeWatcher::default(),
+            Arc::new(MixerShared::new()),
+            Timings { stall, ..fast() },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stalled_callback_rebuilds_on_the_thread() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        // Nothing renders, so the heartbeat never advances.
+        let handle = spawn_with_stall(&factory, ms(300));
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        assert!(wait_until(WAIT, || factory.builds().len() >= 2));
+        assert_eq!(factory.overlapping_builds(), 0);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn live_callback_does_not_rebuild_on_the_thread() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        // Longer than DRAIN_INTERVAL, so the thread samples the heartbeat
+        // (taking its baseline) before the stall deadline.
+        let handle = spawn_with_stall(&factory, ms(300));
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        let mixer = factory.mixer().unwrap();
+        // Stand in for a running stream callback for well over the stall time.
+        let mut out = vec![0.0; 64];
+        let start = Instant::now();
+        while start.elapsed() < ms(1200) {
+            mixer.lock().unwrap().render(&mut out);
+            thread::sleep(ms(10));
+        }
+        assert_eq!(factory.builds().len(), 1);
         handle.shutdown();
     }
 
@@ -789,7 +818,7 @@ mod tests {
         let factory = FakeSinkFactory::new(48_000, 1, "spk");
         let watcher = FakeWatcher::default();
         let shared = Arc::new(MixerShared::new());
-        let handle = spawn_with_timings(
+        let handle = spawn_supervisor(
             factory.clone(),
             watcher.clone(),
             Arc::clone(&shared),
@@ -858,7 +887,7 @@ mod tests {
         let factory = FakeSinkFactory::new(48_000, 1, "spk");
         let watcher = FakeWatcher::default();
         let shared = Arc::new(MixerShared::new());
-        let handle = spawn_with_timings(
+        let handle = spawn_supervisor(
             factory.clone(),
             watcher.clone(),
             Arc::clone(&shared),
@@ -886,7 +915,7 @@ mod tests {
     fn shutdown_joins_promptly_and_cleans_up() {
         let factory = FakeSinkFactory::new(48_000, 2, "spk");
         let watcher = FakeWatcher::default();
-        let handle = spawn_with_timings(
+        let handle = spawn_supervisor(
             factory.clone(),
             watcher.clone(),
             Arc::new(MixerShared::new()),

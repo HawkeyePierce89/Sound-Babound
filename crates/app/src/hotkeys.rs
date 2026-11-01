@@ -224,6 +224,13 @@ mod tests {
     }
 
     #[test]
+    fn the_key_must_come_last() {
+        assert!(parse_hotkey("Shift+Ctrl+1").is_ok());
+        assert!(parse_hotkey("1+Ctrl").is_err());
+        assert!(parse_hotkey("Ctrl+C+Shift").is_err());
+    }
+
+    #[test]
     fn aliases_are_normalized() {
         assert_eq!(
             parse_hotkey("Win+Return").unwrap(),

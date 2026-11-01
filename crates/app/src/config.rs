@@ -134,7 +134,10 @@ impl SoundSource {
         if raw.eq_ignore_ascii_case(BUILTIN_DEMO) {
             return Ok(SoundSource::BuiltinDemo);
         }
-        if raw.starts_with(BUILTIN_PREFIX) {
+        if raw
+            .get(..BUILTIN_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(BUILTIN_PREFIX))
+        {
             return Err(format!(
                 "unknown built-in sound {raw:?} (only {BUILTIN_DEMO:?} exists)"
             ));
@@ -278,6 +281,22 @@ mod tests {
         assert!(SoundSource::resolve("  ", dir).is_err());
         let err = SoundSource::resolve("builtin:airhorn", dir).unwrap_err();
         assert!(err.contains("builtin:airhorn"));
+    }
+
+    #[test]
+    fn builtin_prefix_is_case_insensitive() {
+        let dir = Path::new("/cfg");
+        assert_eq!(
+            SoundSource::resolve("BUILTIN:DEMO", dir),
+            Ok(SoundSource::BuiltinDemo)
+        );
+        let err = SoundSource::resolve("BUILTIN:airhorn", dir).unwrap_err();
+        assert!(err.contains("BUILTIN:airhorn"), "{err}");
+        // A non-ASCII path shorter or longer than the prefix is still a path.
+        assert!(matches!(
+            SoundSource::resolve("é.wav", dir),
+            Ok(SoundSource::File(_))
+        ));
     }
 
     #[test]

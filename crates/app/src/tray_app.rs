@@ -129,22 +129,41 @@ fn build_menu(map: &ActionMap) -> Result<Menu> {
     Ok(menu)
 }
 
+/// What [`Hotkeys`] needs from the OS hotkey manager. A recording fake
+/// stands in for it in tests.
+trait HotkeyBackend {
+    fn register(&self, hotkey: HotKey) -> global_hotkey::Result<()>;
+    fn unregister(&self, hotkey: HotKey) -> global_hotkey::Result<()>;
+}
+
+impl HotkeyBackend for GlobalHotKeyManager {
+    fn register(&self, hotkey: HotKey) -> global_hotkey::Result<()> {
+        GlobalHotKeyManager::register(self, hotkey)
+    }
+
+    fn unregister(&self, hotkey: HotKey) -> global_hotkey::Result<()> {
+        GlobalHotKeyManager::unregister(self, hotkey)
+    }
+}
+
 /// The registered global hotkeys.
-struct Hotkeys {
+struct Hotkeys<M = GlobalHotKeyManager> {
     /// `None` when global hotkeys are unavailable (Wayland, or the manager
     /// failed to start).
-    manager: Option<GlobalHotKeyManager>,
+    manager: Option<M>,
     registered: Vec<HotKey>,
 }
 
-impl Hotkeys {
-    fn disabled() -> Hotkeys {
+impl<M> Hotkeys<M> {
+    fn disabled() -> Hotkeys<M> {
         Hotkeys {
             manager: None,
             registered: Vec::new(),
         }
     }
+}
 
+impl Hotkeys {
     /// Starts the hotkey manager if the platform supports global hotkeys.
     fn start() -> Hotkeys {
         if !platform::global_hotkeys_supported() {
@@ -165,7 +184,9 @@ impl Hotkeys {
             }
         }
     }
+}
 
+impl<M: HotkeyBackend> Hotkeys<M> {
     /// Registers each hotkey; a failure is logged and that hotkey skipped.
     fn register(&mut self, hotkeys: &[HotKey]) {
         let Some(manager) = &self.manager else {
@@ -191,6 +212,13 @@ impl Hotkeys {
                 tracing::debug!(%hotkey, "cannot unregister hotkey: {err}");
             }
         }
+    }
+
+    /// Swaps the registered set for `hotkeys`. Everything old is unregistered
+    /// first, so a hotkey kept across a reload registers cleanly.
+    fn replace(&mut self, hotkeys: &[HotKey]) {
+        self.unregister_all();
+        self.register(hotkeys);
     }
 }
 
@@ -264,8 +292,7 @@ impl TrayApp {
         let tray = &self.tray;
         let result = actions::reload(engine, &path, |board| {
             let menu = build_menu(board.map())?;
-            hotkeys.unregister_all();
-            hotkeys.register(board.map().hotkeys());
+            hotkeys.replace(board.map().hotkeys());
             if let Some(tray) = tray {
                 tray.set_menu(Some(Box::new(menu)));
             }
@@ -308,5 +335,102 @@ fn open_config_folder() {
             }
         }
         Err(err) => tracing::warn!("{err:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+
+    use global_hotkey::hotkey::{Code, Modifiers};
+
+    use super::*;
+
+    /// Tracks what the OS would have registered, and rejects like it does.
+    #[derive(Default)]
+    struct FakeBackend {
+        live: RefCell<HashSet<HotKey>>,
+        /// Hotkeys the "OS" refuses (taken by another app).
+        taken: HashSet<HotKey>,
+    }
+
+    impl HotkeyBackend for FakeBackend {
+        fn register(&self, hotkey: HotKey) -> global_hotkey::Result<()> {
+            if self.taken.contains(&hotkey) {
+                return Err(global_hotkey::Error::FailedToRegister(hotkey.to_string()));
+            }
+            if !self.live.borrow_mut().insert(hotkey) {
+                return Err(global_hotkey::Error::AlreadyRegistered(hotkey));
+            }
+            Ok(())
+        }
+
+        fn unregister(&self, hotkey: HotKey) -> global_hotkey::Result<()> {
+            if self.live.borrow_mut().remove(&hotkey) {
+                Ok(())
+            } else {
+                Err(global_hotkey::Error::FailedToUnRegister(hotkey))
+            }
+        }
+    }
+
+    fn key(code: Code) -> HotKey {
+        HotKey::new(Some(Modifiers::SHIFT), code)
+    }
+
+    fn with_backend(backend: FakeBackend) -> Hotkeys<FakeBackend> {
+        Hotkeys {
+            manager: Some(backend),
+            registered: Vec::new(),
+        }
+    }
+
+    fn live(hotkeys: &Hotkeys<FakeBackend>) -> HashSet<HotKey> {
+        hotkeys.manager.as_ref().unwrap().live.borrow().clone()
+    }
+
+    #[test]
+    fn replace_keeps_a_hotkey_shared_by_old_and_new_config() {
+        let (a, b, c) = (key(Code::Digit1), key(Code::Digit2), key(Code::Digit3));
+        let mut hotkeys = with_backend(FakeBackend::default());
+        hotkeys.register(&[a, b]);
+        hotkeys.replace(&[b, c]);
+        assert_eq!(hotkeys.registered, vec![b, c]);
+        assert_eq!(live(&hotkeys), HashSet::from([b, c]));
+    }
+
+    #[test]
+    fn failed_registration_is_skipped_and_not_counted() {
+        let (a, c) = (key(Code::Digit1), key(Code::Digit3));
+        let mut hotkeys = with_backend(FakeBackend {
+            taken: HashSet::from([c]),
+            ..FakeBackend::default()
+        });
+        hotkeys.register(&[a, c]);
+        assert_eq!(hotkeys.registered, vec![a]);
+        assert_eq!(live(&hotkeys), HashSet::from([a]));
+        // Quitting later unregisters only what was registered, cleanly.
+        hotkeys.unregister_all();
+        assert!(hotkeys.registered.is_empty());
+        assert!(live(&hotkeys).is_empty());
+    }
+
+    #[test]
+    fn unregister_all_leaves_nothing_registered() {
+        let mut hotkeys = with_backend(FakeBackend::default());
+        hotkeys.register(&[key(Code::Digit1), key(Code::Digit2)]);
+        hotkeys.unregister_all();
+        assert!(hotkeys.registered.is_empty());
+        assert!(live(&hotkeys).is_empty());
+    }
+
+    #[test]
+    fn disabled_hotkeys_register_nothing() {
+        let mut hotkeys = Hotkeys::<FakeBackend>::disabled();
+        hotkeys.register(&[key(Code::Digit1)]);
+        assert!(hotkeys.registered.is_empty());
+        hotkeys.replace(&[key(Code::Digit2)]);
+        assert!(hotkeys.registered.is_empty());
     }
 }

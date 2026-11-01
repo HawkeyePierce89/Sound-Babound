@@ -121,11 +121,6 @@ mod tests {
     }
 
     #[test]
-    fn drawing_is_deterministic() {
-        assert_eq!(rgba(BLACK), rgba(BLACK));
-    }
-
-    #[test]
     fn color_only_changes_rgb() {
         let black = rgba(BLACK);
         let colored = rgba([10, 20, 30]);

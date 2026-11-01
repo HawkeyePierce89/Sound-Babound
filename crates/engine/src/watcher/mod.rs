@@ -83,6 +83,8 @@ pub enum RebuildPolicy {
 #[derive(Debug, Clone)]
 pub struct EventSender(Sender<SupervisorMsg>);
 
+// The no-op watcher never sends, so outside macOS and Windows only tests do.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 impl EventSender {
     pub(crate) fn new(sender: Sender<SupervisorMsg>) -> EventSender {
         EventSender(sender)
@@ -105,20 +107,19 @@ pub trait DeviceWatcher: Send + 'static {
     fn start(&mut self, events: EventSender) -> Result<Box<dyn WatcherGuard>, WatcherError>;
 }
 
-impl<T: DeviceWatcher + ?Sized> DeviceWatcher for Box<T> {
-    fn start(&mut self, events: EventSender) -> Result<Box<dyn WatcherGuard>, WatcherError> {
-        (**self).start(events)
-    }
-}
-
-/// A watcher that never reports anything.
+/// A watcher that never reports anything. The platform watcher everywhere
+/// except macOS and Windows.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopWatcher;
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 struct NoopGuard;
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl WatcherGuard for NoopGuard {}
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl DeviceWatcher for NoopWatcher {
     fn start(&mut self, _events: EventSender) -> Result<Box<dyn WatcherGuard>, WatcherError> {
         Ok(Box::new(NoopGuard))
@@ -126,8 +127,8 @@ impl DeviceWatcher for NoopWatcher {
 }
 
 /// The watcher for the current platform.
-pub fn platform_watcher() -> Box<dyn DeviceWatcher> {
-    Box::new(PlatformWatcher)
+pub fn platform_watcher() -> PlatformWatcher {
+    PlatformWatcher
 }
 
 #[cfg(test)]

@@ -39,6 +39,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// machine with no audio output would wait forever.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long past the sound's own duration `play` waits for it to finish.
+/// If the output device disappears mid-playback the voice never finishes,
+/// so without a limit `play` would wait forever.
+const FINISH_MARGIN: Duration = Duration::from_secs(10);
+
 /// Plays `file` (or the embedded demo) through the default output device and
 /// returns once it has finished.
 ///
@@ -64,6 +69,7 @@ pub fn run_play(file: Option<PathBuf>) -> Result<()> {
         || (engine.commands_applied(), engine.active_voices()),
         POLL_INTERVAL,
         START_TIMEOUT,
+        sound_duration(&sound) + FINISH_MARGIN,
     );
     engine.shutdown();
     outcome
@@ -82,22 +88,41 @@ pub fn load_play_sound(file: Option<&Path>) -> Result<Sound> {
     })
 }
 
+/// How long `sound` plays at its own sample rate.
+fn sound_duration(sound: &Sound) -> Duration {
+    match sound.sample_rate() {
+        0 => Duration::ZERO,
+        rate => Duration::from_secs_f64(sound.frames() as f64 / f64::from(rate)),
+    }
+}
+
 /// Polls `probe` (returning `(commands_applied, active_voices)`) every
 /// `poll` until the play command has been applied and no voice is left.
 ///
 /// Fails if the command has not been applied within `start_timeout`, which
-/// means no output stream came up.
+/// means no output stream came up, or if a voice is still playing
+/// `finish_timeout` after the command was applied, which means the output
+/// stopped mid-playback.
 fn wait_for_playback(
     probe: impl Fn() -> (u64, usize),
     poll: Duration,
     start_timeout: Duration,
+    finish_timeout: Duration,
 ) -> Result<()> {
     let started = Instant::now();
+    let mut applied_at = None;
     loop {
         let (applied, voices) = probe();
         if applied >= 1 {
             if voices == 0 {
                 return Ok(());
+            }
+            let since = *applied_at.get_or_insert_with(Instant::now);
+            if since.elapsed() >= finish_timeout {
+                bail!(
+                    "playback did not finish within {}s: the output device stopped",
+                    finish_timeout.as_secs()
+                );
             }
         } else if started.elapsed() >= start_timeout {
             bail!(
@@ -115,6 +140,9 @@ mod tests {
     use std::cell::Cell;
 
     use crate::test_support::TempDir;
+
+    /// A finish timeout no test reaches.
+    const LONG: Duration = Duration::from_secs(60);
 
     #[test]
     fn no_args_means_tray_mode() {
@@ -200,7 +228,7 @@ mod tests {
             calls.set(i + 1);
             states[i.min(states.len() - 1)]
         };
-        wait_for_playback(probe, Duration::ZERO, Duration::from_secs(60)).unwrap();
+        wait_for_playback(probe, Duration::ZERO, Duration::from_secs(60), LONG).unwrap();
         assert_eq!(calls.get(), states.len());
     }
 
@@ -212,7 +240,7 @@ mod tests {
             calls.set(calls.get() + 1);
             if calls.get() < 5 { (0, 0) } else { (1, 0) }
         };
-        wait_for_playback(probe, Duration::ZERO, Duration::from_secs(60)).unwrap();
+        wait_for_playback(probe, Duration::ZERO, Duration::from_secs(60), LONG).unwrap();
         assert_eq!(calls.get(), 5);
     }
 
@@ -222,6 +250,7 @@ mod tests {
             || (0, 0),
             Duration::from_millis(1),
             Duration::from_millis(20),
+            LONG,
         )
         .unwrap_err();
         assert!(err.to_string().contains("output device"), "{err}");
@@ -235,7 +264,53 @@ mod tests {
             calls.set(calls.get() + 1);
             if calls.get() < 30 { (1, 1) } else { (1, 0) }
         };
-        wait_for_playback(probe, Duration::from_millis(1), Duration::ZERO).unwrap();
+        wait_for_playback(probe, Duration::from_millis(1), Duration::ZERO, LONG).unwrap();
         assert_eq!(calls.get(), 30);
+    }
+
+    #[test]
+    fn wait_times_out_when_a_voice_never_finishes() {
+        // The output went away mid-playback: the voice count never drops.
+        let err = wait_for_playback(
+            || (1, 1),
+            Duration::from_millis(1),
+            Duration::ZERO,
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("did not finish"), "{err}");
+    }
+
+    #[test]
+    fn finish_timeout_counts_from_when_the_command_is_applied() {
+        // Waiting for the stream to come up does not eat into the finish
+        // timeout: the voice finishes 10 ms after the command is applied,
+        // well inside a 200 ms finish timeout, after a 300 ms start wait.
+        let started = Instant::now();
+        let probe = || {
+            let t = started.elapsed();
+            if t < Duration::from_millis(300) {
+                (0, 0)
+            } else if t < Duration::from_millis(310) {
+                (1, 1)
+            } else {
+                (1, 0)
+            }
+        };
+        wait_for_playback(
+            probe,
+            Duration::from_millis(1),
+            Duration::from_secs(60),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sound_duration_is_frames_over_rate() {
+        let sound = load_play_sound(None).unwrap();
+        let expected = sound.frames() as f64 / f64::from(sound.sample_rate());
+        assert!((sound_duration(&sound).as_secs_f64() - expected).abs() < 1e-9);
+        assert!(sound_duration(&sound) > Duration::ZERO);
     }
 }

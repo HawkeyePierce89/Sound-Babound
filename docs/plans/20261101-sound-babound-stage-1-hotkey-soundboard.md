@@ -187,7 +187,7 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
   - The thread loop is a `recv_timeout` on one channel carrying watcher events, stream errors and `Shutdown`.
   - The thread builds immediately on start.
   - On `CheckDefault` it calls `factory.current_default_identity()` and passes the result to `resolve_check`; on `Drop` it logs the event at debug and does nothing else.
-  - Rebuild sequence: drop the sink, lock the mixer and call `configure(info)`, then build.
+  - Rebuild sequence: drop the sink, lock the mixer and call `configure(info)`, then build. (As built: the supervisor drops the sink and calls `factory.build`. The factory locks the mixer and calls `configure` before it starts the stream, because only the factory knows the device format. Same invariant: the mixer is configured only while no stream exists.)
   - It calls `drain_garbage()` each loop iteration (at most every 100 ms).
   - It logs rebuild outcomes at info: device name, rate, channels, format.
   - It logs input-device events at debug and ignores them.
@@ -219,7 +219,7 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
   - Use `default_output_config()` for format, rate and channels.
   - Build a typed stream per `SampleFormat`. Unknown formats give `BuildError::UnsupportedFormat`.
   - Data callback: `try_lock` the mixer; render in chunks of the preallocated scratch size, then convert; on lock failure, fill with silence.
-  - Error callback: send `SupervisorMsg::StreamError` (no logging inside it beyond the send).
+  - Error callback: send `SupervisorMsg::StreamError` (no logging inside it beyond the send). (As built: `Xrun` and `RealtimeDenied` are not forwarded, see `cpal_sink::needs_rebuild`. The stream keeps running after them, so a rebuild would only add a gap.)
   - Call `play()` and return `StreamInfo` with the device identity and name.
 - [x] `CpalSinkFactory::current_default_identity`: re-query `host.default_output_device()` and derive its `DeviceIdentity`; nothing is stored between calls.
 - [x] Write tests:

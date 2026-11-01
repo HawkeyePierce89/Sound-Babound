@@ -371,10 +371,65 @@ mod tests {
         let garbage: Vec<u8> = (0..4096u32)
             .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
             .collect();
-        assert!(Sound::load_bytes(garbage.clone(), "garbage.wav").is_err());
-        assert!(Sound::load_bytes(garbage, "garbage").is_err());
-        assert!(Sound::load_bytes(Vec::new(), "empty-file.wav").is_err());
-        assert!(Sound::load_bytes(b"RIFF".to_vec(), "truncated.wav").is_err());
+        // None of these is recognized as an audio container.
+        for (bytes, label) in [
+            (garbage.clone(), "garbage.wav"),
+            (garbage, "garbage"),
+            (Vec::new(), "empty-file.wav"),
+            (b"RIFF".to_vec(), "truncated.wav"),
+        ] {
+            let err = Sound::load_bytes(bytes, label).unwrap_err();
+            assert!(
+                matches!(&err, LoadError::Unsupported { label: l, .. } if l == label),
+                "{label}: {err:?}"
+            );
+        }
+    }
+
+    /// Decodes a committed fixture: a 0.25 s 440 Hz tone at 22.05 kHz, made
+    /// with `ffmpeg -f lavfi -i sine=frequency=440:sample_rate=22050:duration=0.25`
+    /// (`-ac 1 -c:a flac`, `-ac 2 -c:a vorbis -strict -2`,
+    /// `-ac 1 -c:a libmp3lame -b:a 32k`).
+    fn fixture(bytes: &'static [u8], label: &str, channels: u16) {
+        const FRAMES: usize = 22_050 / 4;
+        let sound = Sound::load_bytes(bytes.to_vec(), label).unwrap();
+        assert_eq!(sound.sample_rate(), 22_050, "{label}");
+        assert_eq!(sound.channels(), channels, "{label}");
+        // Lossy codecs add encoder delay and padding (a few MP3 frames).
+        let frames = sound.frames();
+        assert!(
+            (FRAMES * 9 / 10..=FRAMES + 3 * 1152).contains(&frames),
+            "{label}: {frames} frames"
+        );
+        // The tone peaks at 1/8 full scale; lossy coding shaves a little off.
+        assert!(sound.samples().iter().any(|&x| x.abs() > 0.05), "{label}");
+    }
+
+    #[test]
+    fn flac_fixture_decodes() {
+        fixture(
+            include_bytes!("../testdata/tone-22050-mono.flac"),
+            "tone.flac",
+            1,
+        );
+    }
+
+    #[test]
+    fn ogg_vorbis_fixture_decodes() {
+        fixture(
+            include_bytes!("../testdata/tone-22050-stereo.ogg"),
+            "tone.ogg",
+            2,
+        );
+    }
+
+    #[test]
+    fn mp3_fixture_decodes() {
+        fixture(
+            include_bytes!("../testdata/tone-22050-mono.mp3"),
+            "tone.mp3",
+            1,
+        );
     }
 
     #[test]

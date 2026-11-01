@@ -12,7 +12,7 @@ use crate::error::StartError;
 use crate::mixer::{Command, MixerShared};
 use crate::sink::SinkFactory;
 use crate::sound::Sound;
-use crate::supervisor::{SupervisorHandle, spawn_supervisor};
+use crate::supervisor::{SupervisorHandle, Timings, spawn_supervisor};
 use crate::watcher::{DeviceWatcher, platform_watcher};
 
 /// A running audio engine.
@@ -21,18 +21,19 @@ use crate::watcher::{DeviceWatcher, platform_watcher};
 /// engine succeeds even when there is no output device yet: the supervisor
 /// keeps retrying and playback starts once a device appears.
 ///
-/// Dropping the engine shuts it down, like [`Engine::shutdown`].
+/// Dropping the engine shuts it down, like [`Engine::shutdown`] (through the
+/// supervisor handle's `Drop`).
 #[derive(Debug)]
 pub struct Engine {
     shared: Arc<MixerShared>,
-    supervisor: Option<SupervisorHandle>,
+    supervisor: SupervisorHandle,
 }
 
 impl Engine {
     /// Start the engine on the system default output device, following
     /// device changes reported by the platform watcher.
     pub fn start() -> Result<Engine, StartError> {
-        Engine::start_with(CpalSinkFactory::new(), platform_watcher())
+        Engine::start_with(CpalSinkFactory, platform_watcher())
     }
 
     /// Start the engine with a custom sink factory and watcher.
@@ -43,11 +44,9 @@ impl Engine {
     {
         let shared = Arc::new(MixerShared::new());
         let supervisor =
-            spawn_supervisor(factory, watcher, Arc::clone(&shared)).map_err(StartError::Spawn)?;
-        Ok(Engine {
-            shared,
-            supervisor: Some(supervisor),
-        })
+            spawn_supervisor(factory, watcher, Arc::clone(&shared), Timings::default())
+                .map_err(StartError::Spawn)?;
+        Ok(Engine { shared, supervisor })
     }
 
     /// Queue a new voice playing `sound` at `gain`. Plays overlap.
@@ -83,26 +82,14 @@ impl Engine {
     }
 
     /// Stop the stream, unregister the watcher and join the supervisor thread.
-    pub fn shutdown(mut self) {
-        self.stop();
+    pub fn shutdown(self) {
+        self.supervisor.shutdown();
     }
 
     fn push(&self, command: Command) -> bool {
         // A rejected command (and the sound it holds) is dropped here, on the
         // caller's thread, never on the realtime thread.
         self.shared.push(command).is_ok()
-    }
-
-    fn stop(&mut self) {
-        if let Some(supervisor) = self.supervisor.take() {
-            supervisor.shutdown();
-        }
-    }
-}
-
-impl Drop for Engine {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 
@@ -202,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_play_and_stop_do_not_panic() {
+    fn concurrent_play_and_stop_release_every_sound() {
         let (engine, _factory, _watcher, mixer) = started();
         let engine = Arc::new(engine);
         let sound = tone();
@@ -237,6 +224,18 @@ mod tests {
         }
         renderer.join().unwrap();
         assert!(engine.commands_applied() > 0);
+
+        // A final stop, applied after every play, leaves no voice holding the
+        // sound; the supervisor frees every released handle off this thread.
+        assert!(wait_until(TIMEOUT, || {
+            render(&mixer);
+            engine.stop_all()
+        }));
+        assert!(wait_until(TIMEOUT, || {
+            render(&mixer);
+            sound.handle_count() == 1
+        }));
+        assert_eq!(engine.active_voices(), 0);
         Arc::into_inner(engine).unwrap().shutdown();
     }
 
