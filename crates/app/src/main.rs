@@ -34,7 +34,9 @@ fn main() -> anyhow::Result<ExitCode> {
 
     match cli.command {
         None => tray_app::run().map(|()| ExitCode::SUCCESS),
-        Some(Command::Play { file }) => cli::run_play(file).map(|()| ExitCode::SUCCESS),
+        Some(Command::Play { file, output_only }) => {
+            cli::run_play(file, output_only).map(|()| ExitCode::SUCCESS)
+        }
         Some(Command::MicCheck) => cli::run_mic_check(),
         Some(Command::Settings) => Ok(settings::run()),
     }

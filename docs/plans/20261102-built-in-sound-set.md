@@ -109,10 +109,10 @@ Replace the single embedded demo chime with a registry of built-in sounds, and e
 **Files:**
 - Modify: `crates/app/src/cli.rs`, `crates/app/src/main.rs`
 
-- [ ] Change `Command::Play` to `{ file: Option<PathBuf>, output_only: bool }`, where `output_only` is `#[arg(long)]`, documented as "play on the default output only, never into the virtual mic, whatever `[mic] enabled` says". The `file` help mentions `builtin:<name>` (for example `builtin:airhorn`; the names are in `SOURCES.md`, and an unknown one lists them). `main.rs` passes the flag through to `run_play(file, output_only)`.
-- [ ] `load_play_sound` resolves a UTF-8 argument with `SoundSource::resolve(text, Path::new(""))`, so relative paths stay relative to the working directory. A non-UTF-8 path stays `SoundSource::File`, `None` is the demo entry, and the error context names the argument.
-- [ ] Add a pure `play_mic_config(mic: MicConfig, output_only: bool) -> MicConfig` that turns `enabled` off when `output_only` is set. `run_play` applies it before logging and `play_to_end`, so neither the mic sink nor the mic wait starts.
-- [ ] Tests:
+- [x] Change `Command::Play` to `{ file: Option<PathBuf>, output_only: bool }`, where `output_only` is `#[arg(long)]`, documented as "play on the default output only, never into the virtual mic, whatever `[mic] enabled` says". The `file` help mentions `builtin:<name>` (for example `builtin:airhorn`; the names are in `SOURCES.md`, and an unknown one lists them). `main.rs` passes the flag through to `run_play(file, output_only)`.
+- [x] `load_play_sound` resolves a UTF-8 argument with `SoundSource::resolve(text, Path::new(""))`, so relative paths stay relative to the working directory. A non-UTF-8 path stays `SoundSource::File`, `None` is the demo entry, and the error context names the argument.
+- [x] Add a pure `play_mic_config(mic: MicConfig, output_only: bool) -> MicConfig` that turns `enabled` off when `output_only` is set. `run_play` applies it before logging and `play_to_end`, so neither the mic sink nor the mic wait starts.
+- [x] Tests:
   - parsing: `play --output-only`, `play --output-only builtin:airhorn`, `play -- -odd.wav`, and the defaults without the flag;
   - `load_play_sound(Some("builtin:airhorn"))` decodes with label `builtin:airhorn`;
   - an unknown built-in fails, naming the available sounds;
@@ -120,7 +120,7 @@ Replace the single embedded demo chime with a registry of built-in sounds, and e
   - without the flag it keeps the mic.
 
   The existing demo tests are adapted.
-- [ ] Run the test suite; it must pass before Task 5.
+- [x] Run the test suite; it must pass before Task 5.
 
 ### Task 5: "Add built-in…" in the settings window
 
