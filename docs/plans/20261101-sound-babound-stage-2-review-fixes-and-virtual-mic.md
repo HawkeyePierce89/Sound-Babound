@@ -375,28 +375,29 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 
 - Modify: `crates/app/src/tray_app.rs`, `crates/app/src/actions.rs`
 
-- [ ] Menu: a disabled status item and a "Mic to call: on/off" item (`MENU_TOGGLE_MIC`, `Action::ToggleMic`).
-- [ ] A pure `mic_status_label(&MicStatus, hint)`:
+- [x] Menu: a disabled status item and a "Mic to call: on/off" item (`MENU_TOGGLE_MIC`, `Action::ToggleMic`).
+- [x] A pure `mic_status_label(&MicStatus, hint)`:
   - "Virtual mic: off";
   - "Virtual mic: starting";
   - "Virtual mic: <device> (active)", with the capture state appended when the microphone is unavailable or denied;
   - "Virtual mic: not found, install BlackHole" or "install VB-CABLE", and on Linux "could not create it, see log".
-- [ ] While the mic is enabled, the event loop wakes every 1 s (`ControlFlow::WaitUntil`) and updates the status text only when it changed. With the mic off it stays on `Wait`.
-- [ ] Toggle:
+- [x] While the mic is enabled, the event loop wakes every 1 s (`ControlFlow::WaitUntil`) and updates the status text only when it changed. With the mic off it stays on `Wait`.
+- [x] Toggle:
   - flip the enabled flag;
   - persist it with `set_mic_enabled` (a persist failure is logged, the runtime change still applies);
   - on Linux, create or drop the `VirtualMic` guard;
   - check microphone access;
   - call `engine.set_mic`;
   - update both labels.
-- [ ] Startup: if the mic is enabled, create the Linux device before `apply_config`.
-- [ ] Reload applies `[mic]` through `apply_config`, so the monitor is not interrupted (Task 9 diff logic).
-- [ ] Quit drops the engine first, then the `VirtualMic` guard.
-- [ ] Tests:
+- [x] Startup: if the mic is enabled, create the Linux device before `apply_config`.
+- [x] Reload applies `[mic]` through `apply_config`, so the monitor is not interrupted (Task 9 diff logic).
+- [x] Quit drops the engine first, then the `VirtualMic` guard.
+- [x] Tests:
   - every label variant;
   - the toggle action with the recording `AudioControl` and a TempDir config (persisted and applied, and applied even when persisting fails);
   - reload with changed `[mic]` sends new settings while hotkeys and sounds are unchanged.
-- [ ] Run the verification gates. All must pass before Task 14.
+- [x] Run the verification gates. All must pass before Task 14.
+  (The Linux device follows the mic path through `actions::WithVirtualMic`, an `AudioControl` wrapper: `set_mic(Some)` creates it first, `set_mic(None)` drops it after the engine stops, so startup, reload and the toggle all keep it in step. A device that cannot be created is logged and the mic sink reports not found, shown as the Linux "could not create it, see log". The not-found text comes from a new per-OS `platform::virtual_mic_not_found()`; `MicStatus::Failed` shows "Virtual mic: error, see log", and `CaptureStatus::Disabled` shows as "microphone access denied". The long `virtual_mic_hint()` is logged when the status turns active.)
 
 ### Task 14: CLI `mic-check` and mic-aware `play`
 

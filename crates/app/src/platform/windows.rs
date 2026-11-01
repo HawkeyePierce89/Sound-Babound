@@ -27,9 +27,13 @@ pub fn virtual_input_exclusions(pattern: &str) -> Vec<String> {
 }
 
 /// What the user does to get the virtual microphone.
-#[allow(dead_code)] // For the tray mic status.
 pub fn virtual_mic_hint() -> &'static str {
     "install VB-CABLE, then choose \"CABLE Output\" as the microphone in the call app"
+}
+
+/// The tray status when no output matches the virtual device pattern.
+pub fn virtual_mic_not_found() -> &'static str {
+    "not found, install VB-CABLE"
 }
 
 #[cfg(test)]
@@ -44,5 +48,6 @@ mod tests {
             ["CABLE Input", "CABLE Output"]
         );
         assert!(virtual_mic_hint().contains("CABLE Output"));
+        assert!(virtual_mic_not_found().contains("install VB-CABLE"));
     }
 }

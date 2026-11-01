@@ -35,9 +35,13 @@ pub fn virtual_input_exclusions(pattern: &str) -> Vec<String> {
 }
 
 /// What the user does to get the virtual microphone.
-#[allow(dead_code)] // For the tray mic status.
 pub fn virtual_mic_hint() -> &'static str {
     "install BlackHole 2ch, then choose \"BlackHole 2ch\" as the microphone in the call app"
+}
+
+/// The tray status when no output matches the virtual device pattern.
+pub fn virtual_mic_not_found() -> &'static str {
+    "not found, install BlackHole"
 }
 
 /// The app's microphone permission. `AVAudioApplication` exists from
@@ -72,6 +76,7 @@ mod tests {
         assert_eq!(default_virtual_device(), "BlackHole");
         assert_eq!(virtual_input_exclusions("BlackHole"), ["BlackHole"]);
         assert!(virtual_mic_hint().contains("BlackHole"));
+        assert!(virtual_mic_not_found().contains("install BlackHole"));
     }
 
     #[test]

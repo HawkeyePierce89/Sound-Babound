@@ -33,9 +33,14 @@ pub fn virtual_input_exclusions(pattern: &str) -> Vec<String> {
 }
 
 /// What the user does to get the virtual microphone.
-#[allow(dead_code)] // For the tray mic status.
 pub fn virtual_mic_hint() -> &'static str {
     "choose \"Sound-Babound Mic\" as the microphone in the call app"
+}
+
+/// The tray status when no output matches the virtual device pattern: the
+/// app creates the device itself, so creating it failed (the log says why).
+pub fn virtual_mic_not_found() -> &'static str {
+    "could not create it, see log"
 }
 
 /// Runs `pactl` with `args` and returns its stdout. A missing `pactl` and a
@@ -85,7 +90,6 @@ impl VirtualMic {
 
 /// Creates the virtual microphone. Always `Some` on success: Linux is the
 /// one OS where the app makes the device itself.
-#[allow(dead_code)] // For the tray mic toggle.
 pub fn create_virtual_mic() -> anyhow::Result<Option<VirtualMic>> {
     VirtualMic::create().map(Some)
 }
@@ -102,5 +106,6 @@ mod tests {
             ["sound_babound_sink", "sound_babound_mic"]
         );
         assert!(virtual_mic_hint().contains("Sound-Babound Mic"));
+        assert!(virtual_mic_not_found().contains("see log"));
     }
 }

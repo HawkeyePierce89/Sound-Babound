@@ -11,18 +11,20 @@ mod macos;
 mod windows;
 
 #[cfg(target_os = "linux")]
-#[allow(unused_imports)] // `VirtualMic` and `create_virtual_mic` are for the tray toggle.
 pub use linux::{
     VirtualMic, attach_parent_console, create_virtual_mic, default_virtual_device,
-    global_hotkeys_supported, virtual_input_exclusions,
+    global_hotkeys_supported, virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
     attach_parent_console, default_virtual_device, microphone_access, prepare_event_loop,
-    virtual_input_exclusions, with_tray_icon,
+    virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found, with_tray_icon,
 };
 #[cfg(target_os = "windows")]
-pub use windows::{attach_parent_console, default_virtual_device, virtual_input_exclusions};
+pub use windows::{
+    attach_parent_console, default_virtual_device, virtual_input_exclusions, virtual_mic_hint,
+    virtual_mic_not_found,
+};
 
 /// Fallback for every other OS: nothing to attach.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -43,21 +45,24 @@ pub fn virtual_input_exclusions(pattern: &str) -> Vec<String> {
 
 /// Fallback for every other OS.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-#[allow(dead_code)] // For the tray mic status.
 pub fn virtual_mic_hint() -> &'static str {
     "set [mic] virtual_device to a virtual audio cable's playback device"
+}
+
+/// Fallback for every other OS: the tray status when nothing matches.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn virtual_mic_not_found() -> &'static str {
+    "not found, check [mic] virtual_device"
 }
 
 /// Everywhere but Linux the app creates no virtual device: the user installs
 /// a virtual cable. Uninhabited, so `create_virtual_mic` can only return
 /// `None`.
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)] // For the tray mic toggle.
 pub enum VirtualMic {}
 
 /// Everywhere but Linux there is no virtual device to create.
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)] // For the tray mic toggle.
 pub fn create_virtual_mic() -> anyhow::Result<Option<VirtualMic>> {
     Ok(None)
 }

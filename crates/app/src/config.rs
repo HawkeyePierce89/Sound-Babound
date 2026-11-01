@@ -261,7 +261,6 @@ impl Default for MicConfig {
 /// is replaced atomically (a temp file in the same folder, then a rename), so
 /// a crash leaves either the old or the new file. A file that is not valid
 /// TOML is left untouched and reported as an error.
-#[allow(dead_code)] // Called by the tray mic toggle.
 pub fn set_mic_enabled(path: &Path, enabled: bool) -> Result<()> {
     // Write through a symlink to the file it points at.
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());

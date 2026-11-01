@@ -7,9 +7,10 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use babound_engine::Engine;
+use babound_engine::{Engine, MicStatus};
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use tao::event::{Event, StartCause};
@@ -19,12 +20,19 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::actions::{
     self, Action, ActionMap, CaptureGate, MENU_OPEN_CONFIG, MENU_QUIT, MENU_RELOAD, MENU_STOP_ALL,
-    Soundboard,
+    MENU_TOGGLE_MIC, Soundboard, WithVirtualMic,
 };
 use crate::{paths, platform};
 
 /// Tooltip of the tray icon.
 const TOOLTIP: &str = "Sound-Babound";
+
+/// How often the mic status line is refreshed while the mic is enabled.
+const MIC_POLL: Duration = Duration::from_secs(1);
+
+/// The engine, with the virtual device the app creates itself on Linux.
+type TrayAudio =
+    WithVirtualMic<Engine, platform::VirtualMic, fn() -> Result<Option<platform::VirtualMic>>>;
 
 /// Events forwarded into the event loop.
 #[derive(Debug)]
@@ -37,10 +45,11 @@ enum UserEvent {
 ///
 /// Startup: create the default config if missing, load it (the built-in
 /// default config is used if the file is unreadable or malformed), start the
-/// engine, apply the config's master gain and mic settings, then run the event loop. The tray
-/// and the hotkeys are created once the loop has started. The config path is
-/// kept even after a fallback, so "Reload config" and "Open config folder"
-/// work and a fixed file can be reloaded.
+/// engine, apply the config's master gain and mic settings (creating the
+/// Linux virtual device first when the mic is enabled), then run the event
+/// loop. The tray and the hotkeys are created once the loop has started. The
+/// config path is kept even after a fallback, so "Reload config" and "Open
+/// config folder" work and a fixed file can be reloaded.
 pub fn run() -> Result<()> {
     let config_path = match paths::ensure_default_config() {
         Ok(path) => Some(path),
@@ -50,43 +59,72 @@ pub fn run() -> Result<()> {
         }
     };
     let board = actions::startup_board(config_path.as_deref())?;
-    let mut engine = Engine::start().context("failed to start the audio engine")?;
+    let engine = Engine::start().context("failed to start the audio engine")?;
+    let create_device: fn() -> Result<Option<platform::VirtualMic>> = platform::create_virtual_mic;
+    let mut audio: TrayAudio = WithVirtualMic::new(engine, create_device);
     let mut capture_gate = CaptureGate::default();
     let capture = capture_gate.capture(platform::microphone_access(), board.map().mic());
-    actions::apply_config(&mut engine, board.map(), capture);
+    actions::apply_config(&mut audio, board.map(), capture);
 
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     platform::prepare_event_loop(&mut event_loop);
     forward_events(event_loop.create_proxy());
 
     let mut app = TrayApp {
-        engine: Some(engine),
+        audio: Some(audio),
         board,
         config_path,
         hotkeys: Hotkeys::disabled(),
         tray: None,
+        mic_items: None,
+        mic_label: String::new(),
+        next_mic_poll: None,
         capture_gate,
     };
-    event_loop.run(move |event, _target, control_flow| match event {
-        Event::NewEvents(StartCause::Init) => {
-            *control_flow = ControlFlow::Wait;
-            if let Err(err) = app.init() {
-                tracing::error!("{err:#}");
-                app.quit(control_flow, 1);
+    app.mic_label = app.current_mic_label();
+    event_loop.run(move |event, _target, control_flow| {
+        match event {
+            Event::NewEvents(StartCause::Init) => {
+                *control_flow = ControlFlow::Wait;
+                if let Err(err) = app.init() {
+                    tracing::error!("{err:#}");
+                    app.quit(control_flow, 1);
+                }
             }
-        }
-        Event::UserEvent(UserEvent::Menu(id)) => {
-            if let Some(action) = app.board.map().for_menu_id(id.as_ref()) {
-                app.dispatch(action, control_flow);
+            Event::UserEvent(UserEvent::Menu(id)) => {
+                if let Some(action) = app.board.map().for_menu_id(id.as_ref()) {
+                    app.dispatch(action, control_flow);
+                }
             }
-        }
-        Event::UserEvent(UserEvent::HotKey(id)) => {
-            if let Some(action) = app.board.map().for_hotkey(id) {
-                app.dispatch(action, control_flow);
+            Event::UserEvent(UserEvent::HotKey(id)) => {
+                if let Some(action) = app.board.map().for_hotkey(id) {
+                    app.dispatch(action, control_flow);
+                }
             }
+            _ => {}
         }
-        _ => {}
+        app.schedule_mic_poll(control_flow);
     })
+}
+
+/// When the mic status is next due: `(refresh now, next deadline)`. Pure.
+///
+/// With the mic off there is no deadline, so the event loop just waits.
+/// With it on, a missing or passed deadline means refresh now and wake again
+/// in [`MIC_POLL`]; otherwise the deadline stands.
+fn mic_poll(enabled: bool, next: Option<Instant>, now: Instant) -> (bool, Option<Instant>) {
+    if !enabled {
+        return (false, None);
+    }
+    match next {
+        Some(deadline) if deadline > now => (false, Some(deadline)),
+        _ => (true, Some(now + MIC_POLL)),
+    }
+}
+
+/// The event loop's control flow for a mic poll deadline.
+fn control_flow_for(next: Option<Instant>) -> ControlFlow {
+    next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil)
 }
 
 /// Sends menu clicks and hotkey presses into the event loop.
@@ -108,8 +146,17 @@ fn forward_events(proxy: EventLoopProxy<UserEvent>) {
     }));
 }
 
-/// Builds the tray menu: the sounds, then the fixed items.
-fn build_menu(map: &ActionMap) -> Result<Menu> {
+/// The menu items whose text follows the mic state.
+struct MicItems {
+    /// The disabled status line.
+    status: MenuItem,
+    /// "Mic to call: on/off".
+    toggle: MenuItem,
+}
+
+/// Builds the tray menu: the sounds, the mic status and toggle, then the
+/// fixed items. `mic_label` is the status line's text.
+fn build_menu(map: &ActionMap, mic_label: &str) -> Result<(Menu, MicItems)> {
     let menu = Menu::new();
     if map.sound_items().is_empty() {
         menu.append(&MenuItem::new("No sounds configured", false, None))?;
@@ -123,6 +170,18 @@ fn build_menu(map: &ActionMap) -> Result<Menu> {
         ))?;
     }
     menu.append(&PredefinedMenuItem::separator())?;
+    let mic = MicItems {
+        status: MenuItem::new(mic_label, false, None),
+        toggle: MenuItem::with_id(
+            MENU_TOGGLE_MIC,
+            actions::mic_toggle_label(map.mic().enabled),
+            true,
+            None,
+        ),
+    };
+    menu.append(&mic.status)?;
+    menu.append(&mic.toggle)?;
+    menu.append(&PredefinedMenuItem::separator())?;
     for (id, label) in [
         (MENU_STOP_ALL, "Stop all"),
         (MENU_RELOAD, "Reload config"),
@@ -132,7 +191,7 @@ fn build_menu(map: &ActionMap) -> Result<Menu> {
     }
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&MenuItem::with_id(MENU_QUIT, "Quit", true, None))?;
-    Ok(menu)
+    Ok((menu, mic))
 }
 
 /// What [`Hotkeys`] needs from the OS hotkey manager. A recording fake
@@ -231,7 +290,7 @@ impl<M: HotkeyBackend> Hotkeys<M> {
 /// Everything the event loop owns.
 struct TrayApp {
     /// `None` once the app has quit.
-    engine: Option<Engine>,
+    audio: Option<TrayAudio>,
     board: Soundboard,
     /// `None` if the config file location is unknown; reload is then
     /// unavailable. Kept when startup fell back to the built-in config
@@ -240,6 +299,12 @@ struct TrayApp {
     hotkeys: Hotkeys,
     /// Kept alive for as long as the icon should be shown.
     tray: Option<TrayIcon>,
+    /// The current menu's mic items; `None` until the tray exists.
+    mic_items: Option<MicItems>,
+    /// The text the mic status line shows.
+    mic_label: String,
+    /// When the mic status line is refreshed next; `None` with the mic off.
+    next_mic_poll: Option<Instant>,
     /// Turns the microphone permission into the mic path's capture flag.
     capture_gate: CaptureGate,
 }
@@ -248,7 +313,8 @@ impl TrayApp {
     /// Creates the tray icon and registers the hotkeys. Runs once the event
     /// loop has started, as the tray requires on macOS.
     fn init(&mut self) -> Result<()> {
-        let menu = build_menu(self.board.map())?;
+        let (menu, mic_items) = build_menu(self.board.map(), &self.mic_label)?;
+        self.mic_items = Some(mic_items);
         let builder = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip(TOOLTIP);
@@ -270,17 +336,18 @@ impl TrayApp {
         tracing::debug!(?action, "action");
         match action {
             Action::Play(index) => {
-                if let Some(engine) = &self.engine {
-                    self.board.play(index, engine);
+                if let Some(audio) = &self.audio {
+                    self.board.play(index, audio);
                 }
             }
             Action::StopAll => {
-                if let Some(engine) = &self.engine
-                    && !engine.stop_all()
+                if let Some(audio) = &self.audio
+                    && !audio.control().stop_all()
                 {
                     tracing::warn!("engine command queue is full; stop all dropped");
                 }
             }
+            Action::ToggleMic => self.toggle_mic(),
             Action::Reload => self.reload(),
             Action::OpenConfigFolder => open_config_folder(),
             Action::Quit => self.quit(control_flow, 0),
@@ -294,18 +361,23 @@ impl TrayApp {
             tracing::warn!("the config file location is unknown; nothing to reload");
             return;
         };
-        let Some(engine) = &mut self.engine else {
+        let Some(audio) = &mut self.audio else {
             return;
         };
         let hotkeys = &mut self.hotkeys;
         let tray = &self.tray;
+        let mic_label = &self.mic_label;
+        let mut new_mic_items = None;
         let capture_gate = &mut self.capture_gate;
         let capture = |mic: &_| capture_gate.capture(platform::microphone_access(), mic);
-        let result = actions::reload(engine, &path, capture, |board| {
-            let menu = build_menu(board.map())?;
+        // `apply_config` inside `reload` diffs the mic settings: the monitor
+        // keeps playing, and the mic path restarts only if its device changed.
+        let result = actions::reload(audio, &path, capture, |board| {
+            let (menu, mic_items) = build_menu(board.map(), mic_label)?;
             hotkeys.replace(board.map().hotkeys());
             if let Some(tray) = tray {
                 tray.set_menu(Some(Box::new(menu)));
+                new_mic_items = Some(mic_items);
             }
             Ok(())
         });
@@ -320,17 +392,85 @@ impl TrayApp {
                 // The old sounds are released here; voices still playing
                 // them hold their own handles, freed via the garbage queue.
                 self.board = board;
+                if new_mic_items.is_some() {
+                    self.mic_items = new_mic_items;
+                }
+                self.refresh_mic_status();
             }
             Err(err) => tracing::error!("{err:#}; keeping the previous config"),
         }
     }
 
-    /// Unregisters the hotkeys, shuts the engine down, removes the icon and
-    /// leaves the event loop with `code`.
+    /// Flips the mic, saves it, applies it and updates both mic items.
+    fn toggle_mic(&mut self) {
+        let Some(audio) = &mut self.audio else {
+            return;
+        };
+        let capture_gate = &mut self.capture_gate;
+        let capture = |mic: &_| capture_gate.capture(platform::microphone_access(), mic);
+        let enabled =
+            actions::toggle_mic(audio, &mut self.board, self.config_path.as_deref(), capture);
+        if let Some(items) = &self.mic_items {
+            items.toggle.set_text(actions::mic_toggle_label(enabled));
+        }
+        self.refresh_mic_status();
+    }
+
+    /// The engine's current mic status.
+    fn mic_status(&self) -> MicStatus {
+        self.audio
+            .as_ref()
+            .map_or(MicStatus::Off, |audio| audio.control().mic_status())
+    }
+
+    /// The status line's text for the engine's current mic status.
+    fn current_mic_label(&self) -> String {
+        actions::mic_status_label(&self.mic_status(), platform::virtual_mic_not_found())
+    }
+
+    /// Updates the status line, only if its text changed. A change is
+    /// logged; one to an active mic sink also logs how to use it.
+    fn refresh_mic_status(&mut self) {
+        let status = self.mic_status();
+        let label = actions::mic_status_label(&status, platform::virtual_mic_not_found());
+        if label == self.mic_label {
+            return;
+        }
+        tracing::info!("{label}");
+        if matches!(status, MicStatus::Active { .. }) {
+            tracing::info!("{}", platform::virtual_mic_hint());
+        }
+        if let Some(items) = &self.mic_items {
+            items.status.set_text(&label);
+        }
+        self.mic_label = label;
+    }
+
+    /// Refreshes the mic status when due and sets the event loop to wake
+    /// for the next refresh while the mic is enabled. Leaves an exit alone.
+    fn schedule_mic_poll(&mut self, control_flow: &mut ControlFlow) {
+        if matches!(control_flow, ControlFlow::ExitWithCode(_)) || self.audio.is_none() {
+            return;
+        }
+        let (refresh, next) = mic_poll(
+            self.board.map().mic().enabled,
+            self.next_mic_poll,
+            Instant::now(),
+        );
+        if refresh {
+            self.refresh_mic_status();
+        }
+        self.next_mic_poll = next;
+        *control_flow = control_flow_for(next);
+    }
+
+    /// Unregisters the hotkeys, shuts the engine down and then drops the
+    /// virtual device, removes the icon and leaves the event loop with
+    /// `code`.
     fn quit(&mut self, control_flow: &mut ControlFlow, code: i32) {
         self.hotkeys.unregister_all();
-        if let Some(engine) = self.engine.take() {
-            engine.shutdown();
+        if let Some(audio) = self.audio.take() {
+            audio.shutdown(Engine::shutdown);
         }
         self.tray = None;
         *control_flow = ControlFlow::ExitWithCode(code);
@@ -434,6 +574,43 @@ mod tests {
         hotkeys.unregister_all();
         assert!(hotkeys.registered.is_empty());
         assert!(live(&hotkeys).is_empty());
+    }
+
+    #[test]
+    fn mic_poll_waits_with_the_mic_off() {
+        let now = Instant::now();
+        assert_eq!(mic_poll(false, None, now), (false, None));
+        // Turning the mic off drops a pending deadline.
+        assert_eq!(mic_poll(false, Some(now + MIC_POLL), now), (false, None));
+        assert_eq!(control_flow_for(None), ControlFlow::Wait);
+    }
+
+    #[test]
+    fn mic_poll_refreshes_every_second_with_the_mic_on() {
+        let now = Instant::now();
+        // Just turned on: refresh now, then wake in a second.
+        assert_eq!(mic_poll(true, None, now), (true, Some(now + MIC_POLL)));
+        // An event before the deadline keeps it and refreshes nothing.
+        let deadline = now + MIC_POLL;
+        let early = now + Duration::from_millis(300);
+        assert_eq!(
+            mic_poll(true, Some(deadline), early),
+            (false, Some(deadline))
+        );
+        // At or past the deadline: refresh and schedule the next one.
+        assert_eq!(
+            mic_poll(true, Some(deadline), deadline),
+            (true, Some(deadline + MIC_POLL))
+        );
+        let late = deadline + Duration::from_millis(50);
+        assert_eq!(
+            mic_poll(true, Some(deadline), late),
+            (true, Some(late + MIC_POLL))
+        );
+        assert_eq!(
+            control_flow_for(Some(deadline)),
+            ControlFlow::WaitUntil(deadline)
+        );
     }
 
     #[test]
