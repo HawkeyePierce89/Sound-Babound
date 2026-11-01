@@ -1,10 +1,14 @@
-//! The device supervisor.
+//! The stream supervisor.
 //!
-//! A dedicated thread owns the output sink. It listens for device events and
-//! stream errors on one channel, debounces them, decides whether they affect
-//! the active output and rebuilds the stream on the current default device
-//! when they do. Voices keep playing across a rebuild because the mixer, and
-//! with it every voice position, outlives the stream.
+//! Every stream the engine runs (see [`StreamRole`]) gets its own instance of
+//! one generic supervisor, [`spawn_supervisor`]; only the [`StreamFactory`],
+//! the [`Endpoint`] and the role's rebuild policy differ. Each instance runs
+//! on a dedicated thread that owns its stream and starts its own device
+//! watcher. It listens for device events and stream errors on one channel,
+//! debounces them, decides whether they affect its stream and rebuilds the
+//! stream on the device the role targets now when they do. Voices keep
+//! playing across a rebuild of an output because the mixer, and with it every
+//! voice position, outlives the stream.
 //!
 //! The decision logic is the pure [`SupervisorCore`], driven by explicit
 //! [`Instant`]s so it can be tested with a fake clock. [`spawn_supervisor`]
@@ -12,19 +16,28 @@
 //!
 //! # Rebuild policy
 //!
-//! A rebuild is an audible gap, so not every event triggers one. After the
-//! trailing-edge debounce window:
+//! A rebuild is an audible gap, so not every event triggers one. Each event
+//! is classified for the supervisor's role by `DeviceEvent::rebuild_policy`.
+//! After the trailing-edge debounce window:
 //!
 //! - a [`RebuildPolicy::Always`] event or a stream error rebuilds;
-//! - a window holding only [`RebuildPolicy::IfDefaultOutputChanged`] events
-//!   yields [`Action::CheckDefault`]: the live default output identity is
-//!   re-queried and the stream is rebuilt only if it differs from the identity
-//!   the stream was built on;
+//! - a window holding only [`RebuildPolicy::IfIdentityChanged`] events yields
+//!   [`Action::CheckIdentity`]: the identity of the device the role would pick
+//!   now is re-queried and the stream is rebuilt only if it differs from the
+//!   identity the stream was built on;
 //! - [`RebuildPolicy::Ignore`] events do nothing.
 //!
 //! While no stream is running (initial start, retry backoff) every
 //! non-ignored event rebuilds. A failed build is retried after a backoff, and
-//! a stream whose callback heartbeat stops advancing is rebuilt.
+//! a stream whose callback heartbeat stops advancing is rebuilt. Repeated
+//! build failures are logged through [`FailureLog`], so a missing device does
+//! not warn once a second.
+//!
+//! # Status
+//!
+//! Each supervisor publishes a [`StreamStatus`] for UI reads. It sits behind a
+//! mutex that only the supervisor thread and control threads touch; no
+//! stream callback ever does.
 //!
 //! # Stall watchdog
 //!
@@ -55,8 +68,8 @@ use std::time::{Duration, Instant};
 
 use tracing::{Level, debug, error, info, warn};
 
-use crate::mixer::{Mixer, MixerShared};
-use crate::sink::{ActiveSink, DeviceIdentity, SinkFactory};
+use crate::error::{BuildError, BuildErrorKind};
+use crate::sink::{ActiveStream, DeviceIdentity, Endpoint, StreamFactory, StreamInfo, StreamRole};
 use crate::watcher::{DeviceEvent, DeviceWatcher, EventSender, RebuildPolicy};
 
 /// Longest the supervisor thread sleeps between garbage drains.
@@ -81,7 +94,7 @@ pub enum SupervisorMsg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamErrorKind {
     /// The backend rerouted the stream because the device changed. This is
-    /// the expected result of switching outputs, not a fault.
+    /// the expected result of switching devices, not a fault.
     DeviceChanged,
     /// Any other error that needs a rebuild.
     Other,
@@ -93,6 +106,58 @@ pub(crate) fn stream_error_level(kind: StreamErrorKind) -> Level {
     match kind {
         StreamErrorKind::DeviceChanged => Level::DEBUG,
         StreamErrorKind::Other => Level::WARN,
+    }
+}
+
+/// What a supervisor's stream is doing, for UI reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamStatus {
+    /// The first build, or a rebuild of a stream that was running, is in
+    /// progress.
+    Starting,
+    /// A stream runs on this device.
+    Running(StreamInfo),
+    /// The last build failed; it is retried after a backoff. A rebuild
+    /// started from this state keeps it until a build succeeds.
+    Failed {
+        /// The build error's message.
+        error: String,
+        /// The build error's kind.
+        kind: BuildErrorKind,
+    },
+}
+
+/// Throttles the build-failure log of one supervisor.
+///
+/// A device that is missing for minutes fails a build every retry. Only the
+/// first failure of a streak, and a failure whose message differs from the
+/// previous one, are warnings; repeats are debug. The first success after a
+/// streak is logged at info.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FailureLog {
+    streak: usize,
+    last: Option<String>,
+}
+
+impl FailureLog {
+    /// Record a failed build with `message`; returns the level to log it at.
+    pub fn on_failure(&mut self, message: &str) -> Level {
+        self.streak += 1;
+        if self.last.as_deref() == Some(message) {
+            return Level::DEBUG;
+        }
+        self.last = Some(message.to_owned());
+        Level::WARN
+    }
+
+    /// Record a successful build. Returns the number of failures before it
+    /// when it ends a streak (log the recovery at info), otherwise `None`.
+    pub fn on_success(&mut self) -> Option<usize> {
+        self.last = None;
+        match std::mem::take(&mut self.streak) {
+            0 => None,
+            failures => Some(failures),
+        }
     }
 }
 
@@ -129,19 +194,19 @@ impl Default for Timings {
 /// What the supervisor should do now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Drop the stream and build a new one on the current default device.
+    /// Drop the stream and build a new one on the device the role targets.
     Rebuild,
-    /// Re-query the default output identity and pass it to
-    /// [`SupervisorCore::resolve_check`].
-    CheckDefault,
+    /// Re-query the identity of the device a build would pick now and pass
+    /// it to [`SupervisorCore::resolve_check`].
+    CheckIdentity,
 }
 
 /// The result of [`SupervisorCore::resolve_check`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckOutcome {
-    /// The default output changed: rebuild.
+    /// The target device changed: rebuild.
     Rebuild,
-    /// The event did not affect the active output: drop it.
+    /// The event did not affect the active stream: drop it.
     Drop,
 }
 
@@ -153,7 +218,7 @@ struct Window {
 }
 
 #[derive(Debug, Clone)]
-struct ActiveStream {
+struct LiveStream {
     identity: DeviceIdentity,
     built_at: Instant,
     /// Whether the heartbeat has moved past the value read before the build.
@@ -164,7 +229,7 @@ struct ActiveStream {
     last_beat_at: Instant,
 }
 
-impl ActiveStream {
+impl LiveStream {
     /// When the watchdog rebuilds this stream if the heartbeat stays put.
     fn stall_deadline(&self, timings: &Timings) -> Instant {
         if self.started {
@@ -179,7 +244,7 @@ impl ActiveStream {
 #[derive(Debug, Clone)]
 pub struct SupervisorCore {
     timings: Timings,
-    stream: Option<ActiveStream>,
+    stream: Option<LiveStream>,
     window: Option<Window>,
     build_at: Option<Instant>,
 }
@@ -200,7 +265,7 @@ impl SupervisorCore {
         match policy {
             RebuildPolicy::Ignore => {}
             RebuildPolicy::Always => self.open_window(true, now),
-            RebuildPolicy::IfDefaultOutputChanged => self.open_window(false, now),
+            RebuildPolicy::IfIdentityChanged => self.open_window(false, now),
         }
     }
 
@@ -223,7 +288,7 @@ impl SupervisorCore {
     ) {
         match identity {
             Some(identity) => {
-                self.stream = Some(ActiveStream {
+                self.stream = Some(LiveStream {
                     identity,
                     built_at: now,
                     started: false,
@@ -239,7 +304,7 @@ impl SupervisorCore {
         }
     }
 
-    /// Record the mixer's callback heartbeat as sampled at `now`.
+    /// Record the callback heartbeat as sampled at `now`.
     ///
     /// The first change from the build's baseline marks the stream as
     /// started; from then on the stall clock restarts whenever the value
@@ -265,7 +330,7 @@ impl SupervisorCore {
             if window.force || self.stream.is_none() {
                 return Some(self.begin_rebuild());
             }
-            return Some(Action::CheckDefault);
+            return Some(Action::CheckIdentity);
         }
         if self.build_at.is_some_and(|at| now >= at) {
             return Some(self.begin_rebuild());
@@ -278,9 +343,10 @@ impl SupervisorCore {
         None
     }
 
-    /// Decide an [`Action::CheckDefault`] given the live default output
-    /// identity: rebuild if it differs from the identity the stream was built
-    /// on (including `None` against `Some`), otherwise drop the event.
+    /// Decide an [`Action::CheckIdentity`] given the identity of the device a
+    /// build would pick now: rebuild if it differs from the identity the
+    /// stream was built on (including `None` against `Some`), otherwise drop
+    /// the event.
     pub fn resolve_check(&mut self, current: Option<DeviceIdentity>) -> CheckOutcome {
         match &self.stream {
             Some(stream) if current.as_ref() == Some(&stream.identity) => CheckOutcome::Drop,
@@ -336,10 +402,16 @@ impl SupervisorCore {
 #[derive(Debug)]
 pub struct SupervisorHandle {
     sender: Sender<SupervisorMsg>,
+    status: Arc<Mutex<StreamStatus>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl SupervisorHandle {
+    /// What the supervised stream is doing now.
+    pub fn status(&self) -> StreamStatus {
+        lock_status(&self.status).clone()
+    }
+
     /// Stop the stream, unregister the watcher and join the thread.
     pub fn shutdown(mut self) {
         self.stop();
@@ -362,84 +434,102 @@ impl Drop for SupervisorHandle {
     }
 }
 
-/// Start the supervisor thread.
+fn lock_status(status: &Mutex<StreamStatus>) -> std::sync::MutexGuard<'_, StreamStatus> {
+    status.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Start a supervisor thread for `factory`'s role.
 ///
-/// The thread creates the mixer on `shared`, starts `watcher`, builds the
-/// first stream immediately and then supervises it until shutdown.
-pub(crate) fn spawn_supervisor<F, W>(
+/// The thread starts its own `watcher`, builds the first stream on
+/// `endpoint` immediately and then supervises it until shutdown.
+pub(crate) fn spawn_supervisor<F, E, W>(
     factory: F,
+    endpoint: E,
     watcher: W,
-    shared: Arc<MixerShared>,
     timings: Timings,
 ) -> std::io::Result<SupervisorHandle>
 where
-    F: SinkFactory,
+    F: StreamFactory<Target = E::Target>,
+    E: Endpoint,
     W: DeviceWatcher,
 {
     let (sender, receiver) = mpsc::channel();
+    let status = Arc::new(Mutex::new(StreamStatus::Starting));
     let thread_sender = sender.clone();
+    let thread_status = Arc::clone(&status);
     let thread = thread::Builder::new()
-        .name("babound-supervisor".into())
+        .name(format!("babound-{}", factory.role()))
         .spawn(move || {
-            Worker::new(factory, shared, timings, thread_sender).run(watcher, receiver);
+            Worker::new(factory, endpoint, timings, thread_sender, thread_status)
+                .run(watcher, receiver);
         })?;
     Ok(SupervisorHandle {
         sender,
+        status,
         thread: Some(thread),
     })
 }
 
 /// The supervisor thread's state.
-struct Worker<F> {
+struct Worker<F, E> {
     factory: F,
-    shared: Arc<MixerShared>,
-    mixer: Arc<Mutex<Mixer>>,
+    endpoint: E,
+    role: StreamRole,
     sender: Sender<SupervisorMsg>,
+    status: Arc<Mutex<StreamStatus>>,
     core: SupervisorCore,
+    failures: FailureLog,
     play_grace: Duration,
-    sink: Option<Box<dyn ActiveSink>>,
+    stream: Option<Box<dyn ActiveStream>>,
 }
 
-impl<F: SinkFactory> Worker<F> {
+impl<F, E> Worker<F, E>
+where
+    F: StreamFactory<Target = E::Target>,
+    E: Endpoint,
+{
     fn new(
         factory: F,
-        shared: Arc<MixerShared>,
+        endpoint: E,
         timings: Timings,
         sender: Sender<SupervisorMsg>,
-    ) -> Worker<F> {
+        status: Arc<Mutex<StreamStatus>>,
+    ) -> Worker<F, E> {
         Worker {
+            role: factory.role(),
             factory,
-            mixer: Arc::new(Mutex::new(Mixer::new(Arc::clone(&shared)))),
-            shared,
+            endpoint,
             sender,
+            status,
             core: SupervisorCore::new(timings, Instant::now()),
+            failures: FailureLog::default(),
             play_grace: timings.play_grace,
-            sink: None,
+            stream: None,
         }
     }
 
     fn run<W: DeviceWatcher>(mut self, mut watcher: W, receiver: Receiver<SupervisorMsg>) {
+        let role = self.role;
         let guard = match watcher.start(EventSender::new(self.sender.clone())) {
             Ok(guard) => Some(guard),
             Err(err) => {
-                warn!(error = %err, "device watcher unavailable; relying on stream errors");
+                warn!(%role, error = %err, "device watcher unavailable; relying on stream errors");
                 None
             }
         };
 
         loop {
             let now = Instant::now();
-            self.core
-                .on_heartbeat(self.shared.callback_heartbeat(), now);
+            self.core.on_heartbeat(self.endpoint.heartbeat(), now);
             match self.core.poll(now) {
                 Some(Action::Rebuild) => self.rebuild(),
-                Some(Action::CheckDefault) => self.check_default(),
+                Some(Action::CheckIdentity) => self.check_identity(),
                 None => {}
             }
-            if self.sink.is_none() {
+            if self.stream.is_none() {
                 self.purge_offline();
             }
-            self.shared.drain_garbage();
+            self.endpoint.drain_garbage();
 
             let wait = self
                 .core
@@ -452,9 +542,9 @@ impl<F: SinkFactory> Worker<F> {
                 Ok(SupervisorMsg::Device(event)) => self.on_device_event(event),
                 Ok(SupervisorMsg::StreamError { kind, message }) => {
                     if stream_error_level(kind) == Level::DEBUG {
-                        debug!(error = %message, "output device changed; rebuilding");
+                        debug!(%role, error = %message, "device changed; rebuilding");
                     } else {
-                        warn!(error = %message, "output stream error");
+                        warn!(%role, error = %message, "stream error");
                     }
                     self.core.on_stream_error(Instant::now());
                 }
@@ -463,36 +553,39 @@ impl<F: SinkFactory> Worker<F> {
             }
         }
 
-        drop(self.sink.take());
-        self.shared.close_play_grace();
-        self.shared.set_output_active(false);
+        drop(self.stream.take());
+        self.endpoint.close_play_grace();
+        self.endpoint.set_active(false);
         drop(guard);
-        self.shared.drain_garbage();
-        debug!("supervisor stopped");
+        self.endpoint.drain_garbage();
+        debug!(%role, "supervisor stopped");
     }
 
     fn on_device_event(&mut self, event: DeviceEvent) {
-        let policy = event.rebuild_policy();
+        let role = self.role;
+        let policy = event.rebuild_policy(role);
         if policy == RebuildPolicy::Ignore {
-            debug!(?event, "input device event ignored");
+            debug!(%role, ?event, "device event ignored");
         } else {
-            debug!(?event, ?policy, "device event");
+            debug!(%role, ?event, ?policy, "device event");
         }
         self.core.on_event(policy, Instant::now());
     }
 
-    fn check_default(&mut self) {
-        let current = self.factory.current_default_identity();
+    fn check_identity(&mut self) {
+        let role = self.role;
+        let current = self.factory.current_identity();
         match self.core.resolve_check(current.clone()) {
             CheckOutcome::Rebuild => {
                 info!(
-                    default = current.as_ref().map_or("<none>", DeviceIdentity::as_str),
-                    "default output changed; rebuilding"
+                    %role,
+                    device = current.as_ref().map_or("<none>", DeviceIdentity::as_str),
+                    "target device changed; rebuilding"
                 );
                 self.rebuild();
             }
             CheckOutcome::Drop => {
-                debug!("device change did not affect the default output; ignored");
+                debug!(%role, "device change did not affect the stream; ignored");
             }
         }
     }
@@ -501,76 +594,89 @@ impl<F: SinkFactory> Worker<F> {
     /// from a live teardown is still open, in which case the queue is kept
     /// in order for the replacement stream.
     fn purge_offline(&mut self) {
-        if !self.shared.play_grace_open(Instant::now()) {
-            self.drop_offline_plays();
+        let dropped = self.endpoint.purge_offline(Instant::now());
+        if dropped > 0 {
+            info!(role = %self.role, dropped, "no stream; dropped queued plays");
         }
     }
 
-    /// Drop the plays queued while no stream exists, and apply the other
-    /// commands. No stream means no callback, so the lock cannot contend.
-    fn drop_offline_plays(&mut self) {
-        let dropped = self
-            .mixer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .apply_offline();
-        if dropped > 0 {
-            info!(dropped, "no output stream; dropped queued plays");
-        }
+    fn set_status(&self, status: StreamStatus) {
+        *lock_status(&self.status) = status;
     }
 
     /// Drop the stream, then build a new one. The factory configures the
-    /// mixer while no stream exists, so the callback never contends for it.
+    /// target while no stream exists, so the callback never contends for it.
     ///
     /// When a stream existed, the queue is kept on purpose: its plays were
     /// accepted while that stream ran, and the new stream applies them. The
-    /// play grace window opens before output is marked inactive, so plays
+    /// play grace window opens before the stream is marked inactive, so plays
     /// stay accepted without a gap. When no stream existed, plays queued
     /// since the last loop's purge are dropped first, so the new stream never
     /// starts a press made offline, unless the grace window is still open.
     fn rebuild(&mut self) {
-        match self.sink.take() {
-            Some(sink) => {
-                self.shared
+        match self.stream.take() {
+            Some(stream) => {
+                self.endpoint
                     .open_play_grace(Instant::now() + self.play_grace);
-                drop(sink);
+                drop(stream);
+                self.set_status(StreamStatus::Starting);
             }
             None => self.purge_offline(),
         }
-        self.shared.set_output_active(false);
+        self.endpoint.set_active(false);
         // Read before the build, so a callback that runs before the next
         // sample still counts as the stream starting.
-        let baseline = self.shared.callback_heartbeat();
+        let baseline = self.endpoint.heartbeat();
         match self
             .factory
-            .build(Arc::clone(&self.mixer), self.sender.clone())
+            .build(self.endpoint.target(), self.sender.clone())
         {
-            Ok((sink, info)) => {
-                info!(
-                    device = %info.device_name,
-                    rate = info.sample_rate,
-                    channels = info.channels,
-                    format = %info.sample_format,
-                    "output stream started"
-                );
-                self.sink = Some(sink);
-                self.shared.set_output_active(true);
-                self.shared.close_play_grace();
-                self.core
-                    .on_build_result(Some(info.identity), baseline, Instant::now());
-            }
-            Err(err) => {
-                warn!(error = %err, "output stream build failed; will retry");
-                self.core.on_build_result(None, baseline, Instant::now());
-            }
+            Ok((stream, info)) => self.on_built(stream, info, baseline),
+            Err(err) => self.on_failed(&err, baseline),
         }
+    }
+
+    fn on_built(&mut self, stream: Box<dyn ActiveStream>, info: StreamInfo, baseline: u64) {
+        let role = self.role;
+        if let Some(failures) = self.failures.on_success() {
+            info!(%role, failures, "stream build recovered");
+        }
+        info!(
+            %role,
+            device = %info.device_name,
+            rate = info.sample_rate,
+            channels = info.channels,
+            format = %info.sample_format,
+            "stream started"
+        );
+        self.stream = Some(stream);
+        self.endpoint.set_active(true);
+        self.core
+            .on_build_result(Some(info.identity.clone()), baseline, Instant::now());
+        self.set_status(StreamStatus::Running(info));
+    }
+
+    fn on_failed(&mut self, err: &BuildError, baseline: u64) {
+        let role = self.role;
+        let message = err.to_string();
+        if self.failures.on_failure(&message) == Level::WARN {
+            warn!(%role, error = %message, "stream build failed; will retry");
+        } else {
+            debug!(%role, error = %message, "stream build failed again; will retry");
+        }
+        self.core.on_build_result(None, baseline, Instant::now());
+        self.set_status(StreamStatus::Failed {
+            error: message,
+            kind: err.kind(),
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mixer::Command;
+    use crate::mixer::{Command, MixerShared};
+    use crate::sink::MixerEndpoint;
     use crate::sound::Sound;
     use crate::test_support::{FakeSinkFactory, FakeWatcher, wait_until};
 
@@ -580,6 +686,11 @@ mod tests {
 
     fn id(name: &str) -> DeviceIdentity {
         DeviceIdentity::new(name)
+    }
+
+    /// A fresh status cell for a worker built directly in a test.
+    fn status() -> Arc<Mutex<StreamStatus>> {
+        Arc::new(Mutex::new(StreamStatus::Starting))
     }
 
     /// A core with a stream built on `name` at `t0`.
@@ -610,7 +721,7 @@ mod tests {
                     rebuilds += 1;
                     core.on_build_result(current.map(id), *beat, t);
                 }
-                Some(Action::CheckDefault) => {
+                Some(Action::CheckIdentity) => {
                     checks += 1;
                     if core.resolve_check(current.map(id)) == CheckOutcome::Rebuild {
                         rebuilds += 1;
@@ -698,7 +809,7 @@ mod tests {
         let mut core = SupervisorCore::new(Timings::default(), t0);
         assert_eq!(core.poll(t0), Some(Action::Rebuild));
         core.on_build_result(None, 0, t0);
-        core.on_event(RebuildPolicy::IfDefaultOutputChanged, t0 + ms(100));
+        core.on_event(RebuildPolicy::IfIdentityChanged, t0 + ms(100));
         assert_eq!(core.poll(t0 + ms(299)), None);
         // No stream is active, so even an identity-checked event rebuilds.
         assert_eq!(core.poll(t0 + ms(300)), Some(Action::Rebuild));
@@ -837,7 +948,7 @@ mod tests {
         let mut core = running(t0, "spk");
         for i in 0..5 {
             core.on_event(
-                DeviceEvent::DefaultInputChanged.rebuild_policy(),
+                DeviceEvent::DefaultInputChanged.rebuild_policy(StreamRole::Monitor),
                 t0 + ms(10 * i),
             );
         }
@@ -855,11 +966,11 @@ mod tests {
         let t0 = Instant::now();
         let mut core = running(t0, "spk");
         core.on_event(
-            DeviceEvent::DeviceListChanged.rebuild_policy(),
+            DeviceEvent::DeviceListChanged.rebuild_policy(StreamRole::Monitor),
             t0 + ms(100),
         );
         assert_eq!(core.poll(t0 + ms(299)), None);
-        assert_eq!(core.poll(t0 + ms(300)), Some(Action::CheckDefault));
+        assert_eq!(core.poll(t0 + ms(300)), Some(Action::CheckIdentity));
         assert_eq!(core.resolve_check(Some(id("spk"))), CheckOutcome::Drop);
         assert!(core.has_stream());
         assert_eq!(core.built_on(), Some(&id("spk")));
@@ -871,8 +982,11 @@ mod tests {
     fn list_change_with_new_default_rebuilds() {
         let t0 = Instant::now();
         let mut core = running(t0, "spk");
-        core.on_event(DeviceEvent::DeviceListChanged.rebuild_policy(), t0);
-        assert_eq!(core.poll(t0 + ms(200)), Some(Action::CheckDefault));
+        core.on_event(
+            DeviceEvent::DeviceListChanged.rebuild_policy(StreamRole::Monitor),
+            t0,
+        );
+        assert_eq!(core.poll(t0 + ms(200)), Some(Action::CheckIdentity));
         assert_eq!(core.resolve_check(Some(id("hp"))), CheckOutcome::Rebuild);
         assert!(!core.has_stream());
     }
@@ -881,8 +995,11 @@ mod tests {
     fn removal_of_the_last_device_rebuilds() {
         let t0 = Instant::now();
         let mut core = running(t0, "spk");
-        core.on_event(DeviceEvent::DeviceRemoved.rebuild_policy(), t0);
-        assert_eq!(core.poll(t0 + ms(200)), Some(Action::CheckDefault));
+        core.on_event(
+            DeviceEvent::DeviceRemoved.rebuild_policy(StreamRole::Monitor),
+            t0,
+        );
+        assert_eq!(core.poll(t0 + ms(200)), Some(Action::CheckIdentity));
         assert_eq!(core.resolve_check(None), CheckOutcome::Rebuild);
     }
 
@@ -890,13 +1007,16 @@ mod tests {
     fn mixed_burst_rebuilds_without_check() {
         let t0 = Instant::now();
         let mut core = running(t0, "spk");
-        core.on_event(DeviceEvent::DeviceListChanged.rebuild_policy(), t0);
         core.on_event(
-            DeviceEvent::DefaultOutputChanged.rebuild_policy(),
+            DeviceEvent::DeviceListChanged.rebuild_policy(StreamRole::Monitor),
+            t0,
+        );
+        core.on_event(
+            DeviceEvent::DefaultOutputChanged.rebuild_policy(StreamRole::Monitor),
             t0 + ms(20),
         );
         core.on_event(
-            DeviceEvent::DeviceStateChanged.rebuild_policy(),
+            DeviceEvent::DeviceStateChanged.rebuild_policy(StreamRole::Monitor),
             t0 + ms(40),
         );
         assert_eq!(core.poll(t0 + ms(239)), None);
@@ -920,8 +1040,8 @@ mod tests {
     fn spawn(factory: &FakeSinkFactory, watcher: &FakeWatcher) -> SupervisorHandle {
         spawn_supervisor(
             factory.clone(),
+            MixerEndpoint::new(Arc::new(MixerShared::new())),
             watcher.clone(),
-            Arc::new(MixerShared::new()),
             fast(),
         )
         .unwrap()
@@ -996,8 +1116,8 @@ mod tests {
     fn spawn_with_stall(factory: &FakeSinkFactory, stall: Duration) -> SupervisorHandle {
         spawn_supervisor(
             factory.clone(),
+            MixerEndpoint::new(Arc::new(MixerShared::new())),
             FakeWatcher::default(),
-            Arc::new(MixerShared::new()),
             Timings {
                 stall,
                 startup_grace: stall,
@@ -1044,8 +1164,8 @@ mod tests {
         let shared = Arc::new(MixerShared::new());
         let handle = spawn_supervisor(
             factory.clone(),
+            MixerEndpoint::new(Arc::clone(&shared)),
             watcher.clone(),
-            Arc::clone(&shared),
             fast(),
         )
         .unwrap();
@@ -1102,8 +1222,8 @@ mod tests {
         let shared = Arc::new(MixerShared::new());
         let handle = spawn_supervisor(
             factory.clone(),
+            MixerEndpoint::new(Arc::clone(&shared)),
             watcher.clone(),
-            Arc::clone(&shared),
             fast(),
         )
         .unwrap();
@@ -1142,7 +1262,13 @@ mod tests {
         let factory = FakeSinkFactory::new(48_000, 2, "spk");
         let shared = Arc::new(MixerShared::new());
         let (sender, _receiver) = mpsc::channel();
-        let mut worker = Worker::new(factory.clone(), Arc::clone(&shared), fast(), sender);
+        let mut worker = Worker::new(
+            factory.clone(),
+            MixerEndpoint::new(Arc::clone(&shared)),
+            fast(),
+            sender,
+            status(),
+        );
 
         // A press lands after the loop's purge but before the scheduled build.
         let sound = Sound::from_interleaved(vec![0.5; 4800], 48_000, 1, "late").unwrap();
@@ -1153,7 +1279,7 @@ mod tests {
             })
             .unwrap();
         worker.rebuild();
-        assert!(worker.sink.is_some());
+        assert!(worker.stream.is_some());
         assert_eq!(sound.handle_count(), 1);
 
         let mixer = factory.mixer().unwrap();
@@ -1184,16 +1310,22 @@ mod tests {
             play_grace: Duration::from_secs(3600),
             ..fast()
         };
-        let mut worker = Worker::new(factory.clone(), Arc::clone(&shared), timings, sender);
+        let mut worker = Worker::new(
+            factory.clone(),
+            MixerEndpoint::new(Arc::clone(&shared)),
+            timings,
+            sender,
+            status(),
+        );
         worker.rebuild();
-        assert!(worker.sink.is_some());
+        assert!(worker.stream.is_some());
         // A successful build leaves no window behind.
         assert!(!shared.play_grace_open(Instant::now()));
 
         // The live stream goes away and its replacement fails.
         factory.fail_next(usize::MAX);
         worker.rebuild();
-        assert!(worker.sink.is_none());
+        assert!(worker.stream.is_none());
         assert!(!shared.output_active());
         assert!(shared.accepts_plays(Instant::now()));
 
@@ -1215,7 +1347,7 @@ mod tests {
         // The replacement stream applies both, in order.
         factory.fail_next(0);
         worker.rebuild();
-        assert!(worker.sink.is_some());
+        assert!(worker.stream.is_some());
         assert!(!shared.play_grace_open(Instant::now()));
         let mixer = factory.mixer().unwrap();
         let mut out = vec![0.0; 64];
@@ -1235,7 +1367,13 @@ mod tests {
             play_grace: Duration::ZERO,
             ..fast()
         };
-        let mut worker = Worker::new(factory.clone(), Arc::clone(&shared), timings, sender);
+        let mut worker = Worker::new(
+            factory.clone(),
+            MixerEndpoint::new(Arc::clone(&shared)),
+            timings,
+            sender,
+            status(),
+        );
         worker.rebuild();
         factory.fail_next(usize::MAX);
         worker.rebuild();
@@ -1260,8 +1398,8 @@ mod tests {
         let shared = Arc::new(MixerShared::new());
         let handle = spawn_supervisor(
             factory.clone(),
+            MixerEndpoint::new(Arc::clone(&shared)),
             FakeWatcher::default(),
-            Arc::clone(&shared),
             Timings {
                 play_grace: Duration::from_secs(3600),
                 ..fast()
@@ -1318,8 +1456,8 @@ mod tests {
         let shared = Arc::new(MixerShared::new());
         let handle = spawn_supervisor(
             factory.clone(),
+            MixerEndpoint::new(Arc::clone(&shared)),
             watcher.clone(),
-            Arc::clone(&shared),
             fast(),
         )
         .unwrap();
@@ -1346,8 +1484,8 @@ mod tests {
         let watcher = FakeWatcher::default();
         let handle = spawn_supervisor(
             factory.clone(),
+            MixerEndpoint::new(Arc::new(MixerShared::new())),
             watcher.clone(),
-            Arc::new(MixerShared::new()),
             Timings::default(),
         )
         .unwrap();
@@ -1383,6 +1521,214 @@ mod tests {
         assert!(wait_until(WAIT, || factory.builds().len() == 1));
         assert!(factory.send_stream_error(StreamErrorKind::Other));
         assert!(wait_until(WAIT, || factory.builds().len() == 2));
+        handle.shutdown();
+    }
+
+    // Build-failure log throttling.
+
+    #[test]
+    fn failure_log_warns_once_per_streak() {
+        let mut log = FailureLog::default();
+        assert_eq!(log.on_success(), None);
+        assert_eq!(log.on_failure("no output device"), Level::WARN);
+        assert_eq!(log.on_failure("no output device"), Level::DEBUG);
+        assert_eq!(log.on_failure("no output device"), Level::DEBUG);
+        assert_eq!(log.on_success(), Some(3));
+        // A new streak warns again, even with the same message.
+        assert_eq!(log.on_failure("no output device"), Level::WARN);
+        assert_eq!(log.on_success(), Some(1));
+        assert_eq!(log.on_success(), None);
+    }
+
+    #[test]
+    fn failure_log_warns_when_the_error_changes() {
+        let mut log = FailureLog::default();
+        assert_eq!(log.on_failure("no output device"), Level::WARN);
+        assert_eq!(log.on_failure("audio backend error: busy"), Level::WARN);
+        assert_eq!(log.on_failure("audio backend error: busy"), Level::DEBUG);
+        assert_eq!(log.on_failure("no output device"), Level::WARN);
+        assert_eq!(log.on_success(), Some(4));
+    }
+
+    // Per-role policies in the core.
+
+    #[test]
+    fn mic_sink_core_ignores_default_output_changes() {
+        let t0 = Instant::now();
+        let mut core = running(t0, "cable");
+        for event in [
+            DeviceEvent::DefaultOutputChanged,
+            DeviceEvent::DefaultInputChanged,
+        ] {
+            core.on_event(event.rebuild_policy(StreamRole::MicSink), t0);
+        }
+        let mut beat = 0;
+        assert_eq!(
+            drive(&mut core, t0, t0 + ms(3000), Some("cable"), &mut beat),
+            (0, 0)
+        );
+        core.on_event(
+            DeviceEvent::DeviceRemoved.rebuild_policy(StreamRole::MicSink),
+            t0 + ms(3000),
+        );
+        assert_eq!(core.poll(t0 + ms(3200)), Some(Action::CheckIdentity));
+    }
+
+    #[test]
+    fn capture_core_rebuilds_on_default_input_change() {
+        let t0 = Instant::now();
+        let mut core = running(t0, "mic");
+        core.on_event(
+            DeviceEvent::DefaultOutputChanged.rebuild_policy(StreamRole::Capture),
+            t0,
+        );
+        assert_eq!(core.poll(t0 + ms(300)), None);
+        core.on_event(
+            DeviceEvent::DefaultInputChanged.rebuild_policy(StreamRole::Capture),
+            t0 + ms(300),
+        );
+        assert_eq!(core.poll(t0 + ms(500)), Some(Action::Rebuild));
+    }
+
+    // Status.
+
+    #[test]
+    fn status_goes_from_starting_to_running_and_back_on_rebuild() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        factory.hold_builds();
+        let watcher = FakeWatcher::default();
+        let handle = spawn(&factory, &watcher);
+        assert!(wait_until(WAIT, || factory.building()));
+        assert_eq!(handle.status(), StreamStatus::Starting);
+
+        factory.release_builds();
+        assert!(wait_until(WAIT, || matches!(
+            handle.status(),
+            StreamStatus::Running(_)
+        )));
+        let StreamStatus::Running(info) = handle.status() else {
+            unreachable!()
+        };
+        assert_eq!(info.identity, id("spk"));
+
+        // A rebuild of a running stream is Starting until the new build returns.
+        factory.hold_builds();
+        factory.set_default(Some("hp"));
+        assert!(watcher.send(DeviceEvent::DefaultOutputChanged));
+        assert!(wait_until(WAIT, || factory.building()));
+        assert_eq!(handle.status(), StreamStatus::Starting);
+        factory.release_builds();
+        assert!(wait_until(WAIT, || matches!(
+            handle.status(),
+            StreamStatus::Running(ref info) if info.identity == id("hp")
+        )));
+        handle.shutdown();
+    }
+
+    #[test]
+    fn status_reports_a_failed_build_until_one_succeeds() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        factory.set_default(None);
+        let watcher = FakeWatcher::default();
+        let handle = spawn(&factory, &watcher);
+        assert!(wait_until(WAIT, || factory.attempts() >= 1));
+        let failed = StreamStatus::Failed {
+            error: BuildError::NoDevice.to_string(),
+            kind: BuildErrorKind::NoDevice,
+        };
+        assert!(wait_until(WAIT, || handle.status() == failed));
+
+        // Retries hold the build at the gate; the status stays Failed while
+        // they run, so a UI does not flicker through Starting.
+        factory.hold_builds();
+        assert!(wait_until(WAIT, || factory.building()));
+        assert_eq!(handle.status(), failed);
+        factory.set_default(Some("spk"));
+        factory.release_builds();
+        assert!(wait_until(WAIT, || matches!(
+            handle.status(),
+            StreamStatus::Running(_)
+        )));
+        handle.shutdown();
+    }
+
+    #[test]
+    fn status_reports_the_error_kind() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        factory.fail_next(usize::MAX);
+        let handle = spawn(&factory, &FakeWatcher::default());
+        assert!(wait_until(WAIT, || matches!(
+            handle.status(),
+            StreamStatus::Failed {
+                kind: BuildErrorKind::Backend,
+                ..
+            }
+        )));
+        handle.shutdown();
+    }
+
+    // Several supervisors.
+
+    #[test]
+    fn one_fake_watcher_feeds_two_supervisors() {
+        let monitor = FakeSinkFactory::new(48_000, 2, "spk");
+        let mic = FakeSinkFactory::for_role(StreamRole::MicSink, 48_000, 2, "cable");
+        let watcher = FakeWatcher::default();
+        let monitor_handle = spawn(&monitor, &watcher);
+        let mic_handle = spawn(&mic, &watcher);
+        assert!(wait_until(WAIT, || monitor.builds().len() == 1));
+        assert!(wait_until(WAIT, || mic.builds().len() == 1));
+        assert_eq!(watcher.started(), 2);
+
+        // A default-output change rebuilds the monitor only.
+        monitor.set_default(Some("hp"));
+        assert!(watcher.send(DeviceEvent::DefaultOutputChanged));
+        assert!(wait_until(WAIT, || monitor.builds().len() == 2));
+        // A later list change reaches the mic sink: once it has been checked,
+        // the earlier default-output event has been handled too.
+        assert!(watcher.send(DeviceEvent::DeviceListChanged));
+        assert!(wait_until(WAIT, || mic.identity_queries() == 1));
+        assert!(wait_until(WAIT, || monitor.identity_queries() == 1));
+        thread::sleep(ms(200));
+        assert_eq!(mic.attempts(), 1);
+        assert_eq!(monitor.builds().len(), 2);
+        assert_eq!(mic.live_sinks(), 1);
+        assert_eq!(monitor.live_sinks(), 1);
+
+        // The mic device goes away: only the mic sink rebuilds (and fails).
+        mic.set_default(None);
+        assert!(watcher.send(DeviceEvent::DeviceRemoved));
+        assert!(wait_until(WAIT, || mic.attempts() >= 2));
+        assert!(wait_until(WAIT, || matches!(
+            mic_handle.status(),
+            StreamStatus::Failed {
+                kind: BuildErrorKind::NoDevice,
+                ..
+            }
+        )));
+        assert_eq!(monitor.builds().len(), 2);
+        assert_eq!(monitor.live_sinks(), 1);
+        assert!(matches!(monitor_handle.status(), StreamStatus::Running(_)));
+
+        mic_handle.shutdown();
+        assert_eq!(watcher.guards_dropped(), 1);
+        // The monitor still hears events after the mic sink is gone.
+        assert!(watcher.send(DeviceEvent::DefaultOutputChanged));
+        assert!(wait_until(WAIT, || monitor.builds().len() == 3));
+        monitor_handle.shutdown();
+        assert_eq!(watcher.guards_dropped(), 2);
+        assert!(!watcher.send(DeviceEvent::DefaultOutputChanged));
+    }
+
+    #[test]
+    fn supervisor_threads_are_named_by_role() {
+        let factory = FakeSinkFactory::for_role(StreamRole::Capture, 48_000, 1, "mic");
+        let handle = spawn(&factory, &FakeWatcher::default());
+        let name = handle
+            .thread
+            .as_ref()
+            .and_then(|t| t.thread().name().map(str::to_owned));
+        assert_eq!(name.as_deref(), Some("babound-capture"));
         handle.shutdown();
     }
 }

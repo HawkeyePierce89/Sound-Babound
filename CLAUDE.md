@@ -4,14 +4,14 @@ A Rust tray soundboard. Plans live in `docs/plans/`.
 
 ## Crate layout
 
-- `crates/engine` (`babound-engine`): has no UI dependencies. Its modules are private. `lib.rs` re-exports only what the app needs: `Engine`, `Sound`, `StreamInfo`, `DeviceEvent`, `RebuildPolicy`, the error types and `VERSION`. Items that only tests use are `#[cfg(test)]`.
+- `crates/engine` (`babound-engine`): has no UI dependencies. Its modules are private. `lib.rs` re-exports only what the app needs: `Engine`, `Sound`, `StreamInfo`, `StreamRole`, `StreamStatus`, `DeviceEvent`, `RebuildPolicy`, the error types (with `BuildErrorKind`) and `VERSION`. Items that only tests use are `#[cfg(test)]`.
   - `error.rs`: `LoadError`, `BuildError`, `StartError`, `WatcherError`.
   - `sound.rs`: symphonia decode into a cheap-clone `Sound` (`Arc<SoundData>`).
   - `mixer.rs`: the realtime mixer, the command queue and the garbage queue.
   - `convert.rs`: f32 to device sample format (`OutputSample`). Every cpal PCM format is supported. I24 and U24 go through i32, because dasp overflows them at +1.0.
-  - `sink.rs`: the `SinkFactory` and `ActiveSink` traits.
+  - `sink.rs`: `StreamRole`, the `StreamFactory`, `Endpoint` and `ActiveStream` traits, and `MixerEndpoint` (the endpoint of both output roles).
   - `cpal_sink.rs`: the cpal implementation of those traits.
-  - `supervisor.rs`: the pure `SupervisorCore` state machine and the supervisor thread.
+  - `supervisor.rs`: the pure `SupervisorCore` state machine, the pure `FailureLog` build-failure throttle, `StreamStatus`, and the one generic supervisor thread (`spawn_supervisor`), one instance per role, each starting its own watcher.
   - `watcher/`: OS device-change listeners.
   - `engine.rs`: the public `Engine` API (non-blocking queue pushes and atomic reads).
   - `test_support.rs` (`#[cfg(test)]`): `FakeSinkFactory`, `FakeWatcher` and `wait_until`.
@@ -41,7 +41,7 @@ Pending-release rule: every `Sound` that leaves a voice (finished, evicted or st
 
 ## Mixer handoff invariant
 
-The mixer lives in `Arc<Mutex<Mixer>>`. To rebuild, the supervisor drops the old sink and then calls `SinkFactory::build`, so `build` only ever runs while no stream exists. `build` may lock the mixer freely, and it must call `configure(rate, channels)` before it starts the stream. Once the stream runs, only its callback touches the mixer, through `try_lock`, so that lock never contends. `configure` keeps the voices and their source positions, which is how playback continues across a rebuild.
+The mixer lives in `Arc<Mutex<Mixer>>`. To rebuild, the supervisor drops the old sink and then calls `StreamFactory::build`, so `build` only ever runs while no stream exists. `build` may lock the mixer freely, and it must call `configure(rate, channels)` before it starts the stream. Once the stream runs, only its callback touches the mixer, through `try_lock`, so that lock never contends. `configure` keeps the voices and their source positions, which is how playback continues across a rebuild.
 
 Only a running stream drains the command queue. `MixerShared::output_active` (`Engine::has_output`) reports whether a stream runs; the supervisor sets it only after `build` returns. `Engine::play` rejects a play (returns false) while it is false, so presses made with no device, or during a build started with no stream, never start late when a stream comes up. A rebuild from a live stream keeps the command queue: plays accepted while the old stream ran, including one whose push races the teardown (the check and the push are not atomic), are applied by the new stream, like the voices it continues. While no stream exists (failed build, retry backoff), each supervisor loop, and every build started with no stream, locks the mixer, which cannot contend then, and calls `Mixer::apply_offline`. It drops any play that passed the check just before the stream went away, and it still applies `StopAll` and `SetMasterGain`. The headless `play` waits for `has_output` before queuing its play, and once the mixer reports no voices it keeps the stream up for the measured output latency (`Engine::output_latency`: the cpal callback timestamps' `playback - callback` plus the duration of the callback's buffer, so it reaches the last written frame; capped at 5 s) plus a 200 ms margin, so the device buffer is heard.
 
@@ -50,12 +50,12 @@ Only a running stream drains the command queue. `MixerShared::output_active` (`E
 A rebuild is an audible gap, so not every event triggers one. Events are debounced on the trailing edge, 200 ms after the last event.
 
 - Always rebuild: `DefaultOutputChanged`, a forwarded stream error, and a stalled callback heartbeat (no progress for 2 s). The cpal error callback filters stream errors first (`cpal_sink::needs_rebuild`). `Xrun` and `RealtimeDenied` are dropped, because the stream keeps running and a rebuild would only add a gap.
-- Identity-checked: `DeviceListChanged`, `DeviceStateChanged` and `DeviceRemoved`. The supervisor re-queries the live default output identity and rebuilds only if it differs from the identity the stream was built on (`None` vs `Some` counts as different). Otherwise it logs the event at debug and drops it.
+- Identity-checked (`IfIdentityChanged`): `DeviceListChanged`, `DeviceStateChanged` and `DeviceRemoved`. The supervisor re-queries the live default output identity (`StreamFactory::current_identity`) and rebuilds only if it differs from the identity the stream was built on (`None` vs `Some` counts as different). Otherwise it logs the event at debug and drops it.
 - Ignored: `DefaultInputChanged`.
 - With no active stream (initial start, or the 1 s retry backoff after a failed build), every non-ignored event rebuilds.
 - Never cache the output device. Every build and every identity check re-queries the default device.
 
-The classification is `DeviceEvent::rebuild_policy()`. The timing logic is the pure `SupervisorCore`, tested with a fake clock.
+The classification is `DeviceEvent::rebuild_policy(role)`; the rules above are the monitor's (the mic sink ignores both default changes, the capture rebuilds on `DefaultInputChanged` and ignores `DefaultOutputChanged`; all roles identity-check list, state and removed events). The timing logic is the pure `SupervisorCore`, tested with a fake clock.
 
 ## Platform code
 

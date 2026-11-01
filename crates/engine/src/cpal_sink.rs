@@ -14,14 +14,17 @@ use cpal::{ErrorKind, I24, OutputStreamTimestamp, SampleFormat, StreamConfig, U2
 use crate::convert::{OutputSample, fill_silence, write_samples};
 use crate::error::BuildError;
 use crate::mixer::Mixer;
-use crate::sink::{ActiveSink, BuiltSink, DeviceIdentity, SinkFactory, StreamInfo};
+use crate::sink::{
+    ActiveStream, BuiltStream, DeviceIdentity, StreamFactory, StreamInfo, StreamRole,
+};
 use crate::supervisor::{StreamErrorKind, SupervisorMsg};
 
 /// How long the backend may take to open a stream before the build fails
 /// (and the supervisor retries). Not every backend honors it.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Builds cpal output streams on the current default output device.
+/// Builds the monitor's cpal output streams on the current default output
+/// device.
 #[derive(Debug, Default)]
 pub struct CpalSinkFactory;
 
@@ -30,14 +33,20 @@ struct CpalSink {
     _stream: cpal::Stream,
 }
 
-impl ActiveSink for CpalSink {}
+impl ActiveStream for CpalSink {}
 
-impl SinkFactory for CpalSinkFactory {
+impl StreamFactory for CpalSinkFactory {
+    type Target = Arc<Mutex<Mixer>>;
+
+    fn role(&self) -> StreamRole {
+        StreamRole::Monitor
+    }
+
     fn build(
         &mut self,
         mixer: Arc<Mutex<Mixer>>,
         on_error: Sender<SupervisorMsg>,
-    ) -> Result<BuiltSink, BuildError> {
+    ) -> Result<BuiltStream, BuildError> {
         let host = cpal::default_host();
         let device = host.default_output_device().ok_or(BuildError::NoDevice)?;
         let identity = identity_of(&device);
@@ -81,7 +90,7 @@ impl SinkFactory for CpalSinkFactory {
         Ok((Box::new(CpalSink { _stream: stream }), info))
     }
 
-    fn current_default_identity(&mut self) -> Option<DeviceIdentity> {
+    fn current_identity(&mut self) -> Option<DeviceIdentity> {
         cpal::default_host()
             .default_output_device()
             .map(|device| identity_of(&device))
@@ -397,10 +406,7 @@ mod tests {
         let (sink, info) = factory.build(Arc::clone(&mixer), tx).unwrap();
         assert!(info.sample_rate > 0);
         assert!(info.channels > 0);
-        assert_eq!(
-            factory.current_default_identity(),
-            Some(info.identity.clone())
-        );
+        assert_eq!(factory.current_identity(), Some(info.identity.clone()));
 
         std::thread::sleep(Duration::from_millis(300));
         assert!(shared.callback_heartbeat() > 0, "callback is running");

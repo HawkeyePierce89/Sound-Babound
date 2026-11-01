@@ -1,8 +1,9 @@
 //! Device-change notifications.
 //!
 //! A [`DeviceWatcher`] registers with the OS for audio device events and
-//! forwards them to the supervisor as [`DeviceEvent`]s. The supervisor decides
-//! what each event means through [`DeviceEvent::rebuild_policy`].
+//! forwards them to the supervisor as [`DeviceEvent`]s. Every supervisor
+//! starts its own watcher and decides what each event means for its role
+//! through [`DeviceEvent::rebuild_policy`].
 //!
 //! Platform watchers live in this module's platform submodules and are picked
 //! by [`platform_watcher`]: CoreAudio property listeners on macOS, an
@@ -12,6 +13,7 @@
 use std::sync::mpsc::Sender;
 
 use crate::error::WatcherError;
+use crate::sink::StreamRole;
 use crate::supervisor::SupervisorMsg;
 
 #[cfg(target_os = "linux")]
@@ -55,14 +57,31 @@ impl DeviceEvent {
         DeviceEvent::DeviceStateChanged,
     ];
 
-    /// Whether this event should rebuild the output stream.
-    pub fn rebuild_policy(self) -> RebuildPolicy {
-        match self {
-            DeviceEvent::DefaultOutputChanged => RebuildPolicy::Always,
-            DeviceEvent::DeviceListChanged
-            | DeviceEvent::DeviceStateChanged
-            | DeviceEvent::DeviceRemoved => RebuildPolicy::IfDefaultOutputChanged,
-            DeviceEvent::DefaultInputChanged => RebuildPolicy::Ignore,
+    /// How a supervisor of `role` reacts to this event.
+    ///
+    /// - Monitor: a default-output change always rebuilds, a default-input
+    ///   change is ignored.
+    /// - Mic sink: it targets a named device, so default changes of either
+    ///   direction are ignored.
+    /// - Capture: a default-input change always rebuilds, a default-output
+    ///   change is ignored.
+    ///
+    /// For every role, list, state and removal events are identity-checked.
+    pub fn rebuild_policy(self, role: StreamRole) -> RebuildPolicy {
+        use RebuildPolicy::{Always, IfIdentityChanged, Ignore};
+        match (self, role) {
+            (
+                DeviceEvent::DeviceListChanged
+                | DeviceEvent::DeviceStateChanged
+                | DeviceEvent::DeviceRemoved,
+                _,
+            ) => IfIdentityChanged,
+            (DeviceEvent::DefaultOutputChanged, StreamRole::Monitor) => Always,
+            (DeviceEvent::DefaultInputChanged, StreamRole::Capture) => Always,
+            (DeviceEvent::DefaultOutputChanged, StreamRole::MicSink | StreamRole::Capture)
+            | (DeviceEvent::DefaultInputChanged, StreamRole::Monitor | StreamRole::MicSink) => {
+                Ignore
+            }
         }
     }
 }
@@ -72,10 +91,11 @@ impl DeviceEvent {
 pub enum RebuildPolicy {
     /// Rebuild after the debounce window.
     Always,
-    /// After the debounce window, rebuild only if the identity of the current
-    /// default output differs from the one the active stream was built on.
-    IfDefaultOutputChanged,
-    /// Never rebuild (input-device events).
+    /// After the debounce window, rebuild only if the identity of the device
+    /// the role would pick now differs from the one the active stream was
+    /// built on.
+    IfIdentityChanged,
+    /// Never rebuild.
     Ignore,
 }
 
@@ -134,51 +154,56 @@ pub fn platform_watcher() -> PlatformWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use RebuildPolicy::{Always, IfIdentityChanged, Ignore};
+
+    /// The policies of one event, indexed like [`StreamRole::ALL`]:
+    /// monitor, mic sink, capture.
+    pub(crate) type RolePolicies = [RebuildPolicy; 3];
+
+    const OUTPUT_DEFAULT: RolePolicies = [Always, Ignore, Ignore];
+    const INPUT_DEFAULT: RolePolicies = [Ignore, Ignore, Always];
+    const IDENTITY: RolePolicies = [IfIdentityChanged, IfIdentityChanged, IfIdentityChanged];
 
     /// Every OS notification the platform watchers translate, the event it
-    /// becomes and the policy that event must have. (Windows'
-    /// `OnPropertyValueChanged` is ignored and so emits nothing.) Platform test modules
-    /// check their own mapping against this table.
-    pub(crate) const PLATFORM_EVENT_TABLE: [(&str, DeviceEvent, RebuildPolicy); 8] = [
+    /// becomes and the policy that event must have for each role. (Windows'
+    /// `OnPropertyValueChanged` is ignored and so emits nothing.) Platform
+    /// test modules check their own mapping against this table.
+    pub(crate) const PLATFORM_EVENT_TABLE: [(&str, DeviceEvent, RolePolicies); 8] = [
         (
             "macos:DefaultOutputDevice",
             DeviceEvent::DefaultOutputChanged,
-            RebuildPolicy::Always,
+            OUTPUT_DEFAULT,
         ),
         (
             "macos:DefaultInputDevice",
             DeviceEvent::DefaultInputChanged,
-            RebuildPolicy::Ignore,
+            INPUT_DEFAULT,
         ),
-        (
-            "macos:Devices",
-            DeviceEvent::DeviceListChanged,
-            RebuildPolicy::IfDefaultOutputChanged,
-        ),
+        ("macos:Devices", DeviceEvent::DeviceListChanged, IDENTITY),
         (
             "windows:OnDefaultDeviceChanged(eRender)",
             DeviceEvent::DefaultOutputChanged,
-            RebuildPolicy::Always,
+            OUTPUT_DEFAULT,
         ),
         (
             "windows:OnDefaultDeviceChanged(eCapture)",
             DeviceEvent::DefaultInputChanged,
-            RebuildPolicy::Ignore,
+            INPUT_DEFAULT,
         ),
         (
             "windows:OnDeviceRemoved",
             DeviceEvent::DeviceRemoved,
-            RebuildPolicy::IfDefaultOutputChanged,
+            IDENTITY,
         ),
         (
             "windows:OnDeviceStateChanged",
             DeviceEvent::DeviceStateChanged,
-            RebuildPolicy::IfDefaultOutputChanged,
+            IDENTITY,
         ),
         (
             "windows:OnDeviceAdded",
             DeviceEvent::DeviceListChanged,
-            RebuildPolicy::IfDefaultOutputChanged,
+            IDENTITY,
         ),
     ];
 
@@ -205,9 +230,15 @@ mod tests {
     }
 
     #[test]
-    fn every_platform_event_has_its_policy() {
-        for (source, event, policy) in PLATFORM_EVENT_TABLE {
-            assert_eq!(event.rebuild_policy(), policy, "{source} -> {event:?}");
+    fn every_platform_event_has_its_policy_for_every_role() {
+        for (source, event, policies) in PLATFORM_EVENT_TABLE {
+            for (role, policy) in StreamRole::ALL.into_iter().zip(policies) {
+                assert_eq!(
+                    event.rebuild_policy(role),
+                    policy,
+                    "{source} -> {event:?} for {role}"
+                );
+            }
         }
     }
 
@@ -222,26 +253,75 @@ mod tests {
     }
 
     #[test]
-    fn every_event_maps_to_its_policy() {
+    fn monitor_policy_is_unchanged_from_stage_one() {
         for event in DeviceEvent::ALL {
             let expected = match event {
-                DeviceEvent::DefaultOutputChanged => RebuildPolicy::Always,
-                DeviceEvent::DefaultInputChanged => RebuildPolicy::Ignore,
-                DeviceEvent::DeviceListChanged => RebuildPolicy::IfDefaultOutputChanged,
-                DeviceEvent::DeviceRemoved => RebuildPolicy::IfDefaultOutputChanged,
-                DeviceEvent::DeviceStateChanged => RebuildPolicy::IfDefaultOutputChanged,
+                DeviceEvent::DefaultOutputChanged => Always,
+                DeviceEvent::DefaultInputChanged => Ignore,
+                DeviceEvent::DeviceListChanged => IfIdentityChanged,
+                DeviceEvent::DeviceRemoved => IfIdentityChanged,
+                DeviceEvent::DeviceStateChanged => IfIdentityChanged,
             };
-            assert_eq!(event.rebuild_policy(), expected, "{event:?}");
+            assert_eq!(
+                event.rebuild_policy(StreamRole::Monitor),
+                expected,
+                "{event:?}"
+            );
         }
     }
 
     #[test]
-    fn only_default_output_change_always_rebuilds() {
-        let always: Vec<_> = DeviceEvent::ALL
-            .into_iter()
-            .filter(|e| e.rebuild_policy() == RebuildPolicy::Always)
-            .collect();
-        assert_eq!(always, vec![DeviceEvent::DefaultOutputChanged]);
+    fn mic_sink_ignores_default_changes() {
+        for event in DeviceEvent::ALL {
+            let expected = match event {
+                DeviceEvent::DefaultOutputChanged | DeviceEvent::DefaultInputChanged => Ignore,
+                DeviceEvent::DeviceListChanged
+                | DeviceEvent::DeviceRemoved
+                | DeviceEvent::DeviceStateChanged => IfIdentityChanged,
+            };
+            assert_eq!(
+                event.rebuild_policy(StreamRole::MicSink),
+                expected,
+                "{event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_follows_the_default_input() {
+        for event in DeviceEvent::ALL {
+            let expected = match event {
+                DeviceEvent::DefaultInputChanged => Always,
+                DeviceEvent::DefaultOutputChanged => Ignore,
+                DeviceEvent::DeviceListChanged
+                | DeviceEvent::DeviceRemoved
+                | DeviceEvent::DeviceStateChanged => IfIdentityChanged,
+            };
+            assert_eq!(
+                event.rebuild_policy(StreamRole::Capture),
+                expected,
+                "{event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_role_always_rebuilds_on_at_most_its_own_default() {
+        let always = |role| -> Vec<_> {
+            DeviceEvent::ALL
+                .into_iter()
+                .filter(|e| e.rebuild_policy(role) == Always)
+                .collect()
+        };
+        assert_eq!(
+            always(StreamRole::Monitor),
+            vec![DeviceEvent::DefaultOutputChanged]
+        );
+        assert_eq!(always(StreamRole::MicSink), vec![]);
+        assert_eq!(
+            always(StreamRole::Capture),
+            vec![DeviceEvent::DefaultInputChanged]
+        );
     }
 
     #[test]
@@ -263,5 +343,18 @@ mod tests {
         let mut watcher = platform_watcher();
         let guard = watcher.start(EventSender::new(tx)).unwrap();
         drop(guard);
+    }
+
+    #[test]
+    fn several_platform_watchers_run_side_by_side() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let guards: Vec<_> = (0..3)
+            .map(|_| {
+                platform_watcher()
+                    .start(EventSender::new(tx.clone()))
+                    .unwrap()
+            })
+            .collect();
+        drop(guards);
     }
 }

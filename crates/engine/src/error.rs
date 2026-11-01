@@ -57,6 +57,28 @@ pub enum BuildError {
     Backend(String),
 }
 
+/// What kind of [`BuildError`] a build failed with, without its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuildErrorKind {
+    /// [`BuildError::NoDevice`].
+    NoDevice,
+    /// [`BuildError::UnsupportedFormat`].
+    UnsupportedFormat,
+    /// [`BuildError::Backend`].
+    Backend,
+}
+
+impl BuildError {
+    /// The kind of this error.
+    pub fn kind(&self) -> BuildErrorKind {
+        match self {
+            BuildError::NoDevice => BuildErrorKind::NoDevice,
+            BuildError::UnsupportedFormat(_) => BuildErrorKind::UnsupportedFormat,
+            BuildError::Backend(_) => BuildErrorKind::Backend,
+        }
+    }
+}
+
 /// A failure while registering for device-change notifications.
 #[derive(Debug, Error)]
 #[error("device watcher failed: {0}")]
@@ -102,6 +124,15 @@ mod tests {
             BuildError::Backend("boom".into())
                 .to_string()
                 .contains("boom")
+        );
+        assert_eq!(BuildError::NoDevice.kind(), BuildErrorKind::NoDevice);
+        assert_eq!(
+            BuildError::UnsupportedFormat("i64".into()).kind(),
+            BuildErrorKind::UnsupportedFormat
+        );
+        assert_eq!(
+            BuildError::Backend("boom".into()).kind(),
+            BuildErrorKind::Backend
         );
         assert!(WatcherError("nope".into()).to_string().contains("nope"));
         assert!(

@@ -5,15 +5,15 @@
 //! engine can be shared between threads behind an `Arc` and called from UI
 //! and hotkey handlers without waiting on the audio thread.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::cpal_sink::CpalSinkFactory;
 use crate::error::StartError;
-use crate::mixer::{Command, MixerShared};
-use crate::sink::SinkFactory;
+use crate::mixer::{Command, Mixer, MixerShared};
+use crate::sink::{MixerEndpoint, StreamFactory};
 use crate::sound::Sound;
-use crate::supervisor::{SupervisorHandle, Timings, spawn_supervisor};
+use crate::supervisor::{StreamStatus, SupervisorHandle, Timings, spawn_supervisor};
 use crate::watcher::{DeviceWatcher, platform_watcher};
 
 /// A running audio engine.
@@ -46,29 +46,30 @@ impl Engine {
         Engine::start_with(CpalSinkFactory, platform_watcher())
     }
 
-    /// Start the engine with a custom sink factory and watcher.
+    /// Start the engine with a custom monitor factory and watcher.
     pub(crate) fn start_with<F, W>(factory: F, watcher: W) -> Result<Engine, StartError>
     where
-        F: SinkFactory,
+        F: StreamFactory<Target = Arc<Mutex<Mixer>>>,
         W: DeviceWatcher,
     {
         Engine::start_with_timings(factory, watcher, Timings::default())
     }
 
-    /// Start the engine with a custom sink factory, watcher and supervisor
-    /// timings.
+    /// Start the engine with a custom monitor factory, watcher and
+    /// supervisor timings.
     pub(crate) fn start_with_timings<F, W>(
         factory: F,
         watcher: W,
         timings: Timings,
     ) -> Result<Engine, StartError>
     where
-        F: SinkFactory,
+        F: StreamFactory<Target = Arc<Mutex<Mixer>>>,
         W: DeviceWatcher,
     {
         let shared = Arc::new(MixerShared::new());
-        let supervisor = spawn_supervisor(factory, watcher, Arc::clone(&shared), timings)
-            .map_err(StartError::Spawn)?;
+        let endpoint = MixerEndpoint::new(Arc::clone(&shared));
+        let supervisor =
+            spawn_supervisor(factory, endpoint, watcher, timings).map_err(StartError::Spawn)?;
         Ok(Engine { shared, supervisor })
     }
 
@@ -121,6 +122,12 @@ impl Engine {
     /// Whether an output stream is running, so a play would be heard.
     pub fn has_output(&self) -> bool {
         self.shared.output_active()
+    }
+
+    /// What the output stream is doing: starting, running on a device, or
+    /// failing to build (with the error). For UI display.
+    pub fn output_status(&self) -> StreamStatus {
+        self.supervisor.status()
     }
 
     /// How long until the last frame the latest callback wrote is played. It
@@ -196,6 +203,23 @@ mod tests {
         assert!(!is_silent(&block));
         assert_eq!(engine.active_voices(), 1);
         assert_eq!(engine.commands_applied(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn output_status_follows_the_monitor_stream() {
+        let factory = FakeSinkFactory::new(48_000, 2, "speakers");
+        factory.set_default(None);
+        let engine = Engine::start_with(factory.clone(), FakeWatcher::default()).unwrap();
+        assert!(wait_until(TIMEOUT, || matches!(
+            engine.output_status(),
+            StreamStatus::Failed { .. }
+        )));
+        factory.set_default(Some("speakers"));
+        assert!(wait_until(TIMEOUT, || matches!(
+            engine.output_status(),
+            StreamStatus::Running(ref info) if info.device_name == "speakers"
+        )));
         engine.shutdown();
     }
 

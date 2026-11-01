@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use crate::error::{BuildError, WatcherError};
 use crate::mixer::Mixer;
-use crate::sink::{ActiveSink, BuiltSink, DeviceIdentity, SinkFactory, StreamInfo};
+use crate::sink::{
+    ActiveStream, BuiltStream, DeviceIdentity, StreamFactory, StreamInfo, StreamRole,
+};
 use crate::supervisor::{StreamErrorKind, SupervisorMsg};
 use crate::watcher::{DeviceEvent, DeviceWatcher, EventSender, WatcherGuard};
 
@@ -31,21 +33,26 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[derive(Default)]
 struct WatcherState {
-    sender: Option<EventSender>,
+    /// One sender per started supervisor.
+    senders: Vec<EventSender>,
     started: usize,
     guards_dropped: usize,
     fail: bool,
 }
 
-/// A watcher whose events are sent by the test. Clones share state.
+/// A watcher whose events are sent by the test. Clones share state, so one
+/// fake handed to several supervisors broadcasts to all of them, as the OS
+/// does to several platform watchers.
 #[derive(Clone, Default)]
 pub(crate) struct FakeWatcher(Arc<Mutex<WatcherState>>);
 
 impl FakeWatcher {
-    /// Deliver an event as if the OS reported it. False if not started or
-    /// the supervisor is gone.
+    /// Deliver an event to every started supervisor, as if the OS reported
+    /// it. False if none is started or every one is gone.
     pub(crate) fn send(&self, event: DeviceEvent) -> bool {
-        lock(&self.0).sender.as_ref().is_some_and(|s| s.send(event))
+        let mut state = lock(&self.0);
+        state.senders.retain(|s| s.send(event));
+        !state.senders.is_empty()
     }
 
     /// Make `start` fail.
@@ -79,12 +86,13 @@ impl DeviceWatcher for FakeWatcher {
             return Err(WatcherError("fake watcher failure".into()));
         }
         state.started += 1;
-        state.sender = Some(events);
+        state.senders.push(events);
         Ok(Box::new(FakeGuard(Arc::clone(&self.0))))
     }
 }
 
 struct SinkState {
+    role: StreamRole,
     failures_left: usize,
     sample_rate: u32,
     channels: u16,
@@ -111,19 +119,32 @@ struct SinkShared {
     gate: Condvar,
 }
 
-/// A sink factory that records builds instead of opening a device.
+/// An output factory that records builds instead of opening a device.
 /// Clones share state.
 #[derive(Clone)]
 pub(crate) struct FakeSinkFactory(Arc<SinkShared>);
 
 impl FakeSinkFactory {
+    /// A monitor factory whose builds land on the default output `default`.
     pub(crate) fn new(sample_rate: u32, channels: u16, default: &str) -> FakeSinkFactory {
+        FakeSinkFactory::for_role(StreamRole::Monitor, sample_rate, channels, default)
+    }
+
+    /// A factory for `role` whose builds land on the device `target`: the
+    /// default output for the monitor, the matched device for the mic sink.
+    pub(crate) fn for_role(
+        role: StreamRole,
+        sample_rate: u32,
+        channels: u16,
+        target: &str,
+    ) -> FakeSinkFactory {
         FakeSinkFactory(Arc::new(SinkShared {
             state: Mutex::new(SinkState {
+                role,
                 failures_left: 0,
                 sample_rate,
                 channels,
-                default: Some(DeviceIdentity::new(default)),
+                default: Some(DeviceIdentity::new(target)),
                 attempts: 0,
                 identity_queries: 0,
                 builds: Vec::new(),
@@ -174,7 +195,8 @@ impl FakeSinkFactory {
         state.channels = channels;
     }
 
-    /// Identity of the current default output; `None` means no device.
+    /// Identity of the device a build would pick now (the default output for
+    /// the monitor); `None` means no device.
     pub(crate) fn set_default(&self, default: Option<&str>) {
         self.state().default = default.map(DeviceIdentity::new);
     }
@@ -222,7 +244,7 @@ impl FakeSinkFactory {
 
 struct FakeSink(Arc<SinkShared>);
 
-impl ActiveSink for FakeSink {}
+impl ActiveStream for FakeSink {}
 
 impl Drop for FakeSink {
     fn drop(&mut self) {
@@ -230,12 +252,18 @@ impl Drop for FakeSink {
     }
 }
 
-impl SinkFactory for FakeSinkFactory {
+impl StreamFactory for FakeSinkFactory {
+    type Target = Arc<Mutex<Mixer>>;
+
+    fn role(&self) -> StreamRole {
+        self.state().role
+    }
+
     fn build(
         &mut self,
         mixer: Arc<Mutex<Mixer>>,
         on_error: Sender<SupervisorMsg>,
-    ) -> Result<BuiltSink, BuildError> {
+    ) -> Result<BuiltStream, BuildError> {
         let mut state = self.state();
         state.attempts += 1;
         if state.hold {
@@ -275,7 +303,7 @@ impl SinkFactory for FakeSinkFactory {
         Ok((Box::new(FakeSink(Arc::clone(&self.0))), info))
     }
 
-    fn current_default_identity(&mut self) -> Option<DeviceIdentity> {
+    fn current_identity(&mut self) -> Option<DeviceIdentity> {
         let mut state = self.state();
         state.identity_queries += 1;
         state.default.clone()

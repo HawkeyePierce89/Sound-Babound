@@ -151,32 +151,32 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 
 - Modify: `crates/engine/src/sink.rs`, `crates/engine/src/supervisor.rs`, `crates/engine/src/watcher/mod.rs`, `crates/engine/src/cpal_sink.rs`, `crates/engine/src/engine.rs`, `crates/engine/src/test_support.rs`, `crates/engine/src/lib.rs`
 
-- [ ] Introduce `StreamRole { Monitor, MicSink, Capture }`.
-- [ ] `DeviceEvent::rebuild_policy(role)` gives each role its own policy table:
+- [x] Introduce `StreamRole { Monitor, MicSink, Capture }`.
+- [x] `DeviceEvent::rebuild_policy(role)` gives each role its own policy table:
   - Monitor: unchanged from stage 1.
   - MicSink: default output or input changes are ignored; list, state and removed events are identity-checked.
   - Capture: `DefaultInputChanged` always rebuilds; `DefaultOutputChanged` is ignored; list, state and removed events are identity-checked.
-- [ ] Rename `IfDefaultOutputChanged` to `IfIdentityChanged`.
-- [ ] Update `PLATFORM_EVENT_TABLE` to carry a policy per role.
-- [ ] Split the factory side from the realtime state:
+- [x] Rename `IfDefaultOutputChanged` to `IfIdentityChanged`.
+- [x] Update `PLATFORM_EVENT_TABLE` to carry a policy per role.
+- [x] Split the factory side from the realtime state:
   - `StreamFactory` (renamed from `SinkFactory`): `role()`, `build(target, on_error)`, `current_identity()` (the identity a build would pick now).
   - `Endpoint`: the state the supervisor watches, with `target()`, `heartbeat()`, `set_active()`, and housekeeping while there is no stream (offline play handling with the Task 3 grace, and garbage draining).
   - `MixerEndpoint` serves the two output roles; Task 6 adds the capture endpoint.
-- [ ] `spawn_supervisor<F, E, W>` is the single generic supervisor, and each instance starts its own watcher.
-- [ ] Build-failure log throttling for every role:
+- [x] `spawn_supervisor<F, E, W>` is the single generic supervisor, and each instance starts its own watcher.
+- [x] Build-failure log throttling for every role:
   - warn on the first failure of a streak and when the error changes;
   - debug for repeats;
   - info when a build succeeds after failures.
   - It is a small pure `FailureLog` in `supervisor.rs`.
-- [ ] Each supervisor publishes a `StreamStatus` for UI reads: Starting, Running(`StreamInfo`) or Failed(error text and kind). It sits in a control-thread-only `Arc<Mutex<..>>`, never touched by a callback.
-- [ ] `FakeWatcher` broadcasts to every started supervisor. `FakeSinkFactory` takes a role and a target.
-- [ ] Keep every stage 1 supervisor and engine test passing with the monitor role.
-- [ ] Tests:
+- [x] Each supervisor publishes a `StreamStatus` for UI reads: Starting, Running(`StreamInfo`) or Failed(error text and kind). It sits in a control-thread-only `Arc<Mutex<..>>`, never touched by a callback.
+- [x] `FakeWatcher` broadcasts to every started supervisor. `FakeSinkFactory` takes a role and a target.
+- [x] Keep every stage 1 supervisor and engine test passing with the monitor role.
+- [x] Tests:
   - the role policy tables;
   - `FailureLog` sequences;
   - status transitions;
   - one fake watcher feeding two supervisors.
-- [ ] Run the verification gates. All must pass before Task 6.
+- [x] Run the verification gates. All must pass before Task 6.
 
 ### Task 6: Passthrough ring, drift controller and resampler
 
