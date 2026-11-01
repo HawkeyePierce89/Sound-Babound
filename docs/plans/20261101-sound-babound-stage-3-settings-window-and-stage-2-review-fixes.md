@@ -259,19 +259,19 @@ Part B fixes the five findings from the stage 2 acceptance review:
 - Modify: `crates/app/src/config.rs`
 - Create: `crates/app/src/settings/mod.rs` (module declarations only for now), `crates/app/src/settings/save.rs`
 
-- [ ] `config::update_config(path, edit: impl FnOnce(&mut DocumentMut) -> Result<()>)` does the whole sequence once:
+- [x] `config::update_config(path, edit: impl FnOnce(&mut DocumentMut) -> Result<()>)` does the whole sequence once:
   - canonicalize;
   - read;
   - parse to `DocumentMut`, leaving an invalid file untouched;
   - run `edit`;
   - `write_atomically`.
   - `set_mic_enabled` is rewritten on top of it, with no duplicated read, parse or write code.
-- [ ] `settings/save.rs`, a pure `apply_sounds(doc, loaded: &[RawSound], rows: &[SoundRow]) -> Result<()>`:
+- [x] `settings/save.rs`, a pure `apply_sounds(doc, loaded: &[RawSound], rows: &[SoundRow]) -> Result<()>`:
   - It refuses with a clear error if the document's current `[[sound]]` entries no longer equal `loaded`, meaning the file's sounds changed since the window opened. A `[mic] enabled` toggle by the tray meanwhile is not a change to the sounds and is kept.
   - It rebuilds the array of tables in row order. A row from the file updates `name`, `path` and `hotkey` in its original table, keeping `gain`, unknown keys, comments and decor. No hotkey removes the key. A new row is a new table with `name`, `path` and optionally `hotkey`. Removed rows are dropped.
   - It creates the `[[sound]]` array if the file had none.
-- [ ] `save_sounds(path, loaded, rows)` = `update_config` + `apply_sounds`.
-- [ ] Tests:
+- [x] `save_sounds(path, loaded, rows)` = `update_config` + `apply_sounds`.
+- [x] Tests:
   - round trip on `DEFAULT_CONFIG`: rename a sound, set and clear hotkeys, add one and remove one. Every comment, `[mic]`, `master_gain` and `stop_all_hotkey` stay byte-identical outside the edited entries, and the result parses with `config::parse` to the expected sounds;
   - a per-sound `gain` and an unknown key survive;
   - a concurrent `[mic] enabled` change is kept;
@@ -279,7 +279,8 @@ Part B fixes the five findings from the stage 2 acceptance review:
   - an invalid file stays untouched;
   - `set_mic_enabled`'s existing tests still pass;
   - a save through a symlink writes the target (`TempDir`).
-- [ ] Run the verification gates. All must pass before Task 8.
+  - Note: `SoundRow` (with `original: Option<usize>`) lives in `settings/save.rs` for now; Task 8's form reuses it. The comment above the first `[[sound]]` entry is treated as the list's comment and moves to whichever entry comes first; entries print where the first one stood (by toml_edit table position), at the end of the file if there was none; an inline `sound = [...]` array becomes tables; removing every sound removes the key. `config::replace_value` is shared by both writers. `mod settings` carries a `cfg_attr(not(test), expect(dead_code))` until Task 10 uses it.
+- [x] Run the verification gates. All must pass before Task 8.
 
 ### Task 8: Settings form state, key mapping and validation (egui-free)
 

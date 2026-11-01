@@ -1,6 +1,7 @@
 //! TOML configuration: raw serde model, default template, path resolution,
 //! the validated [`ResolvedConfig`] produced by [`crate::hotkeys::resolve`],
-//! and the comment-preserving [`set_mic_enabled`] writer.
+//! and the comment-preserving [`update_config`] editor with its
+//! [`set_mic_enabled`] writer.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -264,26 +265,35 @@ impl Default for MicConfig {
     }
 }
 
-/// Sets `[mic] enabled` in the config file at `path`, creating the table if
-/// it is missing. Every other key, comment and blank line is kept. The file
-/// is replaced atomically (a temp file in the same folder, then a rename), so
-/// a crash leaves either the old or the new file. A file that is not valid
-/// TOML is left untouched and reported as an error.
-pub fn set_mic_enabled(path: &Path, enabled: bool) -> Result<()> {
+/// Edits the config file at `path` in place: reads it, parses it into a
+/// [`DocumentMut`], runs `edit` on the document and replaces the file with
+/// the result atomically (a temp file in the same folder, then a rename), so
+/// a crash leaves either the old or the new file. A symlink is written
+/// through to the file it points at. Every key, comment and blank line that
+/// `edit` leaves alone is kept. A file that is not valid TOML, or an `edit`
+/// that fails, leaves the file untouched and is reported as an error naming
+/// the path.
+pub fn update_config(path: &Path, edit: impl FnOnce(&mut DocumentMut) -> Result<()>) -> Result<()> {
     // Write through a symlink to the file it points at.
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let text = fs::read_to_string(&path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
-    let updated = with_mic_enabled(&text, enabled)
-        .with_context(|| format!("failed to update config {}", path.display()))?;
-    write_atomically(&path, &updated)
-}
-
-/// `text` with `[mic] enabled` set to `enabled`.
-fn with_mic_enabled(text: &str, enabled: bool) -> Result<String> {
     let mut doc: DocumentMut = text
         .parse()
-        .map_err(|err| anyhow!("invalid config: {err}"))?;
+        .map_err(|err| anyhow!("invalid config: {err}"))
+        .with_context(|| format!("failed to update config {}", path.display()))?;
+    edit(&mut doc).with_context(|| format!("failed to update config {}", path.display()))?;
+    write_atomically(&path, &doc.to_string())
+}
+
+/// Sets `[mic] enabled` in the config file at `path`, creating the table if
+/// it is missing, through [`update_config`].
+pub fn set_mic_enabled(path: &Path, enabled: bool) -> Result<()> {
+    update_config(path, |doc| set_enabled(doc, enabled))
+}
+
+/// Sets `[mic] enabled` to `enabled` in `doc`.
+fn set_enabled(doc: &mut DocumentMut, enabled: bool) -> Result<()> {
     let mic = doc.entry("mic").or_insert_with(toml_edit::table);
     if let Some(table) = mic.as_table_mut() {
         // A table only implied by `[mic.x]` headers would not print its keys.
@@ -293,17 +303,20 @@ fn with_mic_enabled(text: &str, enabled: bool) -> Result<String> {
         bail!("`mic` is not a table");
     };
     match mic.get_mut("enabled").and_then(Item::as_value_mut) {
-        Some(value) => {
-            // Keep the spacing and any trailing comment on the line.
-            let decor = value.decor().clone();
-            *value = Value::from(enabled);
-            *value.decor_mut() = decor;
-        }
+        Some(value) => replace_value(value, Value::from(enabled)),
         None => {
             mic.insert("enabled", toml_edit::value(enabled));
         }
     }
-    Ok(doc.to_string())
+    Ok(())
+}
+
+/// Replaces `value` with `new`, keeping its spacing and any trailing comment
+/// on the line.
+pub fn replace_value(value: &mut Value, new: Value) {
+    let decor = value.decor().clone();
+    *value = new;
+    *value.decor_mut() = decor;
 }
 
 /// Replaces `path` with `text` through a temp file and a rename.

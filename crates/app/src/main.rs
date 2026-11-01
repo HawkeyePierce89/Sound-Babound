@@ -8,6 +8,11 @@ mod icon;
 mod logging;
 mod paths;
 mod platform;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the settings window (stage 3, Task 10) uses it")
+)]
+mod settings;
 #[cfg(test)]
 mod test_support;
 mod tray_app;
