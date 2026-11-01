@@ -83,18 +83,18 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 
 - Modify: `crates/engine/src/supervisor.rs`
 
-- [ ] Add `startup_grace: Duration` (default 10 s) to `Timings`.
-- [ ] `on_build_result` takes the heartbeat value read just before `build`, as the baseline.
-- [ ] `ActiveStream` records `built_at` and whether the heartbeat has moved past the baseline.
-- [ ] Until the first change past the baseline, the watchdog deadline is `built_at + startup_grace`. After that it is `last_beat_at + stall`. `next_deadline` returns the same deadlines.
-- [ ] Worker: read the heartbeat before calling `build` and pass it on.
-- [ ] Update `heartbeat_that_never_moves_after_build_rebuilds` to the 10 s grace.
-- [ ] Add fake-clock tests:
+- [x] Add `startup_grace: Duration` (default 10 s) to `Timings`.
+- [x] `on_build_result` takes the heartbeat value read just before `build`, as the baseline.
+- [x] `ActiveStream` records `built_at` and whether the heartbeat has moved past the baseline.
+- [x] Until the first change past the baseline, the watchdog deadline is `built_at + startup_grace`. After that it is `last_beat_at + stall`. `next_deadline` returns the same deadlines.
+- [x] Worker: read the heartbeat before calling `build` and pass it on.
+- [x] Update `heartbeat_that_never_moves_after_build_rebuilds` to the 10 s grace.
+- [x] Add fake-clock tests:
   - a first callback at 5 s does not rebuild;
   - no callback for 10 s rebuilds;
   - a running stream whose heartbeat then stops for 2 s still rebuilds;
   - a callback that lands between `build` and the first sample counts as started.
-- [ ] Run the verification gates. All must pass before Task 2.
+- [x] Run the verification gates. All must pass before Task 2.
 
 ### Task 2: Device-changed stream errors at debug (Part A.4)
 

@@ -24,7 +24,18 @@
 //!
 //! While no stream is running (initial start, retry backoff) every
 //! non-ignored event rebuilds. A failed build is retried after a backoff, and
-//! a stream whose callback heartbeat stops advancing is rebuilt. `Engine::play`
+//! a stream whose callback heartbeat stops advancing is rebuilt.
+//!
+//! # Stall watchdog
+//!
+//! The heartbeat is read just before every build; that value is the
+//! baseline. Until the heartbeat first moves past it, the stream is still
+//! starting (some devices take seconds to deliver their first callback), and
+//! it is rebuilt only if [`Timings::startup_grace`] passes since the build.
+//! Once it has moved, the stream is rebuilt if the heartbeat stands still for
+//! [`Timings::stall`].
+//!
+//! `Engine::play`
 //! rejects plays while no stream runs; a play that passed that check just
 //! before the stream went away is dropped here if no stream replaces it (see
 //! `Mixer::apply_offline`). A rebuild from a live stream keeps the command
@@ -64,8 +75,12 @@ pub struct Timings {
     pub debounce: Duration,
     /// Delay before retrying a failed build.
     pub retry: Duration,
-    /// How long the callback heartbeat may stand still before a rebuild.
+    /// How long the callback heartbeat may stand still before a rebuild,
+    /// once the stream has started.
     pub stall: Duration,
+    /// How long a new stream may take to deliver its first callback before a
+    /// rebuild.
+    pub startup_grace: Duration,
 }
 
 impl Default for Timings {
@@ -74,6 +89,7 @@ impl Default for Timings {
             debounce: Duration::from_millis(200),
             retry: Duration::from_secs(1),
             stall: Duration::from_secs(2),
+            startup_grace: Duration::from_secs(10),
         }
     }
 }
@@ -107,8 +123,24 @@ struct Window {
 #[derive(Debug, Clone)]
 struct ActiveStream {
     identity: DeviceIdentity,
-    last_beat: Option<u64>,
+    built_at: Instant,
+    /// Whether the heartbeat has moved past the value read before the build.
+    started: bool,
+    /// The baseline until `started`, then the last value seen.
+    last_beat: u64,
+    /// When `last_beat` was first seen; meaningful once `started`.
     last_beat_at: Instant,
+}
+
+impl ActiveStream {
+    /// When the watchdog rebuilds this stream if the heartbeat stays put.
+    fn stall_deadline(&self, timings: &Timings) -> Instant {
+        if self.started {
+            self.last_beat_at + timings.stall
+        } else {
+            self.built_at + timings.startup_grace
+        }
+    }
 }
 
 /// The supervisor's pure decision logic. See the module docs.
@@ -147,12 +179,23 @@ impl SupervisorCore {
 
     /// Record the result of a build: `Some` with the identity the stream was
     /// built on, or `None` if the build failed (retried after the backoff).
-    pub fn on_build_result(&mut self, identity: Option<DeviceIdentity>, now: Instant) {
+    ///
+    /// `baseline` is the heartbeat read just before the build. The stream
+    /// counts as started once a sample differs from it, so a callback that
+    /// runs between the build and the first sample is not missed.
+    pub fn on_build_result(
+        &mut self,
+        identity: Option<DeviceIdentity>,
+        baseline: u64,
+        now: Instant,
+    ) {
         match identity {
             Some(identity) => {
                 self.stream = Some(ActiveStream {
                     identity,
-                    last_beat: None,
+                    built_at: now,
+                    started: false,
+                    last_beat: baseline,
                     last_beat_at: now,
                 });
                 self.build_at = None;
@@ -166,18 +209,16 @@ impl SupervisorCore {
 
     /// Record the mixer's callback heartbeat as sampled at `now`.
     ///
-    /// The first sample after a build is the baseline; the stall clock starts
-    /// at the build and restarts whenever the value changes.
+    /// The first change from the build's baseline marks the stream as
+    /// started; from then on the stall clock restarts whenever the value
+    /// changes.
     pub fn on_heartbeat(&mut self, value: u64, now: Instant) {
-        if let Some(stream) = &mut self.stream {
-            match stream.last_beat {
-                Some(last) if last == value => {}
-                Some(_) => {
-                    stream.last_beat = Some(value);
-                    stream.last_beat_at = now;
-                }
-                None => stream.last_beat = Some(value),
-            }
+        if let Some(stream) = &mut self.stream
+            && stream.last_beat != value
+        {
+            stream.started = true;
+            stream.last_beat = value;
+            stream.last_beat_at = now;
         }
     }
 
@@ -198,7 +239,7 @@ impl SupervisorCore {
             return Some(self.begin_rebuild());
         }
         if let Some(stream) = &self.stream
-            && now.saturating_duration_since(stream.last_beat_at) >= self.timings.stall
+            && now >= stream.stall_deadline(&self.timings)
         {
             return Some(self.begin_rebuild());
         }
@@ -224,7 +265,7 @@ impl SupervisorCore {
         let stall = self
             .stream
             .as_ref()
-            .map(|s| s.last_beat_at + self.timings.stall);
+            .map(|s| s.stall_deadline(&self.timings));
         [self.window.map(|w| w.deadline), self.build_at, stall]
             .into_iter()
             .flatten()
@@ -443,6 +484,9 @@ impl<F: SinkFactory> Worker<F> {
         }
         drop(self.sink.take());
         self.shared.set_output_active(false);
+        // Read before the build, so a callback that runs before the next
+        // sample still counts as the stream starting.
+        let baseline = self.shared.callback_heartbeat();
         match self
             .factory
             .build(Arc::clone(&self.mixer), self.sender.clone())
@@ -458,11 +502,11 @@ impl<F: SinkFactory> Worker<F> {
                 self.sink = Some(sink);
                 self.shared.set_output_active(true);
                 self.core
-                    .on_build_result(Some(info.identity), Instant::now());
+                    .on_build_result(Some(info.identity), baseline, Instant::now());
             }
             Err(err) => {
                 warn!(error = %err, "output stream build failed; will retry");
-                self.core.on_build_result(None, Instant::now());
+                self.core.on_build_result(None, baseline, Instant::now());
             }
         }
     }
@@ -487,7 +531,7 @@ mod tests {
     fn running(t0: Instant, name: &str) -> SupervisorCore {
         let mut core = SupervisorCore::new(Timings::default(), t0);
         assert_eq!(core.poll(t0), Some(Action::Rebuild));
-        core.on_build_result(Some(id(name)), t0);
+        core.on_build_result(Some(id(name)), 0, t0);
         core
     }
 
@@ -509,13 +553,13 @@ mod tests {
             match core.poll(t) {
                 Some(Action::Rebuild) => {
                     rebuilds += 1;
-                    core.on_build_result(current.map(id), t);
+                    core.on_build_result(current.map(id), *beat, t);
                 }
                 Some(Action::CheckDefault) => {
                     checks += 1;
                     if core.resolve_check(current.map(id)) == CheckOutcome::Rebuild {
                         rebuilds += 1;
-                        core.on_build_result(current.map(id), t);
+                        core.on_build_result(current.map(id), *beat, t);
                     }
                 }
                 None => {}
@@ -532,7 +576,7 @@ mod tests {
         assert!(!core.has_stream());
         assert_eq!(core.next_deadline(), Some(t0));
         assert_eq!(core.poll(t0), Some(Action::Rebuild));
-        core.on_build_result(Some(id("spk")), t0);
+        core.on_build_result(Some(id("spk")), 0, t0);
         assert!(core.has_stream());
         assert_eq!(core.built_on(), Some(&id("spk")));
         assert_eq!(core.poll(t0 + ms(10)), None);
@@ -570,15 +614,15 @@ mod tests {
         let t0 = Instant::now();
         let mut core = SupervisorCore::new(Timings::default(), t0);
         assert_eq!(core.poll(t0), Some(Action::Rebuild));
-        core.on_build_result(None, t0);
+        core.on_build_result(None, 0, t0);
         assert!(!core.has_stream());
         assert_eq!(core.next_deadline(), Some(t0 + ms(1000)));
         assert_eq!(core.poll(t0 + ms(999)), None);
         assert_eq!(core.poll(t0 + ms(1000)), Some(Action::Rebuild));
-        core.on_build_result(None, t0 + ms(1000));
+        core.on_build_result(None, 0, t0 + ms(1000));
         assert_eq!(core.poll(t0 + ms(1999)), None);
         assert_eq!(core.poll(t0 + ms(2000)), Some(Action::Rebuild));
-        core.on_build_result(Some(id("spk")), t0 + ms(2000));
+        core.on_build_result(Some(id("spk")), 0, t0 + ms(2000));
 
         let mut beat = 0;
         assert_eq!(
@@ -598,7 +642,7 @@ mod tests {
         let t0 = Instant::now();
         let mut core = SupervisorCore::new(Timings::default(), t0);
         assert_eq!(core.poll(t0), Some(Action::Rebuild));
-        core.on_build_result(None, t0);
+        core.on_build_result(None, 0, t0);
         core.on_event(RebuildPolicy::IfDefaultOutputChanged, t0 + ms(100));
         assert_eq!(core.poll(t0 + ms(299)), None);
         // No stream is active, so even an identity-checked event rebuilds.
@@ -618,13 +662,99 @@ mod tests {
         assert!(!core.has_stream());
     }
 
+    /// A core with a stream built on "spk" at `t0` on heartbeat `baseline`.
+    fn built_with_baseline(t0: Instant, baseline: u64) -> SupervisorCore {
+        let mut core = SupervisorCore::new(Timings::default(), t0);
+        assert_eq!(core.poll(t0), Some(Action::Rebuild));
+        core.on_build_result(Some(id("spk")), baseline, t0);
+        core
+    }
+
     #[test]
     fn heartbeat_that_never_moves_after_build_rebuilds() {
         let t0 = Instant::now();
-        let mut core = running(t0, "spk");
+        let mut core = built_with_baseline(t0, 3);
         core.on_heartbeat(3, t0 + ms(100));
-        core.on_heartbeat(3, t0 + ms(1900));
-        assert_eq!(core.poll(t0 + ms(2000)), Some(Action::Rebuild));
+        core.on_heartbeat(3, t0 + ms(9900));
+        assert_eq!(core.next_deadline(), Some(t0 + ms(10_000)));
+        assert_eq!(core.poll(t0 + ms(9999)), None);
+        assert_eq!(core.poll(t0 + ms(10_000)), Some(Action::Rebuild));
+    }
+
+    #[test]
+    fn first_callback_at_five_seconds_does_not_rebuild() {
+        let t0 = Instant::now();
+        let mut core = built_with_baseline(t0, 0);
+        // Well past the 2 s stall time, but inside the startup grace.
+        let mut t = t0;
+        while t < t0 + ms(5000) {
+            core.on_heartbeat(0, t);
+            assert_eq!(core.poll(t), None, "{:?}", t - t0);
+            t += ms(10);
+        }
+        // The first callback lands; from now on the stall clock applies.
+        let mut beat = 0;
+        assert_eq!(
+            drive(&mut core, t, t0 + ms(15_000), Some("spk"), &mut beat),
+            (0, 0)
+        );
+        assert!(core.has_stream());
+    }
+
+    #[test]
+    fn no_callback_for_the_startup_grace_rebuilds() {
+        let t0 = Instant::now();
+        let mut core = built_with_baseline(t0, 0);
+        let mut t = t0;
+        while t < t0 + ms(10_000) {
+            core.on_heartbeat(0, t);
+            assert_eq!(core.poll(t), None, "{:?}", t - t0);
+            t += ms(10);
+        }
+        core.on_heartbeat(0, t);
+        assert_eq!(core.poll(t), Some(Action::Rebuild));
+        assert!(!core.has_stream());
+    }
+
+    #[test]
+    fn running_stream_that_stops_still_rebuilds_after_the_stall_time() {
+        let t0 = Instant::now();
+        let mut core = built_with_baseline(t0, 0);
+        let mut beat = 0;
+        assert_eq!(
+            drive(&mut core, t0, t0 + ms(1000), Some("spk"), &mut beat),
+            (0, 0)
+        );
+        // The heartbeat stops at 1 s, long before the startup grace ends.
+        core.on_heartbeat(beat, t0 + ms(1500));
+        assert_eq!(core.next_deadline(), Some(t0 + ms(3000)));
+        assert_eq!(core.poll(t0 + ms(2999)), None);
+        assert_eq!(core.poll(t0 + ms(3000)), Some(Action::Rebuild));
+    }
+
+    #[test]
+    fn callback_before_the_first_sample_counts_as_started() {
+        let t0 = Instant::now();
+        // The heartbeat was 7 before the build; a callback ran before the
+        // supervisor's first sample, which already reads 8.
+        let mut core = built_with_baseline(t0, 7);
+        core.on_heartbeat(8, t0 + ms(100));
+        core.on_heartbeat(8, t0 + ms(1000));
+        // Started, so the stall time applies instead of the startup grace.
+        assert_eq!(core.next_deadline(), Some(t0 + ms(2100)));
+        assert_eq!(core.poll(t0 + ms(2099)), None);
+        assert_eq!(core.poll(t0 + ms(2100)), Some(Action::Rebuild));
+    }
+
+    #[test]
+    fn every_build_gets_a_fresh_startup_grace() {
+        let t0 = Instant::now();
+        let mut core = built_with_baseline(t0, 0);
+        assert_eq!(core.poll(t0 + ms(10_000)), Some(Action::Rebuild));
+        let t1 = t0 + ms(10_000);
+        core.on_build_result(Some(id("spk")), 0, t1);
+        assert_eq!(core.next_deadline(), Some(t1 + ms(10_000)));
+        assert_eq!(core.poll(t1 + ms(9999)), None);
     }
 
     #[test]
@@ -656,8 +786,8 @@ mod tests {
                 t0 + ms(10 * i),
             );
         }
-        // Only the stall watchdog is pending.
-        assert_eq!(core.next_deadline(), Some(t0 + ms(2000)));
+        // Only the stall watchdog is pending, still in its startup grace.
+        assert_eq!(core.next_deadline(), Some(t0 + ms(10_000)));
         let mut beat = 0;
         assert_eq!(
             drive(&mut core, t0, t0 + ms(3000), Some("spk"), &mut beat),
@@ -725,6 +855,7 @@ mod tests {
             debounce: ms(50),
             retry: ms(50),
             stall: Duration::from_secs(3600),
+            startup_grace: Duration::from_secs(3600),
         }
     }
 
@@ -811,7 +942,11 @@ mod tests {
             factory.clone(),
             FakeWatcher::default(),
             Arc::new(MixerShared::new()),
-            Timings { stall, ..fast() },
+            Timings {
+                stall,
+                startup_grace: stall,
+                ..fast()
+            },
         )
         .unwrap()
     }
@@ -831,7 +966,7 @@ mod tests {
     fn live_callback_does_not_rebuild_on_the_thread() {
         let factory = FakeSinkFactory::new(48_000, 2, "spk");
         // Longer than DRAIN_INTERVAL, so the thread samples the heartbeat
-        // (taking its baseline) before the stall deadline.
+        // (seeing it move past the build's baseline) before the deadline.
         let handle = spawn_with_stall(&factory, ms(300));
         assert!(wait_until(WAIT, || factory.builds().len() == 1));
         let mixer = factory.mixer().unwrap();
