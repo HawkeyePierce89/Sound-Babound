@@ -1194,7 +1194,9 @@ mod tests {
         let passthrough = backends.capture.passthrough().unwrap();
 
         // The microphone reaches the mic sink, and so does a sound.
-        passthrough.write(&[0.25f32; 4800], 1);
+        for block in [0.25f32; 4800].chunks(480) {
+            passthrough.write(block, 1);
+        }
         assert!(!is_silent(&render(&mixer)));
         assert!(engine.play(&tone(), 1.0));
         assert!(!is_silent(&render(&mixer)));
@@ -1607,8 +1609,10 @@ mod tests {
         let passthrough = backends.capture.passthrough().unwrap();
         assert_eq!(passthrough.capture_rate(), 48_000);
 
-        // 100 ms of capture, past the 30 ms priming target.
-        passthrough.write(&[0.25f32; 4_800], 1);
+        // 100 ms of capture in 10 ms blocks, past the 30 ms priming target.
+        for block in [0.25f32; 4_800].chunks(480) {
+            passthrough.write(block, 1);
+        }
         let mic_block = render(&mic);
         assert!(mic_block.iter().any(|s| (s - 0.25).abs() < 1e-3));
         assert!(is_silent(&render(&monitor)));

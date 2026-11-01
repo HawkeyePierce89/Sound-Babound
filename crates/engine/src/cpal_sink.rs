@@ -395,13 +395,18 @@ fn buffer_duration(samples: usize, channels: u16, rate: u32) -> Duration {
 }
 
 /// Render `out` in chunks of the mixer's preallocated scratch size and
-/// convert each chunk. Anything that cannot be rendered (an unconfigured
-/// mixer, a trailing partial frame) is filled with silence.
+/// convert each chunk. The whole callback's frame count is announced first
+/// ([`Mixer::begin_callback`]), so the passthrough sizes its target to the
+/// device block rather than to a chunk. Anything that cannot be rendered (an
+/// unconfigured mixer, a trailing partial frame) is filled with silence.
 pub(crate) fn render_into<T>(mixer: &mut Mixer, out: &mut [T])
 where
     T: OutputSample,
 {
     let channels = usize::from(mixer.channels());
+    if let Some(frames) = out.len().checked_div(channels) {
+        mixer.begin_callback(frames);
+    }
     let mut rest = out;
     // `checked_div` is `None` for an unconfigured mixer (0 channels).
     while let Some(frames @ 1..) = rest.len().checked_div(channels) {
@@ -525,6 +530,36 @@ mod tests {
         let mut got = vec![0i16; frames];
         render_into(&mut chunked, &mut got);
         assert_eq!(expected, got);
+    }
+
+    #[test]
+    fn render_into_announces_the_whole_callback_before_chunking() {
+        let passthrough = Arc::new(crate::passthrough::PassthroughShared::new());
+        passthrough.begin_capture(48_000);
+        let mut mixer = Mixer::with_passthrough(Arc::new(MixerShared::new()), passthrough.reader());
+        mixer.configure(48_000, 2);
+        let block = [0.5f32; 2_048];
+        let mut out = vec![0.0f32; 2 * 2_048];
+
+        // 2048-frame capture and sink blocks. The first callback publishes the
+        // target for the whole callback (one sink block plus one capture block
+        // plus 5 ms), not for a 1024-frame chunk (3312 samples).
+        passthrough.write(&block, 1);
+        render_into(&mut mixer, &mut out);
+        assert_eq!(passthrough.published_target(), 4_336);
+        assert!(out.iter().all(|&s| s == 0.0), "still priming");
+
+        // With a chunk-sized target, the high mark (3312 + 2400) would trim
+        // this, and every callback would run the ring empty.
+        passthrough.write(&block, 1);
+        passthrough.write(&block, 1);
+        for _ in 0..20 {
+            render_into(&mut mixer, &mut out);
+            assert!(out.iter().all(|&s| (s - 0.5).abs() < 1e-6), "primed");
+            passthrough.write(&block, 1);
+        }
+        assert_eq!(passthrough.underruns(), 0);
+        assert_eq!(passthrough.overruns(), 0);
     }
 
     #[test]

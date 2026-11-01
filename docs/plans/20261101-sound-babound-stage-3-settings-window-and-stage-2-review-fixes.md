@@ -134,23 +134,23 @@ Part B fixes the five findings from the stage 2 acceptance review:
 **Files:**
 - Modify: `crates/engine/src/passthrough.rs`, `crates/engine/src/mixer.rs`, `crates/engine/src/cpal_sink.rs`, `crates/engine/src/platform/macos.rs`
 
-- [ ] `platform/macos.rs`: `MIC_PERIOD_MS = Some(10)`, with the doc comment explaining why. A DAW sets the device buffer to 1024–4096 frames, and `mic_buffer_size` clamps the request to the device's range.
-- [ ] Block sizes:
+- [x] `platform/macos.rs`: `MIC_PERIOD_MS = Some(10)`, with the doc comment explaining why. A DAW sets the device buffer to 1024–4096 frames, and `mic_buffer_size` clamps the request to the device's range.
+- [x] Block sizes:
   - `PassthroughShared` records the largest capture block written, in frames, with an atomic `fetch_max` in `write`. `begin_capture` resets it.
   - `PassthroughReader` records the largest sink block. A new `note_block(frames)` raises it, and `read` also raises it to `out.len()`. It is reset when the mixer is configured, since a new stream may have a new buffer size.
   - `Mixer` gets a realtime-safe `begin_callback(frames)` that forwards to the reader (a no-op without one). `cpal_sink::render_into` calls it with the whole callback's frame count before rendering chunks.
-- [ ] Effective target, in capture-rate samples:
+- [x] Effective target, in capture-rate samples:
   - `max(TARGET_FILL, sink block + capture block + BLOCK_MARGIN)`, with the sink block converted from the sink rate.
   - `BLOCK_MARGIN` must keep the target at exactly 30 ms for the existing tests' blocks (480 capture / 512 sink at 44.1–48 kHz); about 5 ms does. Tune it against the new tests.
   - It is computed before the priming check, so the first read of a long block already primes to the larger target.
   - The reader publishes it to an atomic in `PassthroughShared`.
-- [ ] The writer's high mark is `target + max(HIGH_MARK_MARGIN, capture block + BLOCK_MARGIN)`, using the published target, or `TARGET_FILL` before any is published.
-- [ ] The controller's error uses the effective target.
-- [ ] Realtime rules: only atomics and arithmetic are added; no allocation, no lock, no I/O.
-- [ ] Drift simulation:
+- [x] The writer's high mark is `target + max(HIGH_MARK_MARGIN, capture block + BLOCK_MARGIN)`, using the published target, or `TARGET_FILL` before any is published.
+- [x] The controller's error uses the effective target.
+- [x] Realtime rules: only atomics and arithmetic are added; no allocation, no lock, no I/O.
+- [x] Drift simulation:
   - `simulate` takes the capture and sink block sizes as parameters. The four existing tests keep 480/512 and their assertions unchanged.
   - The sink side calls `note_block(sink block)` and then reads in `mixer::SCRATCH_FRAMES` chunks, as production does.
-- [ ] New drift tests, each run with the existing three sink clocks for 10 simulated minutes:
+- [x] New drift tests, each run with the existing three sink clocks for 10 simulated minutes:
   - 2048 capture / 2048 sink at 48k/48k;
   - 480 capture / 2048 sink at 48k/48k;
   - 2048 capture / 480 sink at 48k/48k;
@@ -160,14 +160,15 @@ Part B fixes the five findings from the stage 2 acceptance review:
     - audible output;
     - fill within the effective target ± (20 ms + one capture block) after 5 s;
     - late mean correction within 20 ppm of the real clock ratio.
-- [ ] Unit tests:
+  - Note: 2048/2048 at ±200 ppm cannot meet the one-minute late mean. With equal block periods the fill seen before a read is a staircase that steps by one capture block at each slip (every ~3.5 min), so the controller corrects in a burst (~25 s at 0.2 %) per slip and sits near 0 in between. The reader only sees the callback order, not time, so no controller can spread that out. That test checks the mean correction from 60 s to the end instead: within 20 ppm plus one capture block over that span (~92 ppm), so a zero correction still fails. The other three keep the late 20 ppm check. The controller also steps once per announced callback rather than once per 1024-frame chunk, since the later chunks of a long callback see a lower fill and biased it by about 100 ppm.
+- [x] Unit tests:
   - the target stays 30 ms for 512-frame blocks and grows for 2048-frame blocks;
   - `begin_capture` and `configure` reset the recorded block sizes;
   - the high mark follows the target;
   - `render_into` announces the whole callback size before chunking (a mixer with a reader primes and stays primed over a 2048-frame callback);
   - rendering with `begin_callback` allocates nothing (the existing allocation-check pattern).
-- [ ] Revert check: replace the effective target with `TARGET_FILL` (and the high mark with the old one) and confirm the 2048 tests fail and the four old ones pass. Then restore.
-- [ ] Run the verification gates. All must pass before Task 4.
+- [x] Revert check: replace the effective target with `TARGET_FILL` (and the high mark with the old one) and confirm the 2048 tests fail and the four old ones pass. Then restore.
+- [x] Run the verification gates. All must pass before Task 4.
 
 ### Task 4: Bounded PulseAudio probe connect and probe backoff (B.2)
 
