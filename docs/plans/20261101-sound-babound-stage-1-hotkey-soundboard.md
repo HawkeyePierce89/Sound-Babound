@@ -82,31 +82,31 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
 **Files:**
 - Create: `crates/engine/src/error.rs`, `crates/engine/src/sound.rs`, `crates/engine/examples/gen_demo_wav.rs`, `crates/app/assets/demo.wav`
 
-- [ ] `error.rs`:
+- [x] `error.rs`:
   - `LoadError`: `Io`, `Unsupported`, `NoAudioTrack`, `Decode`, `Empty`; each carries the source label.
   - `BuildError`: `NoDevice`, `UnsupportedFormat`, `Backend(String)`.
-- [ ] `sound.rs`: a `Sound` handle that is a cheap-clone `Arc<SoundData>`. `SoundData` holds:
+- [x] `sound.rs`: a `Sound` handle that is a cheap-clone `Arc<SoundData>`. `SoundData` holds:
   - interleaved `Vec<f32>` samples
   - `sample_rate`
   - `channels`
   - `frames`
   - display label
-- [ ] `Sound::load_file(path)` and `Sound::load_bytes(bytes, label)`:
+- [x] `Sound::load_file(path)` and `Sound::load_bytes(bytes, label)`:
   - Decode the whole file with symphonia (WAV/FLAC/OGG-Vorbis/MP3) into interleaved f32 at native rate and channel count.
   - Tolerate recoverable decode errors mid-stream, but return `Err` when nothing could be decoded.
   - Never panic.
-- [ ] `examples/gen_demo_wav.rs`:
+- [x] `examples/gen_demo_wav.rs`:
   - A deterministic synthesizer for a ~1.5 s two-tone chime with exponential decay: 44.1 kHz, mono, 16-bit PCM, with a hand-written WAV header and no new dependency.
   - Run it once to produce `crates/app/assets/demo.wav` and commit the file.
   - Mono at 44.1 kHz deliberately exercises resampling and mono-to-stereo mapping.
-- [ ] Write tests (tests write small WAV byte buffers with an in-test helper):
+- [x] Write tests (tests write small WAV byte buffers with an in-test helper):
   - mono 44.1 kHz and stereo 48 kHz decode to the correct frames, rate and channels
   - sample values round-trip within tolerance
   - garbage bytes give `LoadError`, not a panic
   - an empty data chunk gives `LoadError::Empty`
   - a missing file gives `LoadError::Io`
   - the committed `demo.wav` (via `include_bytes!` in the test) decodes
-- [ ] Run the test suite. It must pass before Task 3.
+- [x] Run the test suite. It must pass before Task 3.
 
 ### Task 3: Realtime mixer
 
