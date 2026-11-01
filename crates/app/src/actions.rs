@@ -246,17 +246,27 @@ pub fn fallback_board() -> Result<Soundboard> {
     board_from_text(DEFAULT_CONFIG, Path::new(".")).context("built-in default config is invalid")
 }
 
-/// The board to start with. Falls back to the built-in default config only
-/// if the config file is unknown or unreadable; a malformed config file is
-/// an error.
+/// The board to start with. Falls back to the built-in default config if
+/// the config file is unknown, unreadable or malformed, so the tray always
+/// starts. A malformed file is logged at error level with its path; the
+/// caller keeps the path, so the fixed file can be loaded with a reload.
 pub fn startup_board(path: Option<&Path>) -> Result<Soundboard> {
     let Some(path) = path else {
         tracing::warn!("no config file; using the built-in default config");
         return fallback_board();
     };
     match fs::read_to_string(path) {
-        Ok(text) => board_from_text(&text, config_dir_of(path))
-            .with_context(|| format!("failed to parse config {}", path.display())),
+        Ok(text) => match board_from_text(&text, config_dir_of(path)) {
+            Ok(board) => Ok(board),
+            Err(err) => {
+                tracing::error!(
+                    path = %path.display(),
+                    "failed to parse config: {err:#}; using the built-in default config \
+                     until the file is fixed and reloaded"
+                );
+                fallback_board()
+            }
+        },
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
@@ -463,11 +473,39 @@ mod tests {
     }
 
     #[test]
-    fn startup_rejects_a_malformed_config() {
+    fn startup_falls_back_on_malformed_config() {
         let dir = TempDir::new("actions-malformed");
         let path = write_config(&dir, "master_gain = [\n");
-        let message = format!("{:#}", startup_board(Some(&path)).unwrap_err());
-        assert!(message.contains(&path.display().to_string()), "{message}");
+        let board = startup_board(Some(&path)).unwrap();
+        let labels: Vec<_> = board.map().sound_items().iter().map(|i| &i.label).collect();
+        assert_eq!(labels, ["Demo chime"]);
+        assert_eq!(board.map().master_gain(), 1.0);
+        let fake = FakeAudio::new();
+        apply_config(&fake, board.map());
+        assert_eq!(*fake.gains.borrow(), [1.0]);
+    }
+
+    #[test]
+    fn reload_after_a_malformed_startup_installs_the_fixed_file() {
+        let dir = TempDir::new("actions-malformed-fixed");
+        let path = write_config(&dir, "master_gain = [\n");
+        let fake = FakeAudio::new();
+        apply_config(&fake, startup_board(Some(&path)).unwrap().map());
+
+        fs::write(
+            &path,
+            "master_gain = 0.5\n[[sound]]\nname = \"fixed\"\npath = \"builtin:demo\"\n",
+        )
+        .unwrap();
+        let mut installed = Vec::new();
+        let board = reload(&fake, &path, |board| {
+            installed.extend(board.map().sound_items().iter().map(|i| i.label.clone()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(installed, ["fixed"]);
+        assert_eq!(board.map().master_gain(), 0.5);
+        assert_eq!(*fake.gains.borrow(), [1.0, 0.5]);
     }
 
     #[test]

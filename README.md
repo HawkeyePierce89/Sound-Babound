@@ -92,7 +92,7 @@ The config file is `config.toml` in a `sound-babound` folder under the OS config
 
 The file is created with defaults on first start and is never overwritten after that. "Open config folder" in the tray menu opens its folder. After editing, choose "Reload config". New sounds, hotkeys and gains apply right away, and sounds that are already playing keep playing. If the new file does not parse, the error is logged and the old config stays in effect.
 
-At startup, a config that does not parse is fatal: the app logs the error and exits with code 1. If the file cannot be read at all, the built-in default config (the demo chime) is used and a warning is logged.
+At startup, the tray always comes up. If the config file does not parse, the app logs the parse error at error level, with the file's path, and starts with the built-in default config (the demo chime). The tray menu still works: fix the file, then choose "Reload config" to load it. If the file cannot be read at all, the built-in default config is used too, with a warning in the log. The log goes to stderr (see [Logging](#logging)), so on macOS and Linux start the app from a terminal to read it. On Windows tray mode has no console, so the log is not visible; if the demo chime shows up instead of your sounds, check the file for TOML syntax errors.
 
 Example:
 

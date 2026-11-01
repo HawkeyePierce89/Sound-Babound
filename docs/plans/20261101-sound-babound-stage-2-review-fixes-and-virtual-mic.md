@@ -137,13 +137,13 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 
 - Modify: `crates/app/src/actions.rs`, `crates/app/src/tray_app.rs`, `README.md`
 
-- [ ] `startup_board`: on a parse error, log the error at error level with the path, and return `fallback_board()`.
-- [ ] `TrayApp` keeps `config_path`, so "Reload config" and "Open config folder" work and a fixed file can be reloaded.
-- [ ] Reload behaviour (keep the old config on error) is unchanged.
-- [ ] Replace `startup_rejects_a_malformed_config` with `startup_falls_back_on_malformed_config`, which asserts the fallback board's sounds and gain.
-- [ ] Add a test that a later reload of the fixed file installs it.
-- [ ] README: describe the startup fallback and where to find the log.
-- [ ] Run the verification gates. All must pass before Task 5.
+- [x] `startup_board`: on a parse error, log the error at error level with the path, and return `fallback_board()`.
+- [x] `TrayApp` keeps `config_path`, so "Reload config" and "Open config folder" work and a fixed file can be reloaded.
+- [x] Reload behaviour (keep the old config on error) is unchanged.
+- [x] Replace `startup_rejects_a_malformed_config` with `startup_falls_back_on_malformed_config`, which asserts the fallback board's sounds and gain.
+- [x] Add a test that a later reload of the fixed file installs it.
+- [x] README: describe the startup fallback and where to find the log.
+- [x] Run the verification gates. All must pass before Task 5.
 
 ### Task 5: Generic stream supervisor with roles
 

@@ -35,9 +35,11 @@ enum UserEvent {
 /// Runs the tray app until "Quit".
 ///
 /// Startup: create the default config if missing, load it (the built-in
-/// default config is used only if the file is unreadable), start the engine,
-/// apply the config's master gain, then run the event loop. The tray and the
-/// hotkeys are created once the loop has started.
+/// default config is used if the file is unreadable or malformed), start the
+/// engine, apply the config's master gain, then run the event loop. The tray
+/// and the hotkeys are created once the loop has started. The config path is
+/// kept even after a fallback, so "Reload config" and "Open config folder"
+/// work and a fixed file can be reloaded.
 pub fn run() -> Result<()> {
     let config_path = match paths::ensure_default_config() {
         Ok(path) => Some(path),
@@ -228,7 +230,8 @@ struct TrayApp {
     engine: Option<Engine>,
     board: Soundboard,
     /// `None` if the config file location is unknown; reload is then
-    /// unavailable.
+    /// unavailable. Kept when startup fell back to the built-in config
+    /// because the file was malformed, so the fixed file can be reloaded.
     config_path: Option<PathBuf>,
     hotkeys: Hotkeys,
     /// Kept alive for as long as the icon should be shown.
