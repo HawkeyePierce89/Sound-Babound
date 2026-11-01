@@ -213,20 +213,20 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
 **Files:**
 - Create: `crates/engine/src/cpal_sink.rs`, `crates/engine/src/convert.rs`
 
-- [ ] `convert.rs`: pure functions that write an f32 mix into `&mut [T]` for `f32`, `i16`, `u16`, plus `i32` and `u8` via cpal's `FromSample`. They do not allocate.
-- [ ] `CpalSinkFactory::build`:
+- [x] `convert.rs`: pure functions that write an f32 mix into `&mut [T]` for `f32`, `i16`, `u16`, plus `i32` and `u8` via cpal's `FromSample`. They do not allocate.
+- [x] `CpalSinkFactory::build`:
   - Query `host.default_output_device()` on every call and never cache it. No device means `BuildError::NoDevice`.
   - Use `default_output_config()` for format, rate and channels.
   - Build a typed stream per `SampleFormat`. Unknown formats give `BuildError::UnsupportedFormat`.
   - Data callback: `try_lock` the mixer; render in chunks of the preallocated scratch size, then convert; on lock failure, fill with silence.
   - Error callback: send `SupervisorMsg::StreamError` (no logging inside it beyond the send).
   - Call `play()` and return `StreamInfo` with the device identity and name.
-- [ ] `CpalSinkFactory::current_default_identity`: re-query `host.default_output_device()` and derive its `DeviceIdentity`; nothing is stored between calls.
-- [ ] Write tests:
+- [x] `CpalSinkFactory::current_default_identity`: re-query `host.default_output_device()` and derive its `DeviceIdentity`; nothing is stored between calls.
+- [x] Write tests:
   - conversion boundaries (−1, 0, 1, clipping) for i16 and u16
   - a chunked render over a buffer larger than the scratch size matches a single render
   - a `#[ignore]` smoke test that builds a real stream on the dev machine and checks `current_default_identity()` equals the built stream's identity
-- [ ] Run the test suite and the Windows-target check. They must pass before Task 6.
+- [x] Run the test suite and the Windows-target check. They must pass before Task 6.
 
 ### Task 6: Platform device watchers
 

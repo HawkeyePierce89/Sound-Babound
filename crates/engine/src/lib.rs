@@ -4,6 +4,8 @@
 //! device supervisor that rebuilds the output stream when the default device
 //! changes. It has no UI dependencies.
 
+pub mod convert;
+pub mod cpal_sink;
 pub mod error;
 pub mod mixer;
 pub mod sink;
@@ -14,6 +16,7 @@ pub mod watcher;
 #[cfg(test)]
 mod test_support;
 
+pub use cpal_sink::CpalSinkFactory;
 pub use error::{BuildError, LoadError, WatcherError};
 pub use mixer::{Command, Mixer, MixerShared};
 pub use sink::{ActiveSink, BuiltSink, DeviceIdentity, SinkFactory, StreamInfo};
