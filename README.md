@@ -6,7 +6,7 @@ Playback keeps going when the default output changes. Switch it in the OS settin
 
 Features:
 
-- a tray icon with a menu listing every configured sound, plus the virtual mic status, "Mic to call", "Stop all", "Reload config", "Open config folder" and "Quit"
+- a tray icon with a menu listing every configured sound, plus the virtual mic status, "Mic to call", "Stop all", "Settings…", "Reload config", "Open config folder" and "Quit"
 - one global hotkey per sound and an optional stop-all hotkey
 - overlapping playback (up to 32 voices; the oldest voice is evicted beyond that)
 - WAV, FLAC, OGG Vorbis and MP3, at any sample rate (resampled to the device rate), mono or stereo (files with more channels play their first two)
@@ -14,6 +14,7 @@ Features:
 - a headless `play` command for one-off playback from a terminal
 - an optional virtual microphone ("Mic to call"): the sounds, mixed with your real microphone, go into a voice or video call through a virtual audio cable (see [Virtual microphone](#virtual-microphone))
 - a `mic-check` command that reports whether the virtual microphone can work
+- a settings window to add, remove and rename sounds and set their hotkeys, with the virtual microphone status (see [Settings window](#settings-window))
 
 Supported platforms: macOS, Windows 10/11 (x64 and arm64), and Linux (X11; see the Wayland limitation below). So far only macOS has been run on real hardware. Windows x64 and Linux x64 are compile-checked; Windows arm64 and Linux aarch64 builds have not been tried yet.
 
@@ -63,7 +64,24 @@ The tray menu has, from top to bottom:
 - one item per configured sound, which plays it;
 - the virtual mic status line (greyed out, for reading only, see [Tray status](#tray-status));
 - "Mic to call: on" or "Mic to call: off", which turns the virtual microphone on or off and saves the choice to the config file;
-- "Stop all", "Reload config", "Open config folder" and "Quit".
+- "Stop all", "Settings…" (see [Settings window](#settings-window)), "Reload config", "Open config folder" and "Quit".
+
+### Settings window
+
+```sh
+sound-babound settings
+```
+
+The tray's "Settings…" item opens a small settings window; `sound-babound settings` opens the same window from a terminal. The tray opens one window at a time: choosing "Settings…" again while it is open does nothing.
+
+The window has two parts:
+
+- "Virtual mic": the same report as `mic-check` (see [Checking the virtual microphone](#checking-the-virtual-microphone)), refreshed about once a second. The window cannot see the tray's running microphone capture: when the default input is the virtual device, it says so and notes that the tray's capture stays on the last real microphone it used, if there was one.
+- "Sounds": every configured sound with its name, file and hotkey. You can rename a sound, remove it, add sounds with "Add sound…" (a file picker for WAV, FLAC, OGG and MP3 files; the name starts as the file name without its extension, and the path is stored as an absolute path), and set a hotkey: click the hotkey field, then press the combination. Escape clears the hotkey. A key without a modifier is accepted only for F1–F24, so a plain letter never becomes a global hotkey. The "Stop all" hotkey is shown, but it is set in the config file.
+
+Problems are shown next to their sound: a blank name, a hotkey from the file that does not parse, or a hotkey used twice (by two sounds, or by a sound and "Stop all"). Save stays disabled while there is any problem. If the config file does not parse, the window shows the error and cannot edit the sounds; fix the file first.
+
+While a window opened from the tray's "Settings…" item is open, the tray's global hotkeys are switched off, so you can assign a combination the tray uses. Save writes the sounds to the config file and closes the window. It changes only each sound's `name`, `path` and `hotkey`: per-sound `gain`, `[mic]`, `master_gain`, `stop_all_hotkey` and every comment are kept, and the file is replaced in one step, so it is never left half written. If the sounds in the file were changed by something else while the window was open, Save refuses and says so, and the file is left as it was. Cancel, or closing the window, writes nothing. When that window closes, the tray reloads the config if the file changed, and turns its hotkeys back on. After saving from a window started with `sound-babound settings`, choose "Reload config" in the tray. Quitting the tray leaves an open settings window running.
 
 ### Headless playback
 
@@ -118,7 +136,7 @@ The config file is `config.toml` in a `sound-babound` folder under the OS config
 | Windows | `%APPDATA%\sound-babound\config.toml`                        |
 | Linux   | `$XDG_CONFIG_HOME/sound-babound/config.toml` (default `~/.config/sound-babound/config.toml`) |
 
-The file is created with defaults on first start. After that the app changes it in one case only: the "Mic to call" tray item rewrites the `enabled` value of `[mic]`, keeping your comments and other keys. If you have unsaved edits to the file, save them before using the toggle. "Open config folder" in the tray menu opens its folder. After editing, choose "Reload config". New sounds, hotkeys and gains apply right away, and sounds that are already playing keep playing. If the new file does not parse, the error is logged and the old config stays in effect.
+The file is created with defaults on first start. After that the app changes it in two cases only: the "Mic to call" tray item rewrites the `enabled` value of `[mic]`, and Save in the [settings window](#settings-window) rewrites the `[[sound]]` entries' names, paths and hotkeys. Both keep your comments and other keys. If you have unsaved edits to the file, save them before using either. "Open config folder" in the tray menu opens its folder. After editing, choose "Reload config". New sounds, hotkeys and gains apply right away, and sounds that are already playing keep playing. If the new file does not parse, the error is logged and the old config stays in effect.
 
 At startup, the tray always comes up. If the config file does not parse, the app logs the parse error at error level, with the file's path, and starts with the built-in default config (the demo chime). The tray menu still works: fix the file, then choose "Reload config" to load it. If the file cannot be read at all, the built-in default config is used too, with a warning in the log. The log goes to stderr (see [Logging](#logging)), so on macOS and Linux start the app from a terminal to read it (for the macOS app bundle, see [Logging](#logging)). On Windows tray mode has no console, so the log is not visible; if the demo chime shows up instead of your sounds, check the file for TOML syntax errors.
 
@@ -161,7 +179,7 @@ mic_gain = 1.0                 # volume of your microphone in the call, 0.0 to 4
 | Key              | Default | Meaning |
 |------------------|---------|---------|
 | `enabled`        | `false` | Turns the virtual microphone on. The tray's "Mic to call" item flips this value in the file, keeping your comments and other keys. |
-| `virtual_device` | `"BlackHole"` on macOS, `"CABLE Input"` on Windows, `"sound_babound_sink"` on Linux | The output device the call mix is written to: the first output whose name or id contains this text, ignoring case. A missing or blank value means the default; on macOS the default prefers "BlackHole 2ch" when several BlackHole devices are installed. On Linux the app creates its own devices whatever this says (see [Linux](#linux)). |
+| `virtual_device` | `"BlackHole"` on macOS, `"CABLE Input"` on Windows, `"sound_babound_sink"` on Linux | The output device the call mix is written to: the first output whose name or id contains this text, ignoring case. A missing or blank value means the default. On macOS the default prefers "BlackHole 2ch" when several BlackHole devices are installed (for example 2ch and 16ch), and takes any BlackHole device otherwise; a pattern you set yourself has no preference, so the first matching output is used. On Linux the app creates its own devices whatever this says (see [Linux](#linux)). |
 | `sound_gain`     | `1.0`   | Volume of the sounds in the call, on top of their own gain and `master_gain`. It does not change what you hear. |
 | `mic_gain`       | `1.0`   | Volume of your microphone in the call. |
 
@@ -202,6 +220,8 @@ Reading the permission needs macOS 14 or later. On older macOS the app always tr
 
 If you use another virtual cable (Loopback, for example), set `virtual_device` to the name of its output device.
 
+The app asks BlackHole and your microphone for 10 ms buffers, which keeps the delay your voice gets in the call short. If a device keeps a larger buffer (a DAW or Audio MIDI Setup may have set BlackHole to 2048 frames or more), the microphone still reaches the call: the app holds enough audio to cover both buffers, so the call hears you with a higher delay.
+
 ### Windows
 
 1. Install [VB-CABLE](https://vb-audio.com/Cable/) (a separate, donationware driver) and restart if the installer asks.
@@ -226,7 +246,7 @@ The greyed-out status line in the tray menu shows the state of the virtual micro
 | Virtual mic: starting | The virtual device is being opened. |
 | Virtual mic: BlackHole 2ch (active) | The call mix is going to that device. |
 | Virtual mic: … (active, microphone access denied) | The call hears the sounds only. On macOS, allow the microphone as described above. |
-| Virtual mic: … (active, microphone unavailable) | The microphone cannot be opened (no input device, or the default input is the virtual device itself); the call hears the sounds only. The log has the reason. |
+| Virtual mic: … (active, microphone unavailable: *reason*) | The microphone cannot be opened, and the call hears the sounds only. The reason is "default input is the virtual mic device" (choose a real microphone as the default input), "no input device", "input device not found", or "error, see log" (the log has the full error). |
 | Virtual mic: not found, install BlackHole / install VB-CABLE | No output device matches `virtual_device`. The app keeps looking, so installing or plugging in the device is enough. |
 | Virtual mic: could not create it, see log | Linux only: `pactl` failed or is missing, or no output matches a custom `virtual_device`. |
 | Virtual mic: error, see log | The virtual device was found but could not be opened. The app keeps retrying. |
@@ -263,7 +283,7 @@ Global hotkeys on Linux are X11 key grabs. Wayland compositors do not deliver th
 ## Project layout
 
 - `crates/engine` (`babound-engine`): decoding, the realtime mixers, the cpal output and capture streams, the microphone passthrough, the device supervisors and the platform device watchers. It has no UI dependencies.
-- `crates/app` (`sound-babound`): the binary, with the tray, global hotkeys, the TOML config, the `play` and `mic-check` CLI, and the per-OS glue (the Linux virtual device, the macOS microphone permission).
+- `crates/app` (`sound-babound`): the binary, with the tray, global hotkeys, the TOML config, the settings window, the `play`, `mic-check` and `settings` CLI, and the per-OS glue (the Linux virtual device, the macOS microphone permission).
 - `crates/app/macos/Info.plist` and `scripts/bundle-macos.sh`: the macOS app bundle.
 
 ## License

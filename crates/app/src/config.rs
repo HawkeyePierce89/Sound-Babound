@@ -33,6 +33,8 @@ pub const DEMO_LABEL: &str = "builtin:demo";
 pub const DEFAULT_CONFIG: &str = r#"# Sound-Babound configuration.
 #
 # Edit this file, then choose "Reload config" in the tray menu.
+# "Settings…" in the tray menu adds, removes and renames sounds and sets
+# their hotkeys; it keeps the comments and every other key in this file.
 #
 # Hotkey syntax: modifiers and one key joined with "+", for example
 #   "CmdOrCtrl+Shift+1", "Ctrl+Alt+F5", "Cmd+Shift+A", "Alt+Space".
@@ -61,7 +63,8 @@ stop_all_hotkey = "CmdOrCtrl+Shift+0"
 #                    "BlackHole" on macOS (preferring "BlackHole 2ch" when
 #                    several BlackHole devices are installed), "CABLE Input"
 #                    (VB-CABLE) on Windows and "sound_babound_sink" on Linux,
-#                    where the app creates the device itself.
+#                    where the app creates the device itself. A pattern set
+#                    here has no preference: the first matching output is used.
 #   sound_gain     - volume of the sounds in the call, 0.0 to 4.0 (default 1.0)
 #   mic_gain       - volume of your microphone in the call, 0.0 to 4.0
 #                    (default 1.0)

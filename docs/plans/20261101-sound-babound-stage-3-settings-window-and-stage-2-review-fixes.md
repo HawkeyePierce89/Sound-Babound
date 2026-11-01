@@ -408,13 +408,13 @@ Part B fixes the five findings from the stage 2 acceptance review:
 
 ### Task 13: Update documentation
 
-- [ ] README:
+- [x] README:
   - the settings window: the tray item, `sound-babound settings`, what it shows and edits, that hotkeys pause while it is open, Save and Cancel, and comments kept;
   - the macOS default (BlackHole 2ch preferred, any BlackHole otherwise, a set pattern matches first);
   - the macOS 10 ms mic period, and that larger device buffers still work at a higher latency;
   - the clearer "microphone unavailable" reasons.
-- [ ] Config template: the `virtual_device` comment describes the macOS preference, and the header mentions "Settings…" for sounds and hotkeys.
-- [ ] `CLAUDE.md`:
+- [x] Config template: the `virtual_device` comment describes the macOS preference, and the header mentions "Settings…" for sounds and hotkeys.
+- [x] `CLAUDE.md`:
   - module list: `settings/` (only `view.rs` knows egui), `settings_process.rs`, `virtual_mic.rs` with the device worker and its invariants, `mic_report.rs`, `config::update_config`;
   - the CLI's `settings` subcommand;
   - passthrough rules: the adaptive target (block sizes announced per callback, the formula, the high mark that follows it) and the new drift tests;
