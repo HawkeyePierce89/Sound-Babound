@@ -6,17 +6,48 @@
 //! The mic paths need PulseAudio, because only it lists the app's null sink
 //! and remapped source by name. PipeWire answers it through pipewire-pulse.
 
+use std::sync::Arc;
+
 use cpal::HostId;
+use cpal::traits::HostTrait;
+
+use super::shared_host::SharedHost;
+
+/// The PulseAudio host every mic path shares. A dropped PulseAudio host
+/// leaks its reactor thread and connection, so there is only this one.
+static MIC_HOST: SharedHost<cpal::Host> = SharedHost::new();
 
 /// The monitor's host: ALSA, or the default host if ALSA cannot open.
 pub fn monitor_host() -> cpal::Host {
     cpal::host_from_id(HostId::Alsa).unwrap_or_else(|_| cpal::default_host())
 }
 
-/// The mic paths' host: PulseAudio, or the default host if no PulseAudio
-/// server answers.
-pub fn mic_host() -> cpal::Host {
-    cpal::host_from_id(HostId::PulseAudio).unwrap_or_else(|_| cpal::default_host())
+/// The mic paths' host: the process-wide PulseAudio host, reconnected only
+/// if its connection no longer answers (a query on a dead connection fails
+/// at once), or ALSA if no PulseAudio server answers. The fallback is not
+/// kept, so the next call tries PulseAudio again.
+///
+/// The fallback is ALSA by id, never cpal's default host: that tries
+/// PulseAudio first, and a PulseAudio host outside [`MIC_HOST`] would leak
+/// its reactor thread and connection when dropped. Only if ALSA cannot open
+/// either is the default host used, and a PulseAudio host it returns is
+/// kept in [`MIC_HOST`] like any other.
+pub fn mic_host() -> Arc<cpal::Host> {
+    let alive = |host: &cpal::Host| host.devices().is_ok();
+    if let Some(host) = MIC_HOST.get(alive, || cpal::host_from_id(HostId::PulseAudio).ok()) {
+        return host;
+    }
+    match cpal::host_from_id(HostId::Alsa) {
+        Ok(host) => Arc::new(host),
+        Err(_) => {
+            let host = cpal::default_host();
+            if host.id() == HostId::PulseAudio {
+                MIC_HOST.adopt(host)
+            } else {
+                Arc::new(host)
+            }
+        }
+    }
 }
 
 /// The mic paths' stream period: 10 ms. With the default buffer size cpal

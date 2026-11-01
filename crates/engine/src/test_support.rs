@@ -407,7 +407,7 @@ struct BackendRequests {
     monitors: usize,
     mic_sinks: Vec<String>,
     captures: Vec<Vec<String>>,
-    watchers: usize,
+    watchers: Vec<StreamRole>,
 }
 
 /// Engine backends built from fakes. Every request hands out a clone of the
@@ -451,9 +451,9 @@ impl FakeBackends {
         lock(&self.requests).captures.clone()
     }
 
-    /// Watchers handed out.
-    pub(crate) fn watcher_requests(&self) -> usize {
-        lock(&self.requests).watchers
+    /// The role of every watcher handed out, in order.
+    pub(crate) fn watcher_requests(&self) -> Vec<StreamRole> {
+        lock(&self.requests).watchers.clone()
     }
 }
 
@@ -479,8 +479,8 @@ impl Backends for FakeBackends {
         Box::new(self.capture.clone())
     }
 
-    fn watcher(&self) -> Box<dyn DeviceWatcher> {
-        lock(&self.requests).watchers += 1;
+    fn watcher(&self, role: StreamRole) -> Box<dyn DeviceWatcher> {
+        lock(&self.requests).watchers.push(role);
         Box::new(self.watcher.clone())
     }
 }

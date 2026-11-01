@@ -177,6 +177,13 @@ pub struct Timings {
     /// How long after a live stream is torn down for a rebuild plays are
     /// still accepted and kept for the replacement stream.
     pub play_grace: Duration,
+    /// How long a shutdown waits for the supervisor thread. A device query
+    /// with no timeout of its own (a PulseAudio server that stops answering)
+    /// can block the thread inside a build; past this the thread is left to
+    /// finish on its own, so stopping the mic or the app never hangs. Longer
+    /// than the poll watcher's stop timeout, so a slow watcher stop still
+    /// joins.
+    pub stop_timeout: Duration,
 }
 
 impl Default for Timings {
@@ -187,6 +194,7 @@ impl Default for Timings {
             stall: Duration::from_secs(2),
             startup_grace: Duration::from_secs(10),
             play_grace: Duration::from_secs(1),
+            stop_timeout: Duration::from_secs(3),
         }
     }
 }
@@ -401,9 +409,14 @@ impl SupervisorCore {
 /// A running supervisor thread. Dropping it shuts the thread down.
 #[derive(Debug)]
 pub struct SupervisorHandle {
+    role: StreamRole,
     sender: Sender<SupervisorMsg>,
     status: Arc<Mutex<StreamStatus>>,
     thread: Option<JoinHandle<()>>,
+    /// Disconnects when the thread ends. In a mutex only so the handle (and
+    /// the engine) stays `Sync`; `stop` has `&mut self` and never locks it.
+    done: Mutex<Receiver<()>>,
+    stop_timeout: Duration,
     /// Build failures logged at warn, so tests can check the throttle.
     #[cfg(test)]
     failure_warnings: Arc<std::sync::atomic::AtomicUsize>,
@@ -422,18 +435,68 @@ impl SupervisorHandle {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Stop the stream, unregister the watcher and join the thread.
+    /// Stop the stream, unregister the watcher and join the thread. Waits
+    /// at most [`Timings::stop_timeout`]: a thread still blocked in a device
+    /// query then is left to stop on its own once the query returns (the
+    /// shutdown message stays queued for it). The engine stops its handles
+    /// with [`SupervisorHandle::shutdown_all`]; this is for tests.
+    #[cfg(test)]
     pub fn shutdown(mut self) {
         self.stop();
     }
 
+    /// Shut down every handle in `handles` together (stop the stream,
+    /// unregister the watcher, join the thread): each thread is told to stop
+    /// first, then all are waited for against one deadline, so they
+    /// take at most one [`Timings::stop_timeout`] between them rather than
+    /// one each.
+    pub fn shutdown_all(handles: impl IntoIterator<Item = SupervisorHandle>) {
+        let mut handles: Vec<SupervisorHandle> = handles.into_iter().collect();
+        for handle in &handles {
+            handle.signal();
+        }
+        let timeout = handles
+            .iter()
+            .map(|handle| handle.stop_timeout)
+            .max()
+            .unwrap_or_default();
+        let deadline = Instant::now() + timeout;
+        for handle in &mut handles {
+            handle.wait(deadline);
+        }
+    }
+
     fn stop(&mut self) {
-        if let Some(thread) = self.thread.take() {
-            // A send error means the thread already exited; join anyway.
+        self.signal();
+        self.wait(Instant::now() + self.stop_timeout);
+    }
+
+    /// Tell a running thread to stop.
+    fn signal(&self) {
+        if self.thread.is_some() {
+            // A send error means the thread already exited; it is joined
+            // anyway.
             let _ = self.sender.send(SupervisorMsg::Shutdown);
-            if thread.join().is_err() {
-                error!("supervisor thread panicked");
-            }
+        }
+    }
+
+    /// Join the thread if it ends by `deadline`; otherwise leave it.
+    fn wait(&mut self, deadline: Instant) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let done = self.done.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let left = deadline.saturating_duration_since(Instant::now());
+        if let Err(RecvTimeoutError::Timeout) = done.recv_timeout(left) {
+            warn!(
+                role = %self.role,
+                "supervisor did not stop in time (a device query is not returning); \
+                 leaving its thread to stop on its own"
+            );
+            return;
+        }
+        if thread.join().is_err() {
+            error!("supervisor thread panicked");
         }
     }
 }
@@ -464,6 +527,8 @@ where
     W: DeviceWatcher,
 {
     let (sender, receiver) = mpsc::channel();
+    let (done_tx, done) = mpsc::channel::<()>();
+    let role = factory.role();
     let status = Arc::new(Mutex::new(StreamStatus::Starting));
     let thread_sender = sender.clone();
     let thread_status = Arc::clone(&status);
@@ -472,8 +537,10 @@ where
     #[cfg(test)]
     let thread_warnings = Arc::clone(&failure_warnings);
     let thread = thread::Builder::new()
-        .name(format!("babound-{}", factory.role()))
+        .name(format!("babound-{role}"))
         .spawn(move || {
+            // Dropped when the thread ends, even by a panic.
+            let _done = done_tx;
             let worker = Worker::new(factory, endpoint, timings, thread_sender, thread_status);
             #[cfg(test)]
             let worker = Worker {
@@ -483,9 +550,12 @@ where
             worker.run(watcher, receiver);
         })?;
     Ok(SupervisorHandle {
+        role,
         sender,
         status,
         thread: Some(thread),
+        done: Mutex::new(done),
+        stop_timeout: timings.stop_timeout,
         #[cfg(test)]
         failure_warnings,
     })
@@ -1061,6 +1131,7 @@ mod tests {
             stall: Duration::from_secs(3600),
             startup_grace: Duration::from_secs(3600),
             play_grace: ms(50),
+            stop_timeout: Duration::from_secs(30),
         }
     }
 
@@ -1528,6 +1599,98 @@ mod tests {
         assert_eq!(factory.live_sinks(), 0);
         assert_eq!(watcher.guards_dropped(), 1);
         assert!(!watcher.send(DeviceEvent::DefaultOutputChanged));
+    }
+
+    #[test]
+    fn shutdown_gives_up_on_a_hung_build_and_the_thread_stops_later() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let watcher = FakeWatcher::default();
+        factory.hold_builds();
+        let handle = spawn_supervisor(
+            factory.clone(),
+            MixerEndpoint::new(Arc::new(MixerShared::new())),
+            watcher.clone(),
+            Timings {
+                stop_timeout: ms(100),
+                ..fast()
+            },
+        )
+        .unwrap();
+        assert!(wait_until(WAIT, || factory.building()));
+
+        let start = Instant::now();
+        handle.shutdown();
+        let waited = start.elapsed();
+        assert!(waited >= ms(100) && waited < ms(1000), "{waited:?}");
+        assert_eq!(watcher.guards_dropped(), 0);
+
+        // Once the build returns, the left-behind thread stops on its own.
+        factory.release_builds();
+        assert!(wait_until(WAIT, || watcher.guards_dropped() == 1));
+        assert!(wait_until(WAIT, || factory.live_sinks() == 0));
+    }
+
+    #[test]
+    fn shutting_down_hung_supervisors_together_costs_one_timeout() {
+        let watcher = FakeWatcher::default();
+        let factories: Vec<_> = (0..3)
+            .map(|_| FakeSinkFactory::new(48_000, 2, "spk"))
+            .collect();
+        let handles: Vec<_> = factories
+            .iter()
+            .map(|factory| {
+                factory.hold_builds();
+                spawn_supervisor(
+                    factory.clone(),
+                    MixerEndpoint::new(Arc::new(MixerShared::new())),
+                    watcher.clone(),
+                    Timings {
+                        stop_timeout: ms(300),
+                        ..fast()
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        for factory in &factories {
+            assert!(wait_until(WAIT, || factory.building()));
+        }
+
+        let start = Instant::now();
+        SupervisorHandle::shutdown_all(handles);
+        let waited = start.elapsed();
+        // One timeout, not three.
+        assert!(waited >= ms(300) && waited < ms(800), "{waited:?}");
+
+        for factory in &factories {
+            factory.release_builds();
+        }
+        assert!(wait_until(WAIT, || watcher.guards_dropped() == 3));
+        for factory in &factories {
+            assert!(wait_until(WAIT, || factory.live_sinks() == 0));
+        }
+    }
+
+    #[test]
+    fn shutting_down_together_joins_threads_that_stop() {
+        let watcher = FakeWatcher::default();
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                spawn_supervisor(
+                    factory.clone(),
+                    MixerEndpoint::new(Arc::new(MixerShared::new())),
+                    watcher.clone(),
+                    fast(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert!(wait_until(WAIT, || factory.live_sinks() == 2));
+        SupervisorHandle::shutdown_all(handles);
+        // Joined: everything is torn down by the time it returns.
+        assert_eq!(factory.live_sinks(), 0);
+        assert_eq!(watcher.guards_dropped(), 2);
     }
 
     #[test]

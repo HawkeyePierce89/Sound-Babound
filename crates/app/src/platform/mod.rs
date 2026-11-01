@@ -202,6 +202,79 @@ fn unload_module_args(id: u32) -> Vec<String> {
     vec!["unload-module".to_string(), id.to_string()]
 }
 
+/// How long one `pactl` call may take. `pactl` waits on the sound server with
+/// no timeout of its own, so a server that stops answering would otherwise
+/// freeze the tray's event loop on mic on, mic off or quit.
+#[cfg(any(target_os = "linux", test))]
+const PACTL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Runs `command` with its stdout and stderr captured, and kills it if it
+/// has not finished after `timeout`. `Ok(None)` means it was killed. The
+/// pipes are read on their own threads, so a large output cannot block the
+/// child.
+#[cfg(any(target_os = "linux", test))]
+fn output_within(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::process::{Output, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .map(read_to_end_in_background)
+        .transpose()?;
+    let stderr = child
+        .stderr
+        .take()
+        .map(read_to_end_in_background)
+        .transpose()?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            // The readers end once the killed child's pipes close.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let collect = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| {
+        reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default()
+    };
+    Ok(Some(Output {
+        status,
+        stdout: collect(stdout),
+        stderr: collect(stderr),
+    }))
+}
+
+/// Reads `pipe` to its end on a new thread.
+#[cfg(any(target_os = "linux", test))]
+fn read_to_end_in_background(
+    mut pipe: impl std::io::Read + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<Vec<u8>>> {
+    std::thread::Builder::new()
+        .name("babound-pactl-pipe".into())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            // A read error keeps what was read so far.
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+}
+
 /// The module index `pactl load-module` prints.
 #[cfg(any(target_os = "linux", test))]
 fn parse_module_id(stdout: &str) -> anyhow::Result<u32> {
@@ -319,6 +392,43 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+
+    #[cfg(unix)]
+    fn sh(script: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_within_captures_a_finished_command() {
+        let output = output_within(sh("echo out; echo err >&2; exit 3"), PACTL_TIMEOUT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_within_reads_more_than_a_pipe_buffer() {
+        let output = output_within(sh("head -c 300000 /dev/zero"), PACTL_TIMEOUT)
+            .unwrap()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 300_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_within_kills_a_command_that_does_not_finish() {
+        let started = std::time::Instant::now();
+        let output = output_within(sh("sleep 30"), std::time::Duration::from_millis(100)).unwrap();
+        assert!(output.is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
 
     #[test]
     fn only_a_denial_keeps_the_capture_off() {

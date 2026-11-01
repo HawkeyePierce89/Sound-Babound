@@ -10,7 +10,8 @@
 //! read, so the engine can be called from UI and hotkey handlers without
 //! waiting on an audio thread. Only [`Engine::set_mic`], which starts and
 //! stops the mic path's supervisors, takes `&mut self` and may block briefly
-//! while a supervisor thread is joined.
+//! while the supervisor threads are joined (at most `Timings::stop_timeout`
+//! in all, even when a device query hangs).
 
 use std::fmt;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -24,7 +25,7 @@ use crate::cpal_sink::CpalOutputFactory;
 use crate::error::{BuildError, BuildErrorKind, StartError};
 use crate::mixer::{Command, Mixer, MixerShared};
 use crate::passthrough::PassthroughShared;
-use crate::sink::{CaptureEndpoint, MixerEndpoint, StreamFactory, StreamInfo};
+use crate::sink::{CaptureEndpoint, MixerEndpoint, StreamFactory, StreamInfo, StreamRole};
 use crate::sound::Sound;
 use crate::supervisor::{StreamStatus, SupervisorHandle, Timings, spawn_supervisor};
 use crate::watcher::{DeviceWatcher, platform_watcher};
@@ -48,8 +49,8 @@ pub(crate) trait Backends: fmt::Debug + Send + Sync + 'static {
     /// The capture: the default input, never one `exclusions` names.
     fn capture(&self, exclusions: &[String]) -> CaptureFactory;
 
-    /// A device watcher for one supervisor.
-    fn watcher(&self) -> Box<dyn DeviceWatcher>;
+    /// A device watcher for the supervisor of `role`.
+    fn watcher(&self, role: StreamRole) -> Box<dyn DeviceWatcher>;
 }
 
 /// The production backends: cpal streams and the platform device watcher.
@@ -69,8 +70,8 @@ impl Backends for CpalBackends {
         Box::new(CpalCaptureFactory::new(exclusions.to_vec()))
     }
 
-    fn watcher(&self) -> Box<dyn DeviceWatcher> {
-        Box::new(platform_watcher())
+    fn watcher(&self, role: StreamRole) -> Box<dyn DeviceWatcher> {
+        platform_watcher(role)
     }
 }
 
@@ -257,11 +258,15 @@ impl MicPath {
         )
     }
 
+    /// The path's supervisors, the capture first.
+    fn into_handles(self) -> impl Iterator<Item = SupervisorHandle> {
+        self.capture.into_iter().chain(std::iter::once(self.sink))
+    }
+
+    /// Stop the capture and the mic sink together, so a hung device query
+    /// in both costs one stop timeout, not two.
     fn shutdown(self) {
-        if let Some(capture) = self.capture {
-            capture.shutdown();
-        }
-        self.sink.shutdown();
+        SupervisorHandle::shutdown_all(self.into_handles());
     }
 }
 
@@ -338,9 +343,13 @@ impl Engine {
     ) -> Result<Engine, StartError> {
         let shared = Arc::new(MixerShared::new());
         let endpoint = MixerEndpoint::new(Arc::clone(&shared));
-        let supervisor =
-            spawn_supervisor(backends.monitor(), endpoint, backends.watcher(), timings)
-                .map_err(StartError::Spawn)?;
+        let supervisor = spawn_supervisor(
+            backends.monitor(),
+            endpoint,
+            backends.watcher(StreamRole::Monitor),
+            timings,
+        )
+        .map_err(StartError::Spawn)?;
         Ok(Engine {
             backends: Box::new(backends),
             timings,
@@ -408,7 +417,7 @@ impl Engine {
         let sink = spawn_supervisor(
             self.backends.mic_sink(&settings.device_match),
             endpoint,
-            self.backends.watcher(),
+            self.backends.watcher(StreamRole::MicSink),
             self.timings,
         )
         .map_err(StartError::Spawn)?;
@@ -417,7 +426,7 @@ impl Engine {
                 spawn_supervisor(
                     self.backends.capture(&settings.capture_exclusions()),
                     CaptureEndpoint::new(passthrough),
-                    self.backends.watcher(),
+                    self.backends.watcher(StreamRole::Capture),
                     self.timings,
                 )
                 // Dropping `sink` on the way out stops it.
@@ -530,12 +539,17 @@ impl Engine {
     }
 
     /// Stop every stream, unregister the watchers and join the supervisor
-    /// threads.
-    pub fn shutdown(mut self) {
-        if let Some(mic) = self.mic.take() {
-            mic.shutdown();
-        }
-        // `self` drops here: the monitor supervisor shuts down.
+    /// threads. They stop together, so this waits at most one
+    /// `Timings::stop_timeout` even when device queries hang.
+    pub fn shutdown(self) {
+        let Engine {
+            mic, supervisor, ..
+        } = self;
+        SupervisorHandle::shutdown_all(
+            mic.into_iter()
+                .flat_map(MicPath::into_handles)
+                .chain(std::iter::once(supervisor)),
+        );
     }
 
     /// Push a command built by `command` to every path. Every path gets it,
@@ -776,6 +790,7 @@ mod tests {
             stall: Duration::from_secs(3600),
             startup_grace: Duration::from_secs(3600),
             play_grace,
+            stop_timeout: Duration::from_secs(30),
         }
     }
 
@@ -909,7 +924,7 @@ mod tests {
         assert_eq!(backends.capture.attempts(), 0);
         assert!(backends.mic_sink_requests().is_empty());
         assert!(backends.capture_requests().is_empty());
-        assert_eq!(backends.watcher_requests(), 1);
+        assert_eq!(backends.watcher_requests(), [StreamRole::Monitor]);
         assert_eq!(backends.watcher.started(), 1);
         assert_eq!(engine.mic_status(), MicStatus::Off);
         assert!(!engine.has_mic_output());
@@ -926,6 +941,14 @@ mod tests {
         assert_eq!(
             backends.capture_requests(),
             [vec!["cable monitor".to_string(), "cable".to_string()]]
+        );
+        assert_eq!(
+            backends.watcher_requests(),
+            [
+                StreamRole::Monitor,
+                StreamRole::MicSink,
+                StreamRole::Capture
+            ]
         );
         assert_eq!(backends.watcher.started(), 3);
         assert_eq!(

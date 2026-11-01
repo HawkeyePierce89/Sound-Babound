@@ -5,7 +5,8 @@
 //!
 //! - [`monitor_host`]: the host the monitor output has always used.
 //! - [`mic_host`]: the host for the mic sink and the capture, which must see
-//!   the virtual device by name.
+//!   the virtual device by name. On Linux it is one PulseAudio host kept for
+//!   the whole process (see [`shared_host`]).
 //! - [`MIC_PERIOD_MS`]: the period the mic paths' streams ask for, if the
 //!   host's default does not suit the passthrough.
 
@@ -13,6 +14,9 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+// Only Linux keeps a shared host; the module is tested on every OS.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod shared_host;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -38,8 +42,8 @@ pub fn monitor_host() -> cpal::Host {
 
 /// Every other OS: cpal's default host for every role.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub fn mic_host() -> cpal::Host {
-    cpal::default_host()
+pub fn mic_host() -> std::sync::Arc<cpal::Host> {
+    std::sync::Arc::new(cpal::default_host())
 }
 
 /// Every other OS: the host's default period.

@@ -2,10 +2,11 @@
 //! the validated [`ResolvedConfig`] produced by [`crate::hotkeys::resolve`],
 //! and the comment-preserving [`set_mic_enabled`] writer.
 
-use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::Write;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use babound_engine::{LoadError, Sound};
@@ -299,16 +300,21 @@ fn with_mic_enabled(text: &str, enabled: bool) -> Result<String> {
 }
 
 /// Replaces `path` with `text` through a temp file and a rename.
+///
+/// The temp file has a name no other writer uses (see [`create_temp`]), so
+/// two processes saving at once each rename a complete file of their own:
+/// the last rename wins and the config is never a mix of both.
 fn write_atomically(path: &Path, text: &str) -> Result<()> {
     let name = path
         .file_name()
         .ok_or_else(|| anyhow!("config path {} has no file name", path.display()))?;
-    let mut tmp_name = OsString::from(".");
-    tmp_name.push(name);
-    tmp_name.push(".tmp");
-    let tmp = path.with_file_name(tmp_name);
+    let pid = std::process::id();
+    let candidates = std::iter::repeat_with(|| TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed))
+        .take(TEMP_ATTEMPTS)
+        .map(|seq| path.with_file_name(temp_name(name, pid, seq)));
+    let (tmp, mut file) = create_temp(candidates)
+        .with_context(|| format!("failed to write config {}", path.display()))?;
     let written = (|| -> std::io::Result<()> {
-        let mut file = File::create(&tmp)?;
         file.write_all(text.as_bytes())?;
         if let Ok(meta) = fs::metadata(path) {
             file.set_permissions(meta.permissions())?;
@@ -322,6 +328,41 @@ fn write_atomically(path: &Path, text: &str) -> Result<()> {
         return Err(err).with_context(|| format!("failed to write config {}", path.display()));
     }
     Ok(())
+}
+
+/// Numbers the temp files of this process.
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// How many temp names a save tries before it gives up.
+const TEMP_ATTEMPTS: usize = 16;
+
+/// The temp file name for config file `name`: hidden, in the same directory
+/// (so the rename stays on one file system), unique per process and save.
+fn temp_name(name: &OsStr, pid: u32, seq: u64) -> OsString {
+    let mut tmp = OsString::from(".");
+    tmp.push(name);
+    tmp.push(format!(".{pid}.{seq}.tmp"));
+    tmp
+}
+
+/// Creates the first of `candidates` that does not exist yet. Never opens an
+/// existing file, so it cannot truncate or write into another writer's temp
+/// file (or a stale one a crash left behind).
+fn create_temp(candidates: impl IntoIterator<Item = PathBuf>) -> std::io::Result<(PathBuf, File)> {
+    let mut last = None;
+    for candidate in candidates {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => last = Some(err),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last
+        .unwrap_or_else(|| std::io::Error::new(ErrorKind::AlreadyExists, "no free temp file name")))
 }
 
 #[cfg(test)]
@@ -474,6 +515,87 @@ mod tests {
             assert_eq!(fs::read_to_string(&path).unwrap(), text);
             assert_eq!(files_in(&dir), ["config.toml"]);
         }
+    }
+
+    #[test]
+    fn temp_names_differ_per_process_and_save() {
+        let name = OsStr::new("config.toml");
+        assert_eq!(temp_name(name, 7, 3), ".config.toml.7.3.tmp");
+        assert_ne!(temp_name(name, 7, 3), temp_name(name, 7, 4));
+        assert_ne!(temp_name(name, 7, 3), temp_name(name, 8, 3));
+    }
+
+    #[test]
+    fn create_temp_never_opens_an_existing_file() {
+        let dir = TempDir::new("config-temp-busy");
+        // Another writer's temp file (or a stale one) holds the first name.
+        let busy = dir.path().join(".config.toml.1.0.tmp");
+        fs::write(&busy, "someone else's").unwrap();
+        let free = dir.path().join(".config.toml.1.1.tmp");
+        let (tmp, file) = create_temp([busy.clone(), free.clone()]).unwrap();
+        drop(file);
+        assert_eq!(tmp, free);
+        assert_eq!(fs::read_to_string(&busy).unwrap(), "someone else's");
+
+        let err = create_temp([busy.clone()]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&busy).unwrap(), "someone else's");
+    }
+
+    #[test]
+    fn concurrent_saves_never_mix_and_leave_no_temp_file() {
+        let dir = TempDir::new("config-mic-concurrent");
+        let path = write_config(&dir, DEFAULT_CONFIG);
+        let savers: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        set_mic_enabled(&path, i % 2 == 0).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for saver in savers {
+            saver.join().unwrap();
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        // One whole file from one of the writers.
+        assert!(
+            text == DEFAULT_CONFIG
+                || text == DEFAULT_CONFIG.replace("enabled = false", "enabled = true"),
+            "{text}"
+        );
+        assert_eq!(files_in(&dir), ["config.toml"]);
+    }
+
+    #[test]
+    fn a_failed_rename_removes_the_temp_file() {
+        let dir = TempDir::new("config-rename-fails");
+        // A non-empty directory cannot be replaced by a file.
+        let target = dir.path().join("config.toml");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), "x").unwrap();
+        assert!(write_atomically(&target, "[mic]\n").is_err());
+        assert_eq!(files_in(&dir), ["config.toml"]);
+    }
+
+    #[test]
+    fn set_mic_enabled_leaves_other_temp_files_alone() {
+        let dir = TempDir::new("config-mic-other-temp");
+        let path = write_config(&dir, DEFAULT_CONFIG);
+        // The fixed name the old code truncated.
+        let other = dir.path().join(".config.toml.tmp");
+        fs::write(&other, "in flight").unwrap();
+        set_mic_enabled(&path, true).unwrap();
+        assert!(
+            parse(&fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .mic
+                .enabled
+        );
+        assert_eq!(fs::read_to_string(&other).unwrap(), "in flight");
+        assert_eq!(files_in(&dir), [".config.toml.tmp", "config.toml"]);
     }
 
     #[cfg(unix)]

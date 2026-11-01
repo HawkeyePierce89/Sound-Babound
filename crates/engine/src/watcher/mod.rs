@@ -7,8 +7,10 @@
 //!
 //! Platform watchers live in this module's platform submodules and are picked
 //! by [`platform_watcher`]: CoreAudio property listeners on macOS, an
-//! `IMMNotificationClient` on Windows, and the no-op watcher on Linux and every
-//! other OS. Stream errors reach the supervisor through the sink either way.
+//! `IMMNotificationClient` on Windows, a default-input poller for the Linux
+//! capture (see [`poll`]; the other Linux roles need none), and the no-op
+//! watcher on every other OS. Stream errors reach the supervisor through the
+//! sink either way.
 
 use std::sync::mpsc::Sender;
 
@@ -16,17 +18,22 @@ use crate::error::WatcherError;
 use crate::sink::StreamRole;
 use crate::supervisor::SupervisorMsg;
 
+// Only the Linux watcher polls; these modules are tested on every OS.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod inputs;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod poll;
 #[cfg(target_os = "windows")]
 mod windows;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use NoopWatcher as PlatformWatcher;
 #[cfg(target_os = "linux")]
-use linux::PlatformWatcher;
+pub use linux::platform_watcher;
 #[cfg(target_os = "macos")]
 use macos::CoreAudioWatcher as PlatformWatcher;
 #[cfg(target_os = "windows")]
@@ -103,8 +110,11 @@ pub enum RebuildPolicy {
 #[derive(Debug, Clone)]
 pub struct EventSender(Sender<SupervisorMsg>);
 
-// The no-op watcher never sends, so outside macOS and Windows only tests do.
-#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+// The no-op watcher never sends, so on other OSes only tests do.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    allow(dead_code)
+)]
 impl EventSender {
     pub(crate) fn new(sender: Sender<SupervisorMsg>) -> EventSender {
         EventSender(sender)
@@ -136,7 +146,7 @@ impl<W: DeviceWatcher + ?Sized> DeviceWatcher for Box<W> {
 }
 
 /// A watcher that never reports anything. The platform watcher everywhere
-/// except macOS and Windows.
+/// except macOS and Windows, and on Linux for every role but the capture.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopWatcher;
@@ -154,9 +164,11 @@ impl DeviceWatcher for NoopWatcher {
     }
 }
 
-/// The watcher for the current platform.
-pub fn platform_watcher() -> PlatformWatcher {
-    PlatformWatcher
+/// The watcher for the current platform and `role`. Outside Linux every role
+/// gets the same watcher.
+#[cfg(not(target_os = "linux"))]
+pub fn platform_watcher(_role: StreamRole) -> Box<dyn DeviceWatcher> {
+    Box::new(PlatformWatcher)
 }
 
 #[cfg(test)]
@@ -176,7 +188,7 @@ mod tests {
     /// becomes and the policy that event must have for each role. (Windows'
     /// `OnPropertyValueChanged` is ignored and so emits nothing.) Platform
     /// test modules check their own mapping against this table.
-    pub(crate) const PLATFORM_EVENT_TABLE: [(&str, DeviceEvent, RolePolicies); 8] = [
+    pub(crate) const PLATFORM_EVENT_TABLE: [(&str, DeviceEvent, RolePolicies); 10] = [
         (
             "macos:DefaultOutputDevice",
             DeviceEvent::DefaultOutputChanged,
@@ -210,6 +222,16 @@ mod tests {
         ),
         (
             "windows:OnDeviceAdded",
+            DeviceEvent::DeviceListChanged,
+            IDENTITY,
+        ),
+        (
+            "linux:default input changed",
+            DeviceEvent::DefaultInputChanged,
+            INPUT_DEFAULT,
+        ),
+        (
+            "linux:input list changed",
             DeviceEvent::DeviceListChanged,
             IDENTITY,
         ),
@@ -347,10 +369,12 @@ mod tests {
 
     #[test]
     fn platform_watcher_starts_and_stops() {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut watcher = platform_watcher();
-        let guard = watcher.start(EventSender::new(tx)).unwrap();
-        drop(guard);
+        for role in StreamRole::ALL {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let mut watcher = platform_watcher(role);
+            let guard = watcher.start(EventSender::new(tx)).unwrap();
+            drop(guard);
+        }
     }
 
     #[test]
@@ -358,7 +382,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let guards: Vec<_> = (0..3)
             .map(|_| {
-                platform_watcher()
+                platform_watcher(StreamRole::Capture)
                     .start(EventSender::new(tx.clone()))
                     .unwrap()
             })

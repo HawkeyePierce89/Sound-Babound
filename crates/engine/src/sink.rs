@@ -69,7 +69,7 @@ impl fmt::Display for StreamRole {
 ///
 /// It is the backend's stable device id when there is one, otherwise the
 /// device name. Identities are only compared with each other, never parsed.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeviceIdentity(String);
 
 impl DeviceIdentity {

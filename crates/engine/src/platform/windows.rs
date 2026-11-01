@@ -1,5 +1,7 @@
 //! Windows: WASAPI is the default host, for every role.
 
+use std::sync::Arc;
+
 /// The monitor's host: WASAPI.
 pub fn monitor_host() -> cpal::Host {
     cpal::default_host()
@@ -7,8 +9,8 @@ pub fn monitor_host() -> cpal::Host {
 
 /// The mic paths' host: WASAPI, which lists virtual cables such as VB-CABLE
 /// as ordinary endpoints.
-pub fn mic_host() -> cpal::Host {
-    cpal::default_host()
+pub fn mic_host() -> Arc<cpal::Host> {
+    Arc::new(cpal::default_host())
 }
 
 /// The mic paths' stream period: WASAPI's default shared-mode period

@@ -49,11 +49,20 @@ pub fn virtual_device_missing_hint() -> &'static str {
     "the tray creates it while the mic is on; mic-check does not, so start the tray with the mic on (or set [mic] virtual_device to an existing output)"
 }
 
-/// Runs `pactl` with `args` and returns its stdout. A missing `pactl` and a
-/// non-zero exit are errors; the latter carries pactl's stderr.
+/// Runs `pactl` with `args` and returns its stdout. A missing `pactl`, a
+/// non-zero exit (with pactl's stderr) and a call that does not finish within
+/// [`super::PACTL_TIMEOUT`] (a sound server that stopped answering) are
+/// errors.
 fn run_pactl(args: &[String]) -> anyhow::Result<String> {
-    let output = match Command::new("pactl").args(args).output() {
-        Ok(output) => output,
+    let mut command = Command::new("pactl");
+    command.args(args);
+    let output = match super::output_within(command, super::PACTL_TIMEOUT) {
+        Ok(Some(output)) => output,
+        Ok(None) => bail!(
+            "pactl {} did not finish within {:?}; the sound server is not answering",
+            args.join(" "),
+            super::PACTL_TIMEOUT
+        ),
         Err(err) if err.kind() == ErrorKind::NotFound => {
             bail!("pactl not found: install pulseaudio-utils (or pipewire-pulse's pactl)")
         }

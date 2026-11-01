@@ -27,7 +27,8 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 - New files:
   - `crates/engine/src/passthrough.rs`: ring buffer, drift controller and resampler.
   - `crates/engine/src/capture.rs`: cpal capture factory and input selection.
-  - `crates/engine/src/platform/{mod,macos,windows,linux}.rs`: cpal host choice for the mic paths. On Linux this is the PulseAudio host.
+  - `crates/engine/src/platform/{mod,macos,windows,linux}.rs`: cpal host choice for the mic paths. On Linux this is one process-wide PulseAudio host (`platform/shared_host.rs`, added in review), falling back to ALSA by id.
+  - `crates/engine/src/watcher/{poll,inputs}.rs` (added in review): the polling watcher and the Linux capture's input query.
   - `crates/app/macos/Info.plist`
   - `scripts/bundle-macos.sh`
 - Patterns to reuse:
@@ -44,7 +45,7 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
   - The passthrough uses the existing `crossbeam-queue` `ArrayQueue<f32>`, so no new ring-buffer crate is needed and the "only ArrayQueue push in realtime code" rule holds.
 - Decisions:
   - Resampling: a hand-written linear interpolator, the same kind the mixer already uses, with a continuously adjustable ratio. It allocates nothing. rubato is not used.
-  - Watchers: every supervisor starts its own platform watcher instance (three CoreAudio listeners, three IMMNotificationClients). This keeps the supervisor symmetric with no fan-out plumbing. Each instance filters events through a per-role rebuild policy.
+  - Watchers: every supervisor starts its own platform watcher instance (three CoreAudio listeners, three IMMNotificationClients; on Linux, from review on, `platform_watcher(role)` gives the capture an input poller and the outputs no-op watchers). This keeps the supervisor symmetric with no fan-out plumbing. Each instance filters events through a per-role rebuild policy.
   - Linux virtual device: `pactl` command-line tools. They work on both PulseAudio and PipeWire (pipewire-pulse) through one code path, need no native bindings, and keep the Linux cross-check working with the stub pkg-config.
     - `module-null-sink sink_name=sound_babound_sink`, which the mic sink writes to.
     - `module-remap-source master=sound_babound_sink.monitor source_name=sound_babound_mic`, with the description "Sound-Babound Mic".
@@ -237,7 +238,7 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 - Create: `crates/engine/src/capture.rs`, `crates/engine/src/platform/{mod,macos,windows,linux}.rs`
 - Modify: `crates/engine/src/cpal_sink.rs`, `crates/engine/src/error.rs`, `crates/engine/Cargo.toml`, `crates/engine/src/lib.rs`
 
-- [x] `platform::mic_host()`: the default host on macOS and Windows; the PulseAudio host on Linux, falling back to the default host. Selection happens only in `platform/mod.rs`.
+- [x] `platform::mic_host()`: the default host on macOS and Windows; the PulseAudio host on Linux, falling back to the default host (changed in review: one shared PulseAudio host, falling back to ALSA by id). Selection happens only in `platform/mod.rs`.
 - [x] Enable cpal's `pulseaudio` feature for the Linux target only.
 - [x] Generalize `CpalSinkFactory` into an output factory with a target:
   - `Default` (the monitor, as in stage 1);
@@ -473,3 +474,4 @@ These checks are manual and done by a human:
   - switch the default input and output during a call and confirm that each recovers on its own.
 - On Windows with VB-CABLE, and on a Linux PipeWire desktop: confirm device detection, Linux device creation and removal, and the tray status.
 - Set the default input to the virtual device and confirm the warning and the fallback.
+- On Linux: switch the default input and confirm the capture follows within about a second; with the default input on "Sound-Babound Mic" and the capture on its fallback, unplug the fallback microphone and confirm the capture stops (no feedback); restart pipewire-pulse with the mic on and confirm the mic paths reconnect without piling up `babound-device-poll` threads; stop the server (`SIGSTOP`) and confirm that mic off and quit return within a few seconds with a warning.
