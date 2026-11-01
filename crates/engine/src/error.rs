@@ -57,6 +57,11 @@ pub enum BuildError {
     Backend(String),
 }
 
+/// A failure while registering for device-change notifications.
+#[derive(Debug, Error)]
+#[error("device watcher failed: {0}")]
+pub struct WatcherError(pub String);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +95,6 @@ mod tests {
                 .to_string()
                 .contains("boom")
         );
+        assert!(WatcherError("nope".into()).to_string().contains("nope"));
     }
 }

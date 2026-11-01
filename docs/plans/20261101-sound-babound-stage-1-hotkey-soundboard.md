@@ -160,7 +160,7 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
 **Files:**
 - Create: `crates/engine/src/sink.rs`, `crates/engine/src/supervisor.rs`, `crates/engine/src/watcher/mod.rs`
 
-- [ ] `watcher/mod.rs`:
+- [x] `watcher/mod.rs`:
   - `DeviceEvent` enum: `DefaultOutputChanged`, `DefaultInputChanged`, `DeviceListChanged`, `DeviceRemoved`, `DeviceStateChanged`.
   - `RebuildPolicy` enum and the pure classification helper `DeviceEvent::rebuild_policy()`:
     - `DefaultOutputChanged` → `Always`
@@ -168,14 +168,14 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
     - `DefaultInputChanged` → `Ignore`
   - `DeviceWatcher` trait: `start(sender) -> Result<Box<dyn WatcherGuard>, ...>`. The guard unregisters on drop.
   - `platform_watcher()` selected by cfg. Platform modules come in Task 6. For now Linux and the default use a no-op watcher.
-- [ ] `sink.rs`:
+- [x] `sink.rs`:
   - `DeviceIdentity`: an opaque comparable value (cpal's device id when the backend provides a stable one, otherwise the device name).
   - `StreamInfo` with device identity, device name, sample rate, channels and sample format.
   - `SinkFactory` trait, `Send + 'static`:
     - `build(&mut self, mixer: Arc<Mutex<Mixer>>, on_error: Sender<SupervisorMsg>) -> Result<(Box<dyn ActiveSink>, StreamInfo), BuildError>`
     - `current_default_identity(&mut self) -> Option<DeviceIdentity>`: re-queries the live default output every call; `None` means no output device.
   - `ActiveSink` is non-`Send` and owned by the supervisor thread. Dropping it stops the stream.
-- [ ] `supervisor.rs`, part 1: a pure state machine `SupervisorCore` driven by explicit `Instant`s.
+- [x] `supervisor.rs`, part 1: a pure state machine `SupervisorCore` driven by explicit `Instant`s.
   - Methods: `on_event(policy, now)`, `on_stream_error(now)`, `on_build_result(Option<DeviceIdentity>, now)` (`Some` on success, recording the built-on identity; `None` on failure), `poll(now) -> Option<Action>`, `resolve_check(current: Option<DeviceIdentity>) -> CheckOutcome`, `next_deadline()`.
   - `Action` is `Rebuild` or `CheckDefault`; `CheckOutcome` is `Rebuild` or `Drop`.
   - Debounce is trailing-edge, 200 ms after the last event. A window containing any `Always` event or a stream error yields `Rebuild`; a window with only `IfDefaultOutputChanged` events yields `CheckDefault`; `Ignore` events do not open a window.
@@ -183,7 +183,7 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
   - When no stream is active (initial start or retry backoff), every non-ignored event leads to `Rebuild`.
   - Retry backoff is 1 s after a failed build. New events during the backoff still debounce.
   - The stall watchdog yields `Rebuild` if `callback_heartbeat` has not advanced for 2 s while a stream is supposed to be running.
-- [ ] `supervisor.rs`, part 2: `spawn_supervisor(factory, watcher, shared)` starts a dedicated thread.
+- [x] `supervisor.rs`, part 2: `spawn_supervisor(factory, watcher, shared)` starts a dedicated thread.
   - The thread loop is a `recv_timeout` on one channel carrying watcher events, stream errors and `Shutdown`.
   - The thread builds immediately on start.
   - On `CheckDefault` it calls `factory.current_default_identity()` and passes the result to `resolve_check`; on `Drop` it logs the event at debug and does nothing else.
@@ -191,8 +191,8 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
   - It calls `drain_garbage()` each loop iteration (at most every 100 ms).
   - It logs rebuild outcomes at info: device name, rate, channels, format.
   - It logs input-device events at debug and ignores them.
-- [ ] Write tests for the classification helper: every `DeviceEvent` variant maps to the policy listed above.
-- [ ] Write tests with a fake clock against `SupervisorCore`:
+- [x] Write tests for the classification helper: every `DeviceEvent` variant maps to the policy listed above.
+- [x] Write tests with a fake clock against `SupervisorCore`:
   - bursts of 5 events within 200 ms cause exactly one rebuild
   - failure leads to retry at 1 s; repeated failures keep retrying; success stops the retries
   - a stalled heartbeat triggers a rebuild
@@ -201,12 +201,12 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
   - plugging an unrelated device (`DeviceListChanged`) while the default output identity is unchanged: `poll` yields `CheckDefault`, `resolve_check` yields `Drop`, no rebuild
   - `DeviceListChanged` where the default output identity changed yields a rebuild; the same for `DeviceRemoved` with the current default now `None`
   - a burst mixing `DeviceListChanged` and `DefaultOutputChanged` rebuilds without a check
-- [ ] Write thread-level tests with `FakeWatcher` and `FakeSinkFactory` (fails N times, then succeeds; settable current default identity; records builds):
+- [x] Write thread-level tests with `FakeWatcher` and `FakeSinkFactory` (fails N times, then succeeds; settable current default identity; records builds):
   - a `DefaultOutputChanged` event leads to a rebuild with the new fake rate
   - a `DeviceListChanged` event with an unchanged fake default identity produces no new build
   - a playing voice keeps its source position across the rebuild
   - shutdown joins promptly
-- [ ] Run the test suite. It must pass before Task 5.
+- [x] Run the test suite. It must pass before Task 5.
 
 ### Task 5: cpal output sink with sample-format conversion
 

@@ -6,11 +6,20 @@
 
 pub mod error;
 pub mod mixer;
+pub mod sink;
 pub mod sound;
+pub mod supervisor;
+pub mod watcher;
 
-pub use error::{BuildError, LoadError};
+#[cfg(test)]
+mod test_support;
+
+pub use error::{BuildError, LoadError, WatcherError};
 pub use mixer::{Command, Mixer, MixerShared};
+pub use sink::{ActiveSink, BuiltSink, DeviceIdentity, SinkFactory, StreamInfo};
 pub use sound::{Sound, SoundData};
+pub use supervisor::{SupervisorHandle, SupervisorMsg, spawn_supervisor};
+pub use watcher::{DeviceEvent, DeviceWatcher, EventSender, RebuildPolicy, WatcherGuard};
 
 /// Crate version, exposed so the app can log which engine it runs.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
