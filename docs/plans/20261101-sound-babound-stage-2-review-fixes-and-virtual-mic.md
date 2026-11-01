@@ -185,33 +185,33 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 - Create: `crates/engine/src/passthrough.rs`
 - Modify: `crates/engine/src/convert.rs`, `crates/engine/src/lib.rs`
 
-- [ ] `PassthroughShared`:
+- [x] `PassthroughShared`:
   - an `ArrayQueue<f32>` of mono samples, allocated once with room for 0.5 s at 192 kHz;
   - an atomic capture rate and a generation counter;
   - a capture heartbeat and an active flag;
   - underrun and overrun counters.
-- [ ] Writer (capture side, realtime-safe):
+- [x] Writer (capture side, realtime-safe):
   - downmix interleaved input to mono, then `force_push`;
   - count an overrun when the oldest sample is displaced, or when the fill passes the high mark (target + 50 ms) and the oldest samples are popped;
   - bump the heartbeat.
-- [ ] `begin_capture(rate)`, called from a capture build before its stream starts: empty the ring, store the rate, bump the generation.
-- [ ] `PassthroughReader` (mic sink side, owned by the mic `Mixer`, realtime-safe):
+- [x] `begin_capture(rate)`, called from a capture build before its stream starts: empty the ring, store the rate, bump the generation.
+- [x] `PassthroughReader` (mic sink side, owned by the mic `Mixer`, realtime-safe):
   - Priming: output silence until the fill reaches the target (30 ms of capture-rate frames).
   - Resampling: linear interpolation with ratio `capture_rate / sink_rate * (1 + correction)`.
   - Correction: a PI controller on an EMA-smoothed fill error, clamped to ±0.2 %.
   - Underrun: when the ring runs empty mid-block, count it, output silence for the rest of the block and re-prime.
   - On a generation or rate change, reset and re-prime.
-- [ ] `convert.rs`: add an `InputSample` trait (device format to f32) for every cpal PCM format, including I24 and U24.
-- [ ] Drift tests that simulate device clocks, with no threads and no devices:
+- [x] `convert.rs`: add an `InputSample` trait (device format to f32) for every cpal PCM format, including I24 and U24.
+- [x] Drift tests that simulate device clocks, with no threads and no devices:
   - nominal 48000/48000 with the sink clock at 48000.5 Hz for 10 simulated minutes, mismatched block cadence (capture 480-frame blocks, sink 512): after 5 s of settling, the fill stays within target ± 20 ms with zero underruns and zero overruns;
   - the same for 44100 to 48000, and for ±200 ppm drift in both directions.
-- [ ] Unit tests:
+- [x] Unit tests:
   - underrun gives silence and re-primes;
   - overrun drops the oldest audio;
   - a generation change resets;
   - downmixing;
   - input conversion at full scale.
-- [ ] Run the verification gates. All must pass before Task 7.
+- [x] Run the verification gates. All must pass before Task 7.
 
 ### Task 7: Mic mixer: passthrough input and path gains
 

@@ -8,7 +8,8 @@ A Rust tray soundboard. Plans live in `docs/plans/`.
   - `error.rs`: `LoadError`, `BuildError`, `StartError`, `WatcherError`.
   - `sound.rs`: symphonia decode into a cheap-clone `Sound` (`Arc<SoundData>`).
   - `mixer.rs`: the realtime mixer, the command queue and the garbage queue.
-  - `convert.rs`: f32 to device sample format (`OutputSample`). Every cpal PCM format is supported. I24 and U24 go through i32, because dasp overflows them at +1.0.
+  - `convert.rs`: f32 to device sample format (`OutputSample`). Every cpal PCM format is supported. I24 and U24 go through i32, because dasp overflows them at +1.0. `InputSample` is the reverse (device format to f32) for the capture.
+  - `passthrough.rs`: the mic passthrough. `PassthroughShared` holds a mono `ArrayQueue<f32>` ring (0.5 s at 192 kHz) that the capture writes to. `PassthroughReader`, owned by the mic mixer, primes to 30 ms and resamples by linear interpolation. A PI controller, clamped to ±0.2 %, adjusts the ratio to hold the fill. Drift tests simulate both device clocks.
   - `sink.rs`: `StreamRole`, the `StreamFactory`, `Endpoint` and `ActiveStream` traits, and `MixerEndpoint` (the endpoint of both output roles).
   - `cpal_sink.rs`: the cpal implementation of those traits.
   - `supervisor.rs`: the pure `SupervisorCore` state machine, the pure `FailureLog` build-failure throttle, `StreamStatus`, and the one generic supervisor thread (`spawn_supervisor`), one instance per role, each starting its own watcher.

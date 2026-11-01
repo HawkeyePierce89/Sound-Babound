@@ -9,6 +9,9 @@ mod cpal_sink;
 mod engine;
 mod error;
 mod mixer;
+// Used by the mic mixer and the capture stream once they exist.
+#[cfg_attr(not(test), allow(dead_code))]
+mod passthrough;
 mod sink;
 mod sound;
 mod supervisor;
