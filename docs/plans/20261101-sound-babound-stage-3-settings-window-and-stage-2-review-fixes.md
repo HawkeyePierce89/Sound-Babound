@@ -393,18 +393,18 @@ Part B fixes the five findings from the stage 2 acceptance review:
 
 ### Task 12: Verify acceptance criteria
 
-- [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --workspace --all-targets`, with zero warnings
-- [ ] `cargo test --workspace`
-- [ ] `cargo check --workspace --target x86_64-pc-windows-msvc`
-- [ ] Linux stub pkg-config `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu`, which also covers eframe and rfd.
-- [ ] Revert checks, each restored afterwards:
+- [x] `cargo fmt --all -- --check`
+- [x] `cargo clippy --workspace --all-targets`, with zero warnings
+- [x] `cargo test --workspace`
+- [x] `cargo check --workspace --target x86_64-pc-windows-msvc`
+- [x] Linux stub pkg-config `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu`, which also covers eframe and rfd.
+- [x] Revert checks, each restored afterwards:
   - B.1: a fixed 30 ms target fails the 2048-block drift tests and passes the four old ones;
   - B.2: removing the `probe_failed` call fails the pure backoff test;
   - B.4: the generic label fails the per-kind label test;
   - B.5: `first_match` instead of `best_match` fails the 16ch-before-2ch test.
-- [ ] Confirm that the tests for AC2 (config round trip, keys, duplicates, status text) and AC3 (launcher and hotkey pause) exist and pass.
-- [ ] Coverage of the new pure modules (`settings/{form,keys,save}.rs`, `settings_process.rs`, `virtual_mic.rs`, `mic_report.rs`, the passthrough changes): aim for 80% or more, measured as in stage 2. `view.rs` and the eframe entry are excluded.
+- [x] Confirm that the tests for AC2 (config round trip, keys, duplicates, status text) and AC3 (launcher and hotkey pause) exist and pass.
+- [x] Coverage of the new pure modules (`settings/{form,keys,save}.rs`, `settings_process.rs`, `virtual_mic.rs`, `mic_report.rs`, the passthrough changes): aim for 80% or more, measured as in stage 2. `view.rs` and the eframe entry are excluded.
 
 ### Task 13: Update documentation
 
