@@ -71,10 +71,15 @@ const NAMED_KEYS: &[(&str, &str)] = &[
     ("Backslash", "Backslash"),
 ];
 
-/// egui key names that never become a hotkey: shifted symbols that share a
-/// physical key with another (`Plus` is `Equal`, `Colon` is `Semicolon`),
-/// clipboard and browser keys, function keys past F24, and `Escape`, which
-/// clears the field instead (see [`hotkey_text`]).
+/// egui key names that never become a hotkey: the modifier keys themselves
+/// (egui reports a lone Shift or Ctrl press as a key, which then leaves the
+/// field waiting), shifted symbols that share a physical key with another
+/// (`Plus` is `Equal`, `Colon` is `Semicolon`), clipboard, browser, media,
+/// volume, launch and system keys (Caps Lock, Print Screen, Pause, Num Lock
+/// and the like), function keys past F24, and `Escape`, which clears the
+/// field instead (see [`hotkey_text`]). Only the tests use it: the view's
+/// test checks it against egui's `Key::ALL`.
+#[cfg(test)]
 pub const UNSUPPORTED_UI_KEYS: &[&str] = &[
     "Escape",
     "Copy",
@@ -88,6 +93,43 @@ pub const UNSUPPORTED_UI_KEYS: &[&str] = &[
     "OpenCurlyBracket",
     "CloseCurlyBracket",
     "BrowserBack",
+    "BrowserForward",
+    "BrowserRefresh",
+    "BrowserSearch",
+    "BrowserHome",
+    "BrowserFavorites",
+    "BrowserStop",
+    "MediaPlayPause",
+    "MediaTrackNext",
+    "MediaTrackPrevious",
+    "MediaStop",
+    "AudioVolumeMute",
+    "AudioVolumeDown",
+    "AudioVolumeUp",
+    "LaunchMail",
+    "LaunchApp1",
+    "LaunchApp2",
+    "NumLock",
+    "ShiftLeft",
+    "ShiftRight",
+    "ControlLeft",
+    "ControlRight",
+    "AltLeft",
+    "AltRight",
+    "SuperLeft",
+    "SuperRight",
+    "Fn",
+    "IntlBackslash",
+    "CapsLock",
+    "ScrollLock",
+    "PrintScreen",
+    "Pause",
+    "Menu",
+    "Eject",
+    "Help",
+    "Power",
+    "Sleep",
+    "Clear",
     "F25",
     "F26",
     "F27",

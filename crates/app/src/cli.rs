@@ -3,7 +3,7 @@
 //! With no subcommand the app runs in tray mode. `play [FILE]` plays a single
 //! sound headlessly and exits; without `FILE` it plays the embedded demo.
 //! `mic-check` reports whether the virtual microphone can work, without
-//! opening a stream.
+//! opening a stream. `settings` opens the settings window.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -40,6 +40,9 @@ pub enum Command {
     /// and the microphone permission. Opens no stream and plays nothing;
     /// exits non-zero when the virtual mic cannot work.
     MicCheck,
+    /// Open the settings window: the virtual mic status and the sounds with
+    /// their hotkeys. The tray's "Settings…" item runs this.
+    Settings,
 }
 
 /// How often `play` checks whether playback has finished.
@@ -501,6 +504,17 @@ mod tests {
     fn mic_check_subcommand() {
         let cli = Cli::try_parse_from(["sound-babound", "mic-check"]).unwrap();
         assert_eq!(cli.command, Some(Command::MicCheck));
+    }
+
+    #[test]
+    fn settings_subcommand() {
+        let cli = Cli::try_parse_from(["sound-babound", "settings"]).unwrap();
+        assert_eq!(cli.command, Some(Command::Settings));
+    }
+
+    #[test]
+    fn settings_takes_no_arguments() {
+        assert!(Cli::try_parse_from(["sound-babound", "settings", "extra"]).is_err());
     }
 
     #[test]

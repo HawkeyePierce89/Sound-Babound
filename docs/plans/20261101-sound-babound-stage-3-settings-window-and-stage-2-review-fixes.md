@@ -340,16 +340,16 @@ Part B fixes the five findings from the stage 2 acceptance review:
 - Modify: `Cargo.toml`, `crates/app/Cargo.toml`, `crates/app/src/cli.rs`, `crates/app/src/main.rs`, `crates/app/src/settings/mod.rs`
 - Create: `crates/app/src/settings/view.rs`
 
-- [ ] Add the `eframe` and `rfd` workspace dependencies with the minimal features from Context.
-- [ ] CLI:
+- [x] Add the `eframe` and `rfd` workspace dependencies with the minimal features from Context.
+- [x] CLI:
   - add the `settings` subcommand to clap (with a parse test);
   - `main` dispatches it to `settings::run()`, which returns `ExitCode`;
   - Windows keeps the GUI subsystem, so no console window opens.
-- [ ] `settings::run()`:
+- [x] `settings::run()`:
   - resolve the config path with `paths::ensure_default_config` and build the form;
   - start a status thread that calls `mic_report::status_check` every 1 s and publishes the formatted report (a `Mutex<Option<String>>` plus a `request_repaint` on the egui context). The probe never runs on the UI thread, since a PulseAudio query can block;
   - run `eframe::run_native` with the "Sound-Babound settings" title and a fixed starting size, and request focus once at start (the macOS bundle is an `LSUIElement` agent).
-- [ ] `view.rs` is thin and holds no logic of its own:
+- [x] `view.rs` is thin and holds no logic of its own:
   - the status section with the report text, or "checking…";
   - the sounds list: an editable name, the path as text, the hotkey field and Remove;
   - "Add sound…" opens `rfd::FileDialog` with the `AUDIO_EXTENSIONS` filter;
@@ -357,8 +357,9 @@ Part B fixes the five findings from the stage 2 acceptance review:
   - problems from `validate()` show next to their rows;
   - Save is disabled unless `can_save()`. It calls `save::save_sounds`; on success it closes the window, and on error it shows the message and stays open;
   - Cancel and the window's close button close without writing.
-- [ ] One test in `view.rs` that opens no window: for every `egui::Key::ALL`, `config_key_name(key.name())` is either a name `parse_hotkey` accepts or the key is in the documented unsupported list. This catches egui renames.
-- [ ] Run the verification gates plus the Linux cross clippy (eframe and rfd must type-check for `x86_64-unknown-linux-gnu` with the stub pkg-config). All must pass before Task 11.
+  - Note: eframe 0.37 and rfd 0.17. The hotkey field is a button: a click starts capturing, and while it captures the view swallows every key and text event so no other widget sees them. It uses the physical key when egui reports one, since global hotkeys are physical. egui 0.37 reports modifier and system keys (ShiftLeft, CapsLock, MediaStop…) as keys too; they are in `UNSUPPORTED_UI_KEYS` (now `#[cfg(test)]`), so a lone modifier leaves the field waiting. "Add sound…" uses `pick_files`. The status thread holds a `Weak` to the report and ends once the window drops it. The view shows the `stop_all_hotkey` read-only, so a duplicate with it makes sense. `settings::load_form` turns an unreadable file into a form error (tested).
+- [x] One test in `view.rs` that opens no window: for every `egui::Key::ALL`, `config_key_name(key.name())` is either a name `parse_hotkey` accepts or the key is in the documented unsupported list. This catches egui renames.
+- [x] Run the verification gates plus the Linux cross clippy (eframe and rfd must type-check for `x86_64-unknown-linux-gnu` with the stub pkg-config). All must pass before Task 11.
 
 ### Task 11: Tray "Settings…" item, one instance, pause hotkeys, reload after save
 

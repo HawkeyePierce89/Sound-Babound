@@ -51,6 +51,10 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opener = "0.9"
+# App: the settings window (egui on glow, no accesskit or persistence) and its
+# file picker (the xdg portal on Linux, so no gtk and no pkg-config)
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 # App, macOS
 objc2 = "0.6"

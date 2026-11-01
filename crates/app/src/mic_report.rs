@@ -20,7 +20,6 @@ use crate::platform::{self, MicrophoneAccess};
 /// creating the file), the microphone permission and the devices the mic
 /// path would open. It opens no stream, and it probes the devices even with
 /// the mic off, so the setup can be checked before turning it on.
-#[expect(dead_code, reason = "the settings window (stage 3, Task 10) uses it")]
 pub fn status_check(path: &Path) -> MicCheck {
     let (mic, notes) = mic_config_at(path);
     check_with(

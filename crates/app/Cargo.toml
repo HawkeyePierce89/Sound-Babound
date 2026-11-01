@@ -24,6 +24,8 @@ dirs.workspace = true
 tao.workspace = true
 tray-icon.workspace = true
 opener.workspace = true
+eframe.workspace = true
+rfd.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

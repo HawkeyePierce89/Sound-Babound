@@ -9,10 +9,6 @@ mod logging;
 mod mic_report;
 mod paths;
 mod platform;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the settings window (stage 3, Task 10) uses it")
-)]
 mod settings;
 #[cfg(test)]
 mod test_support;
@@ -39,5 +35,6 @@ fn main() -> anyhow::Result<ExitCode> {
         None => tray_app::run().map(|()| ExitCode::SUCCESS),
         Some(Command::Play { file }) => cli::run_play(file).map(|()| ExitCode::SUCCESS),
         Some(Command::MicCheck) => cli::run_mic_check(),
+        Some(Command::Settings) => Ok(settings::run()),
     }
 }
