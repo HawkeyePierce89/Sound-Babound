@@ -95,14 +95,14 @@ Replace the single embedded demo chime with a registry of built-in sounds, and e
 **Files:**
 - Modify: `crates/app/src/config.rs`, `crates/app/src/hotkeys.rs`, `crates/app/src/actions.rs`, `crates/app/src/settings/form.rs`, `crates/app/src/settings/save.rs`
 
-- [ ] In `DEFAULT_CONFIG`, replace the demo entry with one `[[sound]]` per registry entry except the demo, in registry order. Each entry has only `name = "<label>"` and `path = "builtin:<name>"`, with no hotkey and no gain line. `stop_all_hotkey` stays as it is. The commented file example (with its example hotkey) stays.
-- [ ] Rewrite the comment above the list. It explains that `builtin:<name>` plays a sound embedded in the app, that the list with credits is in `SOURCES.md` (`crates/app/assets/sounds/` in the source) and in the settings window's "Add built-in…", and that hotkeys are set in the settings window or by adding a `hotkey` line.
-- [ ] Tests:
+- [x] In `DEFAULT_CONFIG`, replace the demo entry with one `[[sound]]` per registry entry except the demo, in registry order. Each entry has only `name = "<label>"` and `path = "builtin:<name>"`, with no hotkey and no gain line. `stop_all_hotkey` stays as it is. The commented file example (with its example hotkey) stays.
+- [x] Rewrite the comment above the list. It explains that `builtin:<name>` plays a sound embedded in the app, that the list with credits is in `SOURCES.md` (`crates/app/assets/sounds/` in the source) and in the settings window's "Add built-in…", and that hotkeys are set in the settings window or by adding a `hotkey` line.
+- [x] Tests:
   - Replace `default_template_parses_and_references_builtin_demo` with a test that the template's sounds equal the registry minus the demo, as `(label, "builtin:<name>")` pairs in order. Each has no hotkey, and each path resolves to `SoundSource::Builtin`.
   - Update `hotkeys::default_template_resolves_without_warnings`: no warnings, N sounds, all with hotkey `None`, and stop-all is set.
   - Add an `actions.rs` test that the `ActionMap` built from the default template has every built-in in the menu and only the stop-all hotkey.
-- [ ] Update `form.rs::the_default_template_is_valid` (row count from the registry). Rebase the `save.rs` template tests (round trip, remove-all keeps the list comment, mic toggle kept, refused change, symlink) on the template's first entry (`Air horn`) instead of `DEMO_ENTRY`.
-- [ ] Run the test suite; it must pass before Task 4.
+- [x] Update `form.rs::the_default_template_is_valid` (row count from the registry). Rebase the `save.rs` template tests (round trip, remove-all keeps the list comment, mic toggle kept, refused change, symlink) on the template's first entry (`Air horn`) instead of `DEMO_ENTRY`.
+- [x] Run the test suite; it must pass before Task 4.
 
 ### Task 4: `play builtin:<name>` and `play --output-only`
 

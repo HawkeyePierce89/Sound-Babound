@@ -308,16 +308,9 @@ mod tests {
                 Code::Digit0
             ))
         );
-        assert_eq!(resolved.sounds.len(), 1);
-        assert_eq!(resolved.sounds[0].source, SoundSource::Builtin(DEMO));
+        assert_eq!(resolved.sounds.len(), config::BUILTIN_SOUNDS.len() - 1);
+        assert!(resolved.sounds.iter().all(|sound| sound.hotkey.is_none()));
         assert_eq!(resolved.mic, MicConfig::default());
-        assert_eq!(
-            resolved.sounds[0].hotkey,
-            Some(HotKey::new(
-                Some(cmd_or_ctrl() | Modifiers::SHIFT),
-                Code::Digit1
-            ))
-        );
     }
 
     #[test]

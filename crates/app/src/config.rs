@@ -33,7 +33,7 @@ pub struct BuiltinSound {
     /// The text shown in menus and written as the default sound name.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "first read by the default template (Task 3)")
+        expect(dead_code, reason = "first read by the Add built-in menu (Task 5)")
     )]
     pub label: &'static str,
     /// The encoded file (WAV for the demo, OGG Vorbis for the rest).
@@ -148,14 +148,61 @@ mic_gain = 1.0
 #   name   - label shown in the tray menu (required)
 #   path   - audio file (WAV, FLAC, OGG Vorbis or MP3), required. Absolute
 #            paths are used as-is; relative paths are resolved against the
-#            folder this file lives in. "builtin:demo" is the embedded chime.
-#   hotkey - global hotkey that plays the sound (optional)
+#            folder this file lives in. "builtin:<name>" plays a sound
+#            embedded in the app. The built-in sounds are listed below; their
+#            credits are in SOURCES.md (crates/app/assets/sounds/ in the
+#            source), and "Add built-in…" in the settings window adds them.
+#   hotkey - global hotkey that plays the sound (optional). The built-in
+#            sounds have none: set one in the settings window, or add a
+#            hotkey line here.
 #   gain   - per-sound volume from 0.0 to 4.0 (optional, default 1.0)
 [[sound]]
-name = "Demo chime"
-path = "builtin:demo"
-hotkey = "CmdOrCtrl+Shift+1"
-gain = 1.0
+name = "Air horn"
+path = "builtin:airhorn"
+
+[[sound]]
+name = "Drum roll"
+path = "builtin:drumroll"
+
+[[sound]]
+name = "Crickets"
+path = "builtin:crickets"
+
+[[sound]]
+name = "Applause"
+path = "builtin:applause"
+
+[[sound]]
+name = "Rimshot"
+path = "builtin:rimshot"
+
+[[sound]]
+name = "Sad trombone"
+path = "builtin:sad-trombone"
+
+[[sound]]
+name = "Bell"
+path = "builtin:bell"
+
+[[sound]]
+name = "Buzzer"
+path = "builtin:buzzer"
+
+[[sound]]
+name = "Ding"
+path = "builtin:ding"
+
+[[sound]]
+name = "Boing"
+path = "builtin:boing"
+
+[[sound]]
+name = "Laugh"
+path = "builtin:laugh"
+
+[[sound]]
+name = "Slide whistle"
+path = "builtin:slide-whistle"
 
 # [[sound]]
 # name = "Airhorn"
@@ -543,15 +590,36 @@ mod tests {
     }
 
     #[test]
-    fn default_template_parses_and_references_builtin_demo() {
+    fn default_template_lists_the_builtin_set_without_hotkeys() {
         let raw = parse(DEFAULT_CONFIG).unwrap();
         assert_eq!(raw.master_gain, 1.0);
         assert_eq!(raw.stop_all_hotkey.as_deref(), Some("CmdOrCtrl+Shift+0"));
-        assert_eq!(raw.sounds.len(), 1);
-        let demo = &raw.sounds[0];
-        assert_eq!(demo.path, DEMO.path);
-        assert_eq!(demo.hotkey.as_deref(), Some("CmdOrCtrl+Shift+1"));
-        assert_eq!(demo.gain, 1.0);
+        let expected: Vec<(String, String)> = BUILTIN_SOUNDS
+            .iter()
+            .filter(|entry| entry.name != "demo")
+            .map(|entry| (entry.label.to_owned(), entry.path.to_owned()))
+            .collect();
+        assert_eq!(expected.len(), BUILTIN_SOUNDS.len() - 1);
+        let listed: Vec<(String, String)> = raw
+            .sounds
+            .iter()
+            .map(|sound| (sound.name.clone(), sound.path.clone()))
+            .collect();
+        assert_eq!(listed, expected);
+        for sound in &raw.sounds {
+            assert_eq!(sound.hotkey, None, "{}", sound.name);
+            assert_eq!(sound.gain, 1.0, "{}", sound.name);
+            assert!(
+                matches!(
+                    SoundSource::resolve(&sound.path, Path::new(".")),
+                    Ok(SoundSource::Builtin(_))
+                ),
+                "{}",
+                sound.path
+            );
+        }
+        // The file example stays commented out.
+        assert!(DEFAULT_CONFIG.contains("# hotkey = \"CmdOrCtrl+Shift+2\""));
         assert_eq!(raw.mic, RawMic::default());
     }
 

@@ -295,7 +295,9 @@ path = "sounds/airhorn.mp3"
     #[test]
     fn the_default_template_is_valid() {
         let form = SettingsForm::from_text(config::DEFAULT_CONFIG);
-        assert_eq!(form.rows().len(), 1);
+        assert!(form.editable(), "{:?}", form.error());
+        assert_eq!(form.rows().len(), config::BUILTIN_SOUNDS.len() - 1);
+        assert!(form.rows().iter().all(|row| row.hotkey.is_none()));
         assert!(form.can_save());
     }
 

@@ -303,8 +303,8 @@ mod tests {
             .collect()
     }
 
-    const DEMO_ENTRY: &str = "[[sound]]\nname = \"Demo chime\"\npath = \"builtin:demo\"\n\
-                              hotkey = \"CmdOrCtrl+Shift+1\"\ngain = 1.0\n";
+    /// The template's first entry.
+    const FIRST_ENTRY: &str = "[[sound]]\nname = \"Air horn\"\npath = \"builtin:airhorn\"\n";
 
     #[test]
     fn unchanged_rows_keep_the_file_byte_identical() {
@@ -312,11 +312,17 @@ mod tests {
         assert_eq!(applied(DEFAULT_CONFIG, &loaded, &rows), DEFAULT_CONFIG);
     }
 
+    /// The template's last entry.
+    const LAST_ENTRY: &str =
+        "[[sound]]\nname = \"Slide whistle\"\npath = \"builtin:slide-whistle\"\n";
+
     #[test]
     fn round_trip_on_the_template_edits_only_the_sounds() {
         let dir = TempDir::new("save-template");
         let path = write_config(&dir, DEFAULT_CONFIG);
-        assert_eq!(DEFAULT_CONFIG.matches(DEMO_ENTRY).count(), 1);
+        assert_eq!(DEFAULT_CONFIG.matches(FIRST_ENTRY).count(), 1);
+        assert_eq!(DEFAULT_CONFIG.matches(LAST_ENTRY).count(), 1);
+        let count = config::parse(DEFAULT_CONFIG).unwrap().sounds.len();
 
         // Add a sound with a hotkey.
         let (loaded, mut rows) = rows_of(DEFAULT_CONFIG);
@@ -331,37 +337,40 @@ mod tests {
                     hotkey = \"CmdOrCtrl+Shift+2\"\n";
         assert_eq!(
             added,
-            DEFAULT_CONFIG.replace(DEMO_ENTRY, &format!("{DEMO_ENTRY}{horn}")),
+            DEFAULT_CONFIG.replace(LAST_ENTRY, &format!("{LAST_ENTRY}{horn}")),
         );
 
-        // Rename the demo and clear its hotkey, change the horn's hotkey, add
-        // a sound without one, then remove the horn.
+        // Rename the first sound and give it a hotkey, change the horn's
+        // hotkey, add a sound without one.
         let (loaded, mut rows) = rows_of(&added);
-        rows[0].name = "Chime".to_owned();
-        rows[0].hotkey = None;
-        rows[1].hotkey = Some("Ctrl+Alt+F5".to_owned());
+        rows[0].name = "Klaxon".to_owned();
+        rows[0].hotkey = Some("CmdOrCtrl+Shift+1".to_owned());
+        rows[count].hotkey = Some("Ctrl+Alt+F5".to_owned());
         rows.push(new_row("Bell", "/sounds/bell.ogg", None));
         save_sounds(&path, &loaded, &rows).unwrap();
         let edited = fs::read_to_string(&path).unwrap();
-        let expected = DEFAULT_CONFIG.replace(
-            DEMO_ENTRY,
-            "[[sound]]\nname = \"Chime\"\npath = \"builtin:demo\"\ngain = 1.0\n\
-             \n[[sound]]\nname = \"Horn\"\npath = \"/sounds/horn.wav\"\n\
-             hotkey = \"Ctrl+Alt+F5\"\n\
-             \n[[sound]]\nname = \"Bell\"\npath = \"/sounds/bell.ogg\"\n",
+        let klaxon = "[[sound]]\nname = \"Klaxon\"\npath = \"builtin:airhorn\"\n\
+                      hotkey = \"CmdOrCtrl+Shift+1\"\n";
+        let expected = DEFAULT_CONFIG.replace(FIRST_ENTRY, klaxon).replace(
+            LAST_ENTRY,
+            &format!(
+                "{LAST_ENTRY}\n[[sound]]\nname = \"Horn\"\npath = \"/sounds/horn.wav\"\n\
+                 hotkey = \"Ctrl+Alt+F5\"\n\
+                 \n[[sound]]\nname = \"Bell\"\npath = \"/sounds/bell.ogg\"\n"
+            ),
         );
         assert_eq!(edited, expected);
 
+        // Remove the horn.
         let (loaded, mut rows) = rows_of(&edited);
-        rows.remove(1);
+        rows.remove(count);
         save_sounds(&path, &loaded, &rows).unwrap();
         let removed = fs::read_to_string(&path).unwrap();
         assert_eq!(
             removed,
-            DEFAULT_CONFIG.replace(
-                DEMO_ENTRY,
-                "[[sound]]\nname = \"Chime\"\npath = \"builtin:demo\"\ngain = 1.0\n\
-                 \n[[sound]]\nname = \"Bell\"\npath = \"/sounds/bell.ogg\"\n",
+            DEFAULT_CONFIG.replace(FIRST_ENTRY, klaxon).replace(
+                LAST_ENTRY,
+                &format!("{LAST_ENTRY}\n[[sound]]\nname = \"Bell\"\npath = \"/sounds/bell.ogg\"\n"),
             )
         );
 
@@ -369,12 +378,20 @@ mod tests {
         assert_eq!(raw.master_gain, 1.0);
         assert_eq!(raw.stop_all_hotkey.as_deref(), Some("CmdOrCtrl+Shift+0"));
         assert_eq!(raw.mic, config::parse(DEFAULT_CONFIG).unwrap().mic);
+        let sounds = sounds_in(&removed);
+        assert_eq!(sounds.len(), count + 1);
         assert_eq!(
-            sounds_in(&removed),
-            [
-                ("Chime".into(), "builtin:demo".into(), None, 1.0),
-                ("Bell".into(), "/sounds/bell.ogg".into(), None, 1.0),
-            ]
+            sounds[0],
+            (
+                "Klaxon".into(),
+                "builtin:airhorn".into(),
+                Some("CmdOrCtrl+Shift+1".into()),
+                1.0
+            )
+        );
+        assert_eq!(
+            sounds[count],
+            ("Bell".into(), "/sounds/bell.ogg".into(), None, 1.0)
         );
     }
 
@@ -474,10 +491,10 @@ mod tests {
         let (loaded, _) = rows_of(DEFAULT_CONFIG);
         let out = applied(DEFAULT_CONFIG, &loaded, &[]);
         let comment_start = DEFAULT_CONFIG.find("# One [[sound]] block").unwrap();
-        let comment_end = DEFAULT_CONFIG.find(DEMO_ENTRY).unwrap();
+        let comment_end = DEFAULT_CONFIG.find(FIRST_ENTRY).unwrap();
         let comment = &DEFAULT_CONFIG[comment_start..comment_end];
         assert!(out.contains(comment), "{out}");
-        assert!(!out.contains(DEMO_ENTRY));
+        assert!(!out.contains(FIRST_ENTRY));
         assert!(sounds_in(&out).is_empty());
         // Everything before the list is untouched.
         assert!(out.starts_with(&DEFAULT_CONFIG[..comment_start]));
@@ -522,7 +539,7 @@ mod tests {
             out,
             DEFAULT_CONFIG
                 .replace("enabled = false", "enabled = true")
-                .replace("name = \"Demo chime\"", "name = \"Chime\"")
+                .replace("name = \"Air horn\"", "name = \"Chime\"")
         );
     }
 
@@ -531,12 +548,14 @@ mod tests {
         let dir = TempDir::new("save-changed");
         let (loaded, mut rows) = rows_of(DEFAULT_CONFIG);
         rows[0].name = "Chime".to_owned();
-        let changed =
-            DEFAULT_CONFIG.replace("gain = 1.0\n\n# [[sound]]", "gain = 0.5\n\n# [[sound]]");
+        let changed = DEFAULT_CONFIG.replace(
+            "slide-whistle\"\n\n# [[sound]]",
+            "slide-whistle\"\ngain = 0.5\n\n# [[sound]]",
+        );
         assert_ne!(changed, DEFAULT_CONFIG);
         for text in [
             changed.as_str(),
-            &DEFAULT_CONFIG.replace(DEMO_ENTRY, ""),
+            &DEFAULT_CONFIG.replace(FIRST_ENTRY, ""),
             &format!("{DEFAULT_CONFIG}\n[[sound]]\nname = \"x\"\npath = \"x.wav\"\n"),
         ] {
             let path = write_config(&dir, text);
@@ -601,7 +620,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
-            DEFAULT_CONFIG.replace("name = \"Demo chime\"", "name = \"Chime\"")
+            DEFAULT_CONFIG.replace("name = \"Air horn\"", "name = \"Chime\"")
         );
     }
 }
