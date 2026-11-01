@@ -429,14 +429,15 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 
 ### Task 15: Verify acceptance criteria
 
-- [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --workspace --all-targets`, with zero warnings
-- [ ] `cargo test --workspace`
-- [ ] `cargo check --workspace --target x86_64-pc-windows-msvc`
-- [ ] Linux stub pkg-config `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu`
-- [ ] Confirm each Part A test fails without its fix: revert each fix locally, run the test, restore.
-- [ ] Confirm the drift test (AC4), the feedback exclusion test (AC5), the role isolation tests (AC6) and the mic-off test (AC8) exist and pass.
-- [ ] Check test coverage of the new engine modules (passthrough, capture selection, supervisor roles); aim for 80% or more.
+- [x] `cargo fmt --all -- --check`
+- [x] `cargo clippy --workspace --all-targets`, with zero warnings
+- [x] `cargo test --workspace`
+- [x] `cargo check --workspace --target x86_64-pc-windows-msvc`
+- [x] Linux stub pkg-config `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu`
+- [x] Confirm each Part A test fails without its fix: revert each fix locally, run the test, restore.
+- [x] Confirm the drift test (AC4), the feedback exclusion test (AC5), the role isolation tests (AC6) and the mic-off test (AC8) exist and pass.
+- [x] Check test coverage of the new engine modules (passthrough, capture selection, supervisor roles); aim for 80% or more.
+  (All five gates are clean. Part A reverts, each restored afterwards: A.1, an always-`stall` deadline fails the startup grace tests; A.2, returning the parse error fails `startup_falls_back_on_malformed_config` and the reload test; A.3, `accepts_plays` without the grace fails the live-rebuild engine and supervisor tests, and an unconditional offline purge fails the purge and in-window drop tests; A.4, mapping `DeviceChanged` to `Other` and warn fails `device_changed_maps_to_its_own_kind` and `device_changed_logs_at_debug_and_others_at_warn`. AC4: `passthrough::tests::drift_*` and `capture_clock_drift_holds_the_target`; AC5: the `capture::tests` `choose_input` tests; AC6: `switching_the_default_input_rebuilds_only_the_capture`, `switching_the_default_output_rebuilds_only_the_monitor`, `a_missing_mic_sink_retries_while_the_monitor_plays`; AC8: `mic_off_builds_no_mic_streams`. Coverage, measured with `-C instrument-coverage` and Xcode's llvm-cov: passthrough.rs 98% of lines, supervisor.rs 99%, sink.rs 98%; capture.rs 44% overall, but `choose_input`, `is_excluded` and `NoticeLog` are 100%, and the misses are the cpal device code (`select`, `build`, `probe`, `build_typed`) that only the `#[ignore]` smoke test reaches.)
 
 ### Task 16: Update documentation
 
