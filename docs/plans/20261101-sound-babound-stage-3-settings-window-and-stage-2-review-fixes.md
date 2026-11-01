@@ -175,26 +175,28 @@ Part B fixes the five findings from the stage 2 acceptance review:
 **Files:**
 - Modify: `crates/engine/src/platform/linux.rs`, `crates/engine/src/platform/shared_host.rs`, `crates/engine/Cargo.toml`, `Cargo.toml`
 
-- [ ] `server_answers` connects with a bounded non-blocking AF_UNIX connect (`socket2`, Linux target only):
+- [x] `server_answers` connects with a bounded non-blocking AF_UNIX connect (`socket2`, Linux target only):
   - an immediate `WouldBlock`/`EAGAIN` (the listener's backlog is full) fails the probe at once;
   - `EINPROGRESS` waits for writability for at most the probe timeout;
   - the socket is then checked as connected, switched back to blocking with the existing read and write timeouts, and turned into a `UnixStream`.
   - No `unsafe` unless `socket2` cannot express a step.
-- [ ] `Backoff::probe_failed(now)`: arms the hold-off with the same doubling as `failed`, but never counts a stalled connect.
-- [ ] The decision in `connect_pulse` becomes a pure generic function in `shared_host.rs`, so it is tested on every OS: hold-off check, then probe, then connect, with `failed` on a connect error and `probe_failed` on a failed probe. Its arguments are the backoff, the clock reading and closures for the probe and the connect.
-- [ ] `connect_pulse` calls it and logs:
+  - Note: no `unsafe`. socket2 has no public poll, so an `EINPROGRESS` (which a Unix socket connect does not normally report) is waited out by checking `take_error`/`peer_addr` every 5 ms. socket2's own `connect_timeout` was not used, because it treats `EAGAIN` as in progress. `libc` is a Linux dependency only for the `EINPROGRESS` constant (`io::ErrorKind::InProgress` is unstable).
+- [x] `Backoff::probe_failed(now)`: arms the hold-off with the same doubling as `failed`, but never counts a stalled connect.
+- [x] The decision in `connect_pulse` becomes a pure generic function in `shared_host.rs`, so it is tested on every OS: hold-off check, then probe, then connect, with `failed` on a connect error and `probe_failed` on a failed probe. Its arguments are the backoff, the clock reading and closures for the probe and the connect.
+- [x] `connect_pulse` calls it and logs:
   - a failed probe at debug (the 1 Hz pollers would flood the log);
   - the existing warn and error lines for connects stay.
-- [ ] Tests in `shared_host.rs`, on every OS:
+- [x] Tests in `shared_host.rs`, on every OS:
   - a failed probe arms the hold-off, and a call inside it neither probes nor connects;
   - the hold-off doubles up to 60 s over failed probes;
   - ten failed probes in a row leave `exhausted()` false;
   - a successful connect resets the hold-off;
   - the existing connect-failure behavior is unchanged.
-- [ ] Linux-only test in `linux.rs`: a `socket2` listener with backlog 0 that never accepts, filled with non-blocking connects until `WouldBlock`. Then `server_answers` must return false within the probe timeout plus slack.
+- [x] Linux-only test in `linux.rs`: a `socket2` listener with backlog 0 that never accepts, filled with non-blocking connects until `WouldBlock`. Then `server_answers` must return false within the probe timeout plus slack.
   - This is deterministic on Linux, since a full backlog returns `EAGAIN` for a non-blocking connect.
   - It runs only on a Linux host. From macOS it is only type-checked by the stub-pkg-config clippy, and the task notes say so.
-- [ ] Run the verification gates plus the Linux cross clippy. All must pass before Task 5.
+  - Note: this iteration also ran the engine's `platform::` tests in a local `rust:1.98` Linux container (no audio devices): all 20 passed. As a revert check, swapping the bounded connect for the old blocking `UnixStream::connect` made the backlog test fail.
+- [x] Run the verification gates plus the Linux cross clippy. All must pass before Task 5.
 
 ### Task 5: Device worker thread for the virtual mic (B.3, part 1: state machine)
 
