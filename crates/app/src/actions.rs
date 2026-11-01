@@ -568,7 +568,7 @@ mod tests {
     fn entry(name: &str, hotkey: Option<HotKey>) -> ResolvedSound {
         ResolvedSound {
             name: name.into(),
-            source: SoundSource::BuiltinDemo,
+            source: SoundSource::Builtin(crate::config::DEMO),
             hotkey,
             gain: 1.0,
         }
@@ -851,7 +851,7 @@ mod tests {
         board.play(7, &fake);
         assert_eq!(
             *fake.plays.borrow(),
-            [(crate::config::DEMO_LABEL.to_string(), 0.5)]
+            [(crate::config::DEMO.path.to_string(), 0.5)]
         );
     }
 

@@ -208,7 +208,7 @@ fn output_drain(latency: Duration) -> Duration {
 pub fn load_play_sound(file: Option<&Path>) -> Result<Sound> {
     let source = match file {
         Some(path) => SoundSource::File(path.to_path_buf()),
-        None => SoundSource::BuiltinDemo,
+        None => SoundSource::Builtin(crate::config::DEMO),
     };
     source.load().with_context(|| match file {
         Some(path) => format!("cannot play {}", path.display()),
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn embedded_demo_decodes_through_cli_path() {
         let sound = load_play_sound(None).unwrap();
-        assert_eq!(sound.label(), crate::config::DEMO_LABEL);
+        assert_eq!(sound.label(), crate::config::DEMO.path);
         assert_eq!(sound.sample_rate(), 44_100);
         assert!(sound.frames() > 0);
     }
@@ -366,7 +366,7 @@ mod tests {
     fn demo_file_on_disk_decodes_through_cli_path() {
         let dir = TempDir::new("play-demo-file");
         let path = dir.path().join("demo.wav");
-        std::fs::write(&path, crate::config::DEMO_WAV).unwrap();
+        std::fs::write(&path, crate::config::DEMO.bytes).unwrap();
         let from_file = load_play_sound(Some(&path)).unwrap();
         let embedded = load_play_sound(None).unwrap();
         assert_eq!(from_file.frames(), embedded.frames());

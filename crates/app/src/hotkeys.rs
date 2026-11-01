@@ -184,7 +184,7 @@ mod tests {
     use global_hotkey::hotkey::{Code, Modifiers};
 
     use super::*;
-    use crate::config::{self, BUILTIN_DEMO, DEFAULT_CONFIG, RawSound};
+    use crate::config::{self, DEFAULT_CONFIG, DEMO, RawSound};
 
     fn sound(name: &str, path: &str, hotkey: Option<&str>, gain: f32) -> RawSound {
         RawSound {
@@ -309,7 +309,7 @@ mod tests {
             ))
         );
         assert_eq!(resolved.sounds.len(), 1);
-        assert_eq!(resolved.sounds[0].source, SoundSource::BuiltinDemo);
+        assert_eq!(resolved.sounds[0].source, SoundSource::Builtin(DEMO));
         assert_eq!(resolved.mic, MicConfig::default());
         assert_eq!(
             resolved.sounds[0].hotkey,
@@ -324,7 +324,7 @@ mod tests {
     fn garbage_hotkey_warns_and_keeps_the_sound() {
         let raw = RawConfig {
             stop_all_hotkey: Some("Nope+Nope".into()),
-            sounds: vec![sound("a", BUILTIN_DEMO, Some("Ctrl+Banana"), 1.0)],
+            sounds: vec![sound("a", DEMO.path, Some("Ctrl+Banana"), 1.0)],
             ..RawConfig::default()
         };
         let (resolved, warnings) = resolve(&raw, Path::new("/cfg"));
@@ -341,11 +341,11 @@ mod tests {
         let raw = RawConfig {
             stop_all_hotkey: Some("Ctrl+Shift+0".into()),
             sounds: vec![
-                sound("a", BUILTIN_DEMO, Some("Ctrl+Shift+1"), 1.0),
+                sound("a", DEMO.path, Some("Ctrl+Shift+1"), 1.0),
                 // Same hotkey, different spelling.
-                sound("b", BUILTIN_DEMO, Some("shift+control+1"), 1.0),
-                sound("c", BUILTIN_DEMO, Some("Ctrl+Shift+0"), 1.0),
-                sound("d", BUILTIN_DEMO, Some("Ctrl+Shift+1"), 1.0),
+                sound("b", DEMO.path, Some("shift+control+1"), 1.0),
+                sound("c", DEMO.path, Some("Ctrl+Shift+0"), 1.0),
+                sound("d", DEMO.path, Some("Ctrl+Shift+1"), 1.0),
             ],
             ..RawConfig::default()
         };
@@ -364,8 +364,8 @@ mod tests {
         let raw = RawConfig {
             stop_all_hotkey: Some("  ".into()),
             sounds: vec![
-                sound("a", BUILTIN_DEMO, Some(""), 1.0),
-                sound("b", BUILTIN_DEMO, None, 1.0),
+                sound("a", DEMO.path, Some(""), 1.0),
+                sound("b", DEMO.path, None, 1.0),
             ],
             ..RawConfig::default()
         };
@@ -380,10 +380,10 @@ mod tests {
         let raw = RawConfig {
             master_gain: 9.0,
             sounds: vec![
-                sound("loud", BUILTIN_DEMO, None, 5.0),
-                sound("negative", BUILTIN_DEMO, None, -1.0),
-                sound("ok", BUILTIN_DEMO, None, 0.5),
-                sound("nan", BUILTIN_DEMO, None, f32::NAN),
+                sound("loud", DEMO.path, None, 5.0),
+                sound("negative", DEMO.path, None, -1.0),
+                sound("ok", DEMO.path, None, 0.5),
+                sound("nan", DEMO.path, None, f32::NAN),
             ],
             ..RawConfig::default()
         };
@@ -423,7 +423,7 @@ mod tests {
         let abs = std::env::temp_dir().join("abs.wav");
         let raw = RawConfig {
             sounds: vec![
-                sound("demo", BUILTIN_DEMO, None, 1.0),
+                sound("demo", DEMO.path, None, 1.0),
                 sound("abs", abs.to_str().unwrap(), None, 1.0),
                 sound("rel", "sounds/rel.wav", None, 1.0),
             ],
@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(
             sources,
             [
-                SoundSource::BuiltinDemo,
+                SoundSource::Builtin(DEMO),
                 SoundSource::File(abs),
                 SoundSource::File(dir.join("sounds/rel.wav")),
             ]

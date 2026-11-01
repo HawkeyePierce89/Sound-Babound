@@ -66,17 +66,17 @@ Replace the single embedded demo chime with a registry of built-in sounds, and e
 **Files:**
 - Modify: `crates/app/src/config.rs`, `crates/app/src/cli.rs`, `crates/app/src/hotkeys.rs`, `crates/app/src/actions.rs`
 
-- [ ] Add `pub struct BuiltinSound { name, path, label, bytes }`, all `&'static`:
+- [x] Add `pub struct BuiltinSound { name, path, label, bytes }`, all `&'static`:
   - `path` is `"builtin:<name>"` and is also the decode label.
   - `Debug` and `PartialEq` are written by hand, by name only, so the bytes never print or get compared.
   - A small `macro_rules!` builds an entry with `concat!`/`include_bytes!("../assets/sounds/<name>.ogg")`.
-- [ ] Add `pub static BUILTIN_SOUNDS: &[BuiltinSound]`. It starts with `demo` ("Demo chime", `../assets/demo.wav`, unchanged), followed by the twelve in `sources.txt` order with these labels: "Air horn", "Drum roll", "Crickets", "Applause", "Rimshot", "Sad trombone", "Bell", "Buzzer", "Ding", "Boing", "Laugh", "Slide whistle". Also add `pub fn builtin(name) -> Option<&'static BuiltinSound>` (case-insensitive) and a `DEMO: &BuiltinSound` accessor for the `play` default.
-- [ ] Replace `SoundSource::BuiltinDemo` with `SoundSource::Builtin(&'static BuiltinSound)`:
+- [x] Add `pub static BUILTIN_SOUNDS: &[BuiltinSound]`. It starts with `demo` ("Demo chime", `../assets/demo.wav`, unchanged), followed by the twelve in `sources.txt` order with these labels: "Air horn", "Drum roll", "Crickets", "Applause", "Rimshot", "Sad trombone", "Bell", "Buzzer", "Ding", "Boing", "Laugh", "Slide whistle". Also add `pub fn builtin(name) -> Option<&'static BuiltinSound>` (case-insensitive) and a `DEMO: &BuiltinSound` accessor for the `play` default.
+- [x] Replace `SoundSource::BuiltinDemo` with `SoundSource::Builtin(&'static BuiltinSound)`:
   - `resolve` matches the `builtin:` prefix case-insensitively and looks up the name case-insensitively.
   - An unknown name fails with `unknown built-in sound "builtin:x"; available: builtin:demo, builtin:airhorn, …`.
   - `load` decodes `entry.bytes` with `entry.path` as the label.
   - Remove `BUILTIN_DEMO`, `DEMO_WAV` and `DEMO_LABEL`, and update their users (the `cli.rs` default and its tests, the `hotkeys.rs` and `actions.rs` tests) to the registry.
-- [ ] Tests in `config.rs`:
+- [x] Tests in `config.rs`:
   - every entry decodes with a non-zero frame count;
   - names are unique and match `[a-z0-9-]+`;
   - labels are non-empty;
@@ -88,7 +88,7 @@ Replace the single embedded demo chime with a registry of built-in sounds, and e
   - an unknown name lists the available names.
 
   The `hotkeys.rs` test expecting `builtin:nope` in a warning must still pass.
-- [ ] Run the test suite; it must pass before Task 3.
+- [x] Run the test suite; it must pass before Task 3.
 
 ### Task 3: The default template lists the built-in set
 

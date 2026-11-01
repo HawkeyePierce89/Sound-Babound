@@ -18,17 +18,86 @@ use toml_edit::{DocumentMut, Item, Value};
 
 use crate::platform;
 
-/// Path value that selects the embedded demo chime.
-pub const BUILTIN_DEMO: &str = "builtin:demo";
-
 /// Prefix shared by all built-in sound paths.
 const BUILTIN_PREFIX: &str = "builtin:";
 
-/// The embedded demo chime (44.1 kHz mono WAV).
-pub const DEMO_WAV: &[u8] = include_bytes!("../assets/demo.wav");
+/// A sound embedded in the app.
+///
+/// `Debug` and `PartialEq` look at the name only, so the bytes never print or
+/// get compared.
+pub struct BuiltinSound {
+    /// The name after `builtin:`, lowercase `[a-z0-9-]+`.
+    pub name: &'static str,
+    /// `"builtin:<name>"`; also the decode label.
+    pub path: &'static str,
+    /// The text shown in menus and written as the default sound name.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "first read by the default template (Task 3)")
+    )]
+    pub label: &'static str,
+    /// The encoded file (WAV for the demo, OGG Vorbis for the rest).
+    pub bytes: &'static [u8],
+}
 
-/// Label used for the embedded demo when it is decoded.
-pub const DEMO_LABEL: &str = "builtin:demo";
+impl std::fmt::Debug for BuiltinSound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuiltinSound")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for BuiltinSound {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for BuiltinSound {}
+
+macro_rules! builtin_sound {
+    ($name:literal, $label:literal, $file:expr) => {
+        BuiltinSound {
+            name: $name,
+            path: concat!("builtin:", $name),
+            label: $label,
+            bytes: include_bytes!(concat!("../assets/", $file)),
+        }
+    };
+    ($name:literal, $label:literal) => {
+        builtin_sound!($name, $label, concat!("sounds/", $name, ".ogg"))
+    };
+}
+
+/// Every built-in sound: the demo chime first, then the CC0 set in the order of
+/// `scripts/convert-sounds.sh`'s `sources.txt` (credits in
+/// `assets/sounds/SOURCES.md`).
+pub static BUILTIN_SOUNDS: &[BuiltinSound] = &[
+    builtin_sound!("demo", "Demo chime", "demo.wav"),
+    builtin_sound!("airhorn", "Air horn"),
+    builtin_sound!("drumroll", "Drum roll"),
+    builtin_sound!("crickets", "Crickets"),
+    builtin_sound!("applause", "Applause"),
+    builtin_sound!("rimshot", "Rimshot"),
+    builtin_sound!("sad-trombone", "Sad trombone"),
+    builtin_sound!("bell", "Bell"),
+    builtin_sound!("buzzer", "Buzzer"),
+    builtin_sound!("ding", "Ding"),
+    builtin_sound!("boing", "Boing"),
+    builtin_sound!("laugh", "Laugh"),
+    builtin_sound!("slide-whistle", "Slide whistle"),
+];
+
+/// The demo chime, the default of the headless `play`.
+pub static DEMO: &BuiltinSound = &BUILTIN_SOUNDS[0];
+
+/// Looks a built-in sound up by name (the part after `builtin:`), ignoring case.
+pub fn builtin(name: &str) -> Option<&'static BuiltinSound> {
+    BUILTIN_SOUNDS
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(name))
+}
 
 /// Commented config template written on first start.
 pub const DEFAULT_CONFIG: &str = r#"# Sound-Babound configuration.
@@ -175,31 +244,36 @@ pub fn load(path: &Path) -> Result<RawConfig> {
 /// Where a sound's audio comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SoundSource {
-    /// The embedded demo chime.
-    BuiltinDemo,
+    /// A sound embedded in the app.
+    Builtin(&'static BuiltinSound),
     /// A file on disk (absolute after resolution).
     File(PathBuf),
 }
 
 impl SoundSource {
-    /// Resolves a config `path` value. `builtin:demo` maps to the embedded
-    /// asset, absolute paths are used as-is and relative paths are joined to
-    /// `config_dir`.
+    /// Resolves a config `path` value. `builtin:<name>` (prefix and name
+    /// ignoring case) maps to an embedded sound, absolute paths are used as-is
+    /// and relative paths are joined to `config_dir`.
     pub fn resolve(raw: &str, config_dir: &Path) -> Result<SoundSource, String> {
         let raw = raw.trim();
         if raw.is_empty() {
             return Err("path is empty".to_string());
         }
-        if raw.eq_ignore_ascii_case(BUILTIN_DEMO) {
-            return Ok(SoundSource::BuiltinDemo);
-        }
         if raw
             .get(..BUILTIN_PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(BUILTIN_PREFIX))
         {
-            return Err(format!(
-                "unknown built-in sound {raw:?} (only {BUILTIN_DEMO:?} exists)"
-            ));
+            return match builtin(&raw[BUILTIN_PREFIX.len()..]) {
+                Some(entry) => Ok(SoundSource::Builtin(entry)),
+                None => {
+                    let available: Vec<&str> =
+                        BUILTIN_SOUNDS.iter().map(|entry| entry.path).collect();
+                    Err(format!(
+                        "unknown built-in sound {raw:?}; available: {}",
+                        available.join(", ")
+                    ))
+                }
+            };
         }
         let path = Path::new(raw);
         if path.is_absolute() {
@@ -212,7 +286,7 @@ impl SoundSource {
     /// Decodes the sound.
     pub fn load(&self) -> Result<Sound, LoadError> {
         match self {
-            SoundSource::BuiltinDemo => Sound::load_bytes(DEMO_WAV, DEMO_LABEL),
+            SoundSource::Builtin(entry) => Sound::load_bytes(entry.bytes, entry.path),
             SoundSource::File(path) => Sound::load_file(path),
         }
     }
@@ -475,7 +549,7 @@ mod tests {
         assert_eq!(raw.stop_all_hotkey.as_deref(), Some("CmdOrCtrl+Shift+0"));
         assert_eq!(raw.sounds.len(), 1);
         let demo = &raw.sounds[0];
-        assert_eq!(demo.path, BUILTIN_DEMO);
+        assert_eq!(demo.path, DEMO.path);
         assert_eq!(demo.hotkey.as_deref(), Some("CmdOrCtrl+Shift+1"));
         assert_eq!(demo.gain, 1.0);
         assert_eq!(raw.mic, RawMic::default());
@@ -819,11 +893,11 @@ mod tests {
         let dir = Path::new("/cfg");
         assert_eq!(
             SoundSource::resolve("builtin:demo", dir),
-            Ok(SoundSource::BuiltinDemo)
+            Ok(SoundSource::Builtin(DEMO))
         );
         assert_eq!(
             SoundSource::resolve(" BUILTIN:Demo ", dir),
-            Ok(SoundSource::BuiltinDemo)
+            Ok(SoundSource::Builtin(DEMO))
         );
     }
 
@@ -850,19 +924,32 @@ mod tests {
     fn resolve_rejects_empty_and_unknown_builtin() {
         let dir = Path::new("/cfg");
         assert!(SoundSource::resolve("  ", dir).is_err());
-        let err = SoundSource::resolve("builtin:airhorn", dir).unwrap_err();
-        assert!(err.contains("builtin:airhorn"));
+        let err = SoundSource::resolve("builtin:nope", dir).unwrap_err();
+        assert!(err.contains("builtin:nope"), "{err}");
     }
 
     #[test]
-    fn builtin_prefix_is_case_insensitive() {
+    fn unknown_builtin_lists_the_available_names() {
+        let err = SoundSource::resolve("builtin:nope", Path::new("/cfg")).unwrap_err();
+        for entry in BUILTIN_SOUNDS {
+            assert!(err.contains(entry.path), "{err} lacks {}", entry.path);
+        }
+    }
+
+    #[test]
+    fn builtin_prefix_and_name_are_case_insensitive() {
         let dir = Path::new("/cfg");
         assert_eq!(
             SoundSource::resolve("BUILTIN:DEMO", dir),
-            Ok(SoundSource::BuiltinDemo)
+            Ok(SoundSource::Builtin(DEMO))
         );
-        let err = SoundSource::resolve("BUILTIN:airhorn", dir).unwrap_err();
-        assert!(err.contains("BUILTIN:airhorn"), "{err}");
+        let airhorn = builtin("airhorn").unwrap();
+        assert_eq!(
+            SoundSource::resolve("BUILTIN:AirHorn", dir),
+            Ok(SoundSource::Builtin(airhorn))
+        );
+        assert_eq!(builtin("AIRHORN"), Some(airhorn));
+        assert_eq!(builtin("nope"), None);
         // A non-ASCII path shorter or longer than the prefix is still a path.
         assert!(matches!(
             SoundSource::resolve("é.wav", dir),
@@ -871,11 +958,110 @@ mod tests {
     }
 
     #[test]
+    fn builtin_equality_and_debug_use_the_name_only() {
+        let airhorn = builtin("airhorn").unwrap();
+        assert_eq!(airhorn, builtin("airhorn").unwrap());
+        assert_ne!(airhorn, DEMO);
+        let text = format!("{airhorn:?}");
+        assert!(text.contains("airhorn"), "{text}");
+        assert!(text.len() < 100, "bytes must not print: {text}");
+    }
+
+    #[test]
     fn builtin_demo_decodes() {
-        let sound = SoundSource::BuiltinDemo.load().unwrap();
+        let sound = SoundSource::Builtin(DEMO).load().unwrap();
         assert_eq!(sound.sample_rate(), 44_100);
         assert_eq!(sound.channels(), 1);
         assert!(sound.frames() > 0);
+    }
+
+    #[test]
+    fn every_builtin_decodes_with_frames() {
+        for entry in BUILTIN_SOUNDS {
+            let sound = SoundSource::Builtin(entry)
+                .load()
+                .unwrap_or_else(|err| panic!("{} fails to decode: {err}", entry.path));
+            assert!(sound.frames() > 0, "{} is empty", entry.path);
+            assert_eq!(sound.label(), entry.path);
+        }
+    }
+
+    #[test]
+    fn builtin_names_are_unique_valid_and_labelled() {
+        let mut seen = std::collections::HashSet::new();
+        for entry in BUILTIN_SOUNDS {
+            assert!(seen.insert(entry.name), "duplicate {}", entry.name);
+            assert!(
+                !entry.name.is_empty()
+                    && entry
+                        .name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "bad name {:?}",
+                entry.name
+            );
+            assert_eq!(entry.path, format!("builtin:{}", entry.name));
+            assert!(
+                !entry.label.trim().is_empty(),
+                "{} has no label",
+                entry.name
+            );
+        }
+        assert_eq!(BUILTIN_SOUNDS[0].name, "demo");
+    }
+
+    #[test]
+    fn every_builtin_lasts_at_most_six_seconds() {
+        for entry in BUILTIN_SOUNDS {
+            let sound = SoundSource::Builtin(entry).load().unwrap();
+            let seconds = sound.frames() as f64 / f64::from(sound.sample_rate());
+            assert!(seconds <= 6.0, "{} lasts {seconds} s", entry.path);
+        }
+    }
+
+    #[test]
+    fn builtin_bytes_stay_within_the_budget() {
+        let total: usize = BUILTIN_SOUNDS.iter().map(|entry| entry.bytes.len()).sum();
+        assert!(total < 600_000, "built-in sounds take {total} bytes");
+    }
+
+    fn sounds_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/sounds")
+    }
+
+    #[test]
+    fn sources_md_lists_exactly_the_registry_without_the_demo() {
+        let text = fs::read_to_string(sounds_dir().join("SOURCES.md")).unwrap();
+        let mut listed: Vec<String> = text
+            .lines()
+            .filter_map(|line| {
+                let cell = line.strip_prefix("| `builtin:")?;
+                Some(cell.split('`').next()?.to_string())
+            })
+            .collect();
+        let mut expected: Vec<String> = BUILTIN_SOUNDS
+            .iter()
+            .filter(|entry| entry.name != "demo")
+            .map(|entry| entry.name.to_string())
+            .collect();
+        listed.sort();
+        expected.sort();
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn every_ogg_in_the_assets_folder_is_a_registry_entry() {
+        let mut found = 0;
+        for item in fs::read_dir(sounds_dir()).unwrap() {
+            let path = item.unwrap().path();
+            if path.extension().and_then(OsStr::to_str) != Some("ogg") {
+                continue;
+            }
+            found += 1;
+            let stem = path.file_stem().and_then(OsStr::to_str).unwrap();
+            assert!(builtin(stem).is_some(), "{stem}.ogg is not in the registry");
+        }
+        assert_eq!(found, BUILTIN_SOUNDS.len() - 1);
     }
 
     #[test]
