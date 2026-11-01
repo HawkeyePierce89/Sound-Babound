@@ -219,16 +219,16 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 
 - Modify: `crates/engine/src/mixer.rs`
 
-- [ ] `Mixer` gets an optional `PassthroughReader`. The monitor never has one, so it can never carry the microphone.
-- [ ] `configure(rate, channels)` passes the sink rate to the reader.
-- [ ] In `mix`, add `input_gain × passthrough` before the existing clamp, using the mono-sound channel mapping.
-- [ ] Add `Command::SetPathGains { sound, input }`. The mixer applies `voice gain × master × sound path gain` and the input gain, all sanitized like the existing gains. The defaults are 1.0, so the monitor is unchanged.
-- [ ] Tests:
+- [x] `Mixer` gets an optional `PassthroughReader`. The monitor never has one, so it can never carry the microphone.
+- [x] `configure(rate, channels)` passes the sink rate to the reader.
+- [x] In `mix`, add `input_gain × passthrough` before the existing clamp, using the mono-sound channel mapping.
+- [x] Add `Command::SetPathGains { sound, input }`. The mixer applies `voice gain × master × sound path gain` and the input gain, all sanitized like the existing gains. The defaults are 1.0, so the monitor is unchanged.
+- [x] Tests:
   - passthrough is mixed and clamped;
   - path gains multiply;
   - a mixer without a reader is identical to stage 1, checked against the existing render tests;
   - rendering with a reader allocates nothing, using the existing patterns: no new Vec, and `render_scratch` matches `render`.
-- [ ] Run the verification gates. All must pass before Task 8.
+- [x] Run the verification gates. All must pass before Task 8.
 
 ### Task 8: cpal mic sink and capture factories with feedback exclusion
 

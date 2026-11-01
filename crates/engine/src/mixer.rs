@@ -31,7 +31,17 @@
 //! stream exists and the grace window is closed, the supervisor calls
 //! [`Mixer::apply_offline`], which drops any play that passed that check
 //! (just before the stream went away, or inside a window whose rebuild
-//! failed) and still applies `StopAll` and `SetMasterGain`.
+//! failed) and still applies `StopAll`, `SetMasterGain` and `SetPathGains`.
+//!
+//! # Mic passthrough
+//!
+//! The mic sink's mixer is built with [`Mixer::with_passthrough`] and owns a
+//! [`PassthroughReader`]. Every render adds `input gain × passthrough` to the
+//! mix before the clamp, with the mono-sound channel mapping. The monitor's
+//! mixer is built with [`Mixer::new`] and has no reader, so it can never
+//! carry the microphone. [`Command::SetPathGains`] sets the per-path sound and
+//! input gains; both default to 1.0, so a mixer that never receives it mixes
+//! exactly as in stage 1.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -39,6 +49,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
 
+use crate::passthrough::PassthroughReader;
 use crate::sound::Sound;
 
 /// Maximum number of simultaneously playing voices.
@@ -61,6 +72,11 @@ pub enum Command {
     StopAll,
     /// Set the gain applied on top of every voice's own gain.
     SetMasterGain(f32),
+    /// Set this path's gains: `sound` multiplies every voice (on top of the
+    /// voice and master gains), `input` scales the mic passthrough.
+    // Sent by the engine's mic path once it exists.
+    #[cfg_attr(not(test), allow(dead_code))]
+    SetPathGains { sound: f32, input: f32 },
 }
 
 /// State shared between the mixer and the control threads.
@@ -232,9 +248,18 @@ pub struct Mixer {
     pending_used: usize,
     next_seq: u64,
     master_gain: f32,
+    /// This path's gain on every voice, on top of the voice and master gains.
+    sound_gain: f32,
+    /// This path's gain on the passthrough.
+    input_gain: f32,
     sample_rate: u32,
     channels: usize,
     scratch: Vec<f32>,
+    /// The mic passthrough; only the mic sink's mixer has one.
+    passthrough: Option<PassthroughReader>,
+    /// Mono passthrough samples for one chunk of [`SCRATCH_FRAMES`] frames,
+    /// allocated by `configure` when there is a reader.
+    input_scratch: Vec<f32>,
 }
 
 impl Mixer {
@@ -248,9 +273,24 @@ impl Mixer {
             pending_used: 0,
             next_seq: 0,
             master_gain: 1.0,
+            sound_gain: 1.0,
+            input_gain: 1.0,
             sample_rate: 0,
             channels: 0,
             scratch: Vec::new(),
+            passthrough: None,
+            input_scratch: Vec::new(),
+        }
+    }
+
+    /// Create an unconfigured mic mixer that adds `reader`'s passthrough to
+    /// its mix. See [`new`](Mixer::new).
+    // Built by the engine's mic path once it exists.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_passthrough(shared: Arc<MixerShared>, reader: PassthroughReader) -> Mixer {
+        Mixer {
+            passthrough: Some(reader),
+            ..Mixer::new(shared)
         }
     }
 
@@ -269,12 +309,18 @@ impl Mixer {
     /// Set the output format. Runs outside the callback and may allocate.
     ///
     /// Voices and their source positions are kept, so playback continues
-    /// where it was after a stream rebuild.
+    /// where it was after a stream rebuild. The passthrough reader, if any,
+    /// gets the new rate (a change re-primes it).
     pub fn configure(&mut self, sample_rate: u32, channels: u16) {
         self.sample_rate = sample_rate;
         self.channels = usize::from(channels);
         self.scratch.clear();
         self.scratch.resize(SCRATCH_FRAMES * self.channels, 0.0);
+        if let Some(reader) = self.passthrough.as_mut() {
+            reader.set_sink_rate(sample_rate);
+            self.input_scratch.clear();
+            self.input_scratch.resize(SCRATCH_FRAMES, 0.0);
+        }
     }
 
     /// Output sample rate in Hz (0 while unconfigured).
@@ -291,6 +337,12 @@ impl Mixer {
     #[cfg(test)]
     pub fn master_gain(&self) -> f32 {
         self.master_gain
+    }
+
+    /// Current path gains: `(sound, input)`.
+    #[cfg(test)]
+    pub fn path_gains(&self) -> (f32, f32) {
+        (self.sound_gain, self.input_gain)
     }
 
     /// Frames the scratch buffer holds (0 while unconfigured).
@@ -444,6 +496,10 @@ impl Mixer {
                     self.master_gain = sanitize_gain(gain);
                     applied += 1;
                 }
+                Command::SetPathGains { sound, input } => {
+                    self.set_path_gains(sound, input);
+                    applied += 1;
+                }
             }
         }
         if applied > 0 {
@@ -493,7 +549,13 @@ impl Mixer {
                 }
             }
             Command::SetMasterGain(gain) => self.master_gain = sanitize_gain(gain),
+            Command::SetPathGains { sound, input } => self.set_path_gains(sound, input),
         }
+    }
+
+    fn set_path_gains(&mut self, sound: f32, input: f32) {
+        self.sound_gain = sanitize_gain(sound);
+        self.input_gain = sanitize_gain(input);
     }
 
     /// A free slot, else a finished one, else the oldest voice.
@@ -517,14 +579,23 @@ impl Mixer {
     fn mix(&mut self, out: &mut [f32]) {
         let out_channels = self.channels;
         let rate = f64::from(self.sample_rate);
-        let master = self.master_gain;
+        let path = self.master_gain * self.sound_gain;
         for voice in self.voices.iter_mut().flatten() {
             if voice.finished {
                 continue;
             }
             let step = f64::from(voice.sound.sample_rate()) / rate;
-            let gain = voice.gain * master;
+            let gain = voice.gain * path;
             voice.finished = mix_voice(voice, out, out_channels, step, gain);
+        }
+        if let Some(reader) = self.passthrough.as_mut() {
+            mix_passthrough(
+                reader,
+                &mut self.input_scratch,
+                out,
+                out_channels,
+                self.input_gain,
+            );
         }
         for sample in out.iter_mut() {
             *sample = sample.clamp(-1.0, 1.0);
@@ -576,6 +647,36 @@ fn mix_voice(
     position as usize >= frames
 }
 
+/// Add `gain × passthrough` to `out`, mapped like a mono sound: channel 0,
+/// and channel 1 when there is one. Reads the passthrough in chunks of the
+/// preallocated mono `scratch`, so `out` may be any length. Realtime-safe.
+fn mix_passthrough(
+    reader: &mut PassthroughReader,
+    scratch: &mut [f32],
+    out: &mut [f32],
+    out_channels: usize,
+    gain: f32,
+) {
+    let chunk_frames = scratch.len();
+    if chunk_frames == 0 {
+        return;
+    }
+    for chunk in out.chunks_mut(chunk_frames * out_channels) {
+        let frames = chunk.len() / out_channels;
+        let Some(input) = scratch.get_mut(..frames) else {
+            return;
+        };
+        reader.read(input);
+        for (frame, &sample) in chunk.chunks_exact_mut(out_channels).zip(input.iter()) {
+            let value = sample * gain;
+            frame[0] += value;
+            if let Some(right) = frame.get_mut(1) {
+                *right += value;
+            }
+        }
+    }
+}
+
 /// Linear interpolation between frame `index` and the next one on `channel`.
 /// Past the last frame the signal is treated as silence.
 #[inline]
@@ -599,6 +700,7 @@ fn sanitize_gain(gain: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::passthrough::PassthroughShared;
 
     fn sound(samples: Vec<f32>, rate: u32, channels: u16) -> Sound {
         Sound::from_interleaved(samples, rate, channels, "test").unwrap()
@@ -1138,6 +1240,232 @@ mod tests {
         assert_eq!(m.shared().callback_heartbeat(), 2);
         assert_eq!(m.shared().commands_applied(), 2);
         assert_eq!(m.shared().active_voices(), 1);
+    }
+
+    /// A capture at 48 kHz holding `samples` copies of `value`, and a mic
+    /// mixer reading it at 48 kHz with `channels` channels.
+    fn mic_mixer(channels: u16, samples: usize, value: f32) -> (Mixer, Arc<PassthroughShared>) {
+        let passthrough = Arc::new(PassthroughShared::new());
+        passthrough.begin_capture(48_000);
+        passthrough.write(&vec![value; samples], 1);
+        let mut m = Mixer::with_passthrough(Arc::new(MixerShared::new()), passthrough.reader());
+        m.configure(48_000, channels);
+        (m, passthrough)
+    }
+
+    /// Enough passthrough to prime (30 ms at 48 kHz) and play a while,
+    /// below the high mark (80 ms).
+    const PRIMED: usize = 3_000;
+
+    fn reader(m: &Mixer) -> &PassthroughReader {
+        m.passthrough.as_ref().unwrap()
+    }
+
+    #[test]
+    fn passthrough_is_mixed_with_the_mono_mapping() {
+        let (mut m, passthrough) = mic_mixer(2, PRIMED, 0.5);
+        let out = render(&mut m, 64);
+        assert!(reader(&m).is_primed());
+        assert!(out.iter().all(|&x| (x - 0.5).abs() < 1e-6), "{out:?}");
+        assert!(passthrough.fill() < PRIMED, "the mixer consumed the ring");
+
+        let (mut m, _passthrough) = mic_mixer(1, PRIMED, 0.25);
+        let out = render(&mut m, 8);
+        assert!(out.iter().all(|&x| (x - 0.25).abs() < 1e-6), "{out:?}");
+
+        let (mut m, _passthrough) = mic_mixer(6, PRIMED, 0.25);
+        let out = render(&mut m, 8);
+        for frame in out.chunks(6) {
+            assert_close(frame[0], 0.25);
+            assert_close(frame[1], 0.25);
+            assert!(frame[2..].iter().all(|&x| x == 0.0));
+        }
+    }
+
+    #[test]
+    fn passthrough_adds_to_voices_and_is_clamped() {
+        let (mut m, _passthrough) = mic_mixer(2, PRIMED, 0.5);
+        let s = constant(0.25, 1000, 48_000, 1);
+        play(&m, &s, 1.0);
+        let out = render(&mut m, 16);
+        assert!(out.iter().all(|&x| (x - 0.75).abs() < 1e-6), "{out:?}");
+
+        play(&m, &s, 2.0);
+        let out = render(&mut m, 16);
+        assert!(out.iter().all(|&x| x == 1.0), "clamped: {out:?}");
+
+        let (mut m, _passthrough) = mic_mixer(2, PRIMED, -0.9);
+        let n = constant(-0.5, 1000, 48_000, 1);
+        play(&m, &n, 1.0);
+        let out = render(&mut m, 16);
+        assert!(out.iter().all(|&x| x == -1.0), "clamped: {out:?}");
+    }
+
+    #[test]
+    fn path_gains_multiply() {
+        let (mut m, _passthrough) = mic_mixer(1, PRIMED, 0.4);
+        assert_eq!(m.path_gains(), (1.0, 1.0), "defaults leave the mix alone");
+        let s = constant(0.5, 1000, 48_000, 1);
+        m.shared().push(Command::SetMasterGain(0.5)).unwrap();
+        m.shared()
+            .push(Command::SetPathGains {
+                sound: 0.5,
+                input: 0.25,
+            })
+            .unwrap();
+        play(&m, &s, 0.8);
+        let out = render(&mut m, 8);
+        // voice 0.5 × 0.8 × master 0.5 × sound 0.5 = 0.1, plus input 0.4 × 0.25 = 0.1.
+        assert!(out.iter().all(|&x| (x - 0.2).abs() < 1e-6), "{out:?}");
+        assert_eq!(m.path_gains(), (0.5, 0.25));
+
+        // The monitor (no reader) applies the sound path gain too.
+        let mut monitor = mixer(48_000, 1);
+        monitor
+            .shared()
+            .push(Command::SetPathGains {
+                sound: 0.5,
+                input: 3.0,
+            })
+            .unwrap();
+        play(&monitor, &s, 1.0);
+        let out = render(&mut monitor, 8);
+        assert!(out.iter().all(|&x| (x - 0.25).abs() < 1e-6), "{out:?}");
+    }
+
+    #[test]
+    fn invalid_path_gains_are_sanitized_and_apply_offline() {
+        let (mut m, _passthrough) = mic_mixer(1, PRIMED, 0.5);
+        m.shared()
+            .push(Command::SetPathGains {
+                sound: f32::NAN,
+                input: -1.0,
+            })
+            .unwrap();
+        let s = constant(0.5, 1000, 48_000, 1);
+        play(&m, &s, 1.0);
+        let out = render(&mut m, 8);
+        assert!(out.iter().all(|&x| x == 0.0), "{out:?}");
+        assert_eq!(m.path_gains(), (0.0, 0.0));
+
+        m.shared()
+            .push(Command::SetPathGains {
+                sound: f32::INFINITY,
+                input: 0.75,
+            })
+            .unwrap();
+        let applied = m.shared().commands_applied();
+        assert_eq!(m.apply_offline(), 0);
+        assert_eq!(m.path_gains(), (0.0, 0.75));
+        assert_eq!(m.shared().commands_applied(), applied + 1);
+    }
+
+    #[test]
+    fn configure_passes_the_sink_rate_to_the_reader() {
+        let (mut m, _passthrough) = mic_mixer(2, PRIMED, 0.5);
+        render(&mut m, 16);
+        assert!(reader(&m).is_primed());
+        m.configure(48_000, 1);
+        assert!(reader(&m).is_primed(), "the same rate keeps the reader");
+        m.configure(44_100, 2);
+        assert!(!reader(&m).is_primed(), "a new rate re-primes");
+
+        // Unconfigured, the reader has no sink rate and the mix is silent.
+        let passthrough = Arc::new(PassthroughShared::new());
+        passthrough.begin_capture(48_000);
+        passthrough.write(&vec![0.5f32; PRIMED], 1);
+        let mut m = Mixer::with_passthrough(Arc::new(MixerShared::new()), passthrough.reader());
+        let mut out = vec![1.0f32; 16];
+        m.render(&mut out);
+        assert!(out.iter().all(|&x| x == 0.0));
+        assert_eq!(passthrough.fill(), PRIMED, "nothing was read");
+    }
+
+    #[test]
+    fn mixer_without_passthrough_audio_matches_stage_one() {
+        // A mic mixer whose capture has not started mixes exactly like the
+        // monitor, and so does one whose input gain is zero.
+        let s = sound(
+            (0..3000).map(|i| (i as f32 * 0.01).sin()).collect(),
+            44_100,
+            1,
+        );
+        let mut monitor = mixer(48_000, 2);
+        let mut idle = Mixer::with_passthrough(
+            Arc::new(MixerShared::new()),
+            Arc::new(PassthroughShared::new()).reader(),
+        );
+        idle.configure(48_000, 2);
+        let (mut muted, _passthrough) = mic_mixer(2, PRIMED, 0.5);
+        muted
+            .shared()
+            .push(Command::SetPathGains {
+                sound: 1.0,
+                input: 0.0,
+            })
+            .unwrap();
+        for m in [&monitor, &idle, &muted] {
+            play(m, &s, 0.8);
+        }
+        let expected = render(&mut monitor, 2000);
+        assert_eq!(render(&mut idle, 2000), expected);
+        assert_eq!(render(&mut muted, 2000), expected);
+    }
+
+    #[test]
+    fn render_with_a_reader_allocates_nothing_and_matches_render_scratch() {
+        fn sine_mixer() -> (Mixer, Arc<PassthroughShared>) {
+            let passthrough = Arc::new(PassthroughShared::new());
+            passthrough.begin_capture(48_000);
+            let input: Vec<f32> = (0..3_800).map(|i| 0.5 * (i as f32 * 0.03).sin()).collect();
+            passthrough.write(&input, 1);
+            let mut m = Mixer::with_passthrough(Arc::new(MixerShared::new()), passthrough.reader());
+            m.configure(48_000, 2);
+            (m, passthrough)
+        }
+        let s = sound(
+            (0..3000).map(|i| (i as f32 * 0.01).sin()).collect(),
+            44_100,
+            1,
+        );
+        let (mut a, _pa) = sine_mixer();
+        let (mut b, _pb) = sine_mixer();
+        play(&a, &s, 0.3);
+        play(&b, &s, 0.3);
+        let scratch = (b.scratch.as_ptr(), b.scratch.capacity());
+        let input = (b.input_scratch.as_ptr(), b.input_scratch.capacity());
+
+        // More than one scratch chunk, so the passthrough is read in chunks.
+        let total = SCRATCH_FRAMES * 2 + 100;
+        let expected = render(&mut a, total);
+        let mut got = Vec::new();
+        while got.len() < total * 2 {
+            let remaining = total - got.len() / 2;
+            got.extend_from_slice(b.render_scratch(remaining));
+        }
+        assert_eq!(expected.len(), got.len());
+        for (x, y) in expected.iter().zip(&got) {
+            assert_close(*x, *y);
+        }
+        assert!(reader(&b).is_primed());
+        assert!(
+            expected.iter().any(|&x| x.abs() > 0.1),
+            "the passthrough was heard"
+        );
+        // The buffers were neither reallocated nor grown.
+        assert_eq!((b.scratch.as_ptr(), b.scratch.capacity()), scratch);
+        assert_eq!(
+            (b.input_scratch.as_ptr(), b.input_scratch.capacity()),
+            input
+        );
+        assert_eq!(b.input_scratch.len(), SCRATCH_FRAMES);
+    }
+
+    #[test]
+    fn the_monitor_has_no_passthrough_buffer() {
+        let m = mixer(48_000, 2);
+        assert!(m.passthrough.is_none());
+        assert!(m.input_scratch.is_empty());
     }
 
     #[test]

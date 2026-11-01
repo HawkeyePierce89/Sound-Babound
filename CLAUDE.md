@@ -7,7 +7,7 @@ A Rust tray soundboard. Plans live in `docs/plans/`.
 - `crates/engine` (`babound-engine`): has no UI dependencies. Its modules are private. `lib.rs` re-exports only what the app needs: `Engine`, `Sound`, `StreamInfo`, `StreamRole`, `StreamStatus`, `DeviceEvent`, `RebuildPolicy`, the error types (with `BuildErrorKind`) and `VERSION`. Items that only tests use are `#[cfg(test)]`.
   - `error.rs`: `LoadError`, `BuildError`, `StartError`, `WatcherError`.
   - `sound.rs`: symphonia decode into a cheap-clone `Sound` (`Arc<SoundData>`).
-  - `mixer.rs`: the realtime mixer, the command queue and the garbage queue.
+  - `mixer.rs`: the realtime mixer, the command queue and the garbage queue. The mic sink's mixer (`Mixer::with_passthrough`) owns a `PassthroughReader` and adds `input gain × passthrough` before the clamp, with the mono-sound mapping; the monitor's mixer (`Mixer::new`) has none. `Command::SetPathGains { sound, input }` sets the per-path gains (default 1.0).
   - `convert.rs`: f32 to device sample format (`OutputSample`). Every cpal PCM format is supported. I24 and U24 go through i32, because dasp overflows them at +1.0. `InputSample` is the reverse (device format to f32) for the capture.
   - `passthrough.rs`: the mic passthrough. `PassthroughShared` holds a mono `ArrayQueue<f32>` ring (0.5 s at 192 kHz) that the capture writes to. `PassthroughReader`, owned by the mic mixer, primes to 30 ms and resamples by linear interpolation. A PI controller, clamped to ±0.2 %, adjusts the ratio to hold the fill. Drift tests simulate both device clocks.
   - `sink.rs`: `StreamRole`, the `StreamFactory`, `Endpoint` and `ActiveStream` traits, and `MixerEndpoint` (the endpoint of both output roles).
