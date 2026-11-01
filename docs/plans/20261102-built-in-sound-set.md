@@ -181,15 +181,15 @@ Replace the single embedded demo chime with a registry of built-in sounds, and e
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets` (zero warnings), `cargo test --workspace` and `cargo check --workspace --target x86_64-pc-windows-msvc`.
-- [ ] Run the Linux cross-check `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu` with the stub `PKG_CONFIG` and `PKG_CONFIG_ALLOW_CROSS=1`, as CLAUDE.md describes.
-- [ ] Re-run `scripts/convert-sounds.sh ~/Downloads/babound-sounds` and confirm that no tracked file changed (`git status --porcelain`).
-- [ ] Confirm against the acceptance criteria:
+- [x] Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets` (zero warnings), `cargo test --workspace` and `cargo check --workspace --target x86_64-pc-windows-msvc`.
+- [x] Run the Linux cross-check `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu` with the stub `PKG_CONFIG` and `PKG_CONFIG_ALLOW_CROSS=1`, as CLAUDE.md describes.
+- [x] Re-run `scripts/convert-sounds.sh ~/Downloads/babound-sounds` and confirm that no tracked file changed (`git status --porcelain`).
+- [x] Confirm against the acceptance criteria:
   - every CC0 sound is in the registry, `SOURCES.md` and the template;
   - the budget test passes;
   - the template and hotkey tests show no sound hotkey;
   - the form and audition tests and the `--output-only` tests exist and pass.
-- [ ] Check that the new code in `config.rs`, `cli.rs`, `form.rs` and `audition.rs` is covered by tests (aim for 80%+ of the new logic).
+- [x] Check that the new code in `config.rs`, `cli.rs`, `form.rs` and `audition.rs` is covered by tests (aim for 80%+ of the new logic).
 
 ### Task 8: Update documentation
 
