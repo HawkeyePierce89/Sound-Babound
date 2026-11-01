@@ -191,6 +191,19 @@ mod tests {
     }
 
     #[test]
+    fn table_event_finds_every_source() {
+        for (source, event, _) in PLATFORM_EVENT_TABLE {
+            assert_eq!(table_event(source), event, "{source}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not in the platform event table")]
+    fn table_event_rejects_unknown_sources() {
+        table_event("nowhere:Nothing");
+    }
+
+    #[test]
     fn every_platform_event_has_its_policy() {
         for (source, event, policy) in PLATFORM_EVENT_TABLE {
             assert_eq!(event.rebuild_policy(), policy, "{source} -> {event:?}");

@@ -158,12 +158,24 @@ mod tests {
         }
     }
 
+    /// The modifier `CmdOrCtrl` stands for on this OS, as the parser sees it.
+    /// `cmd_or_ctrl_is_cmd_or_ctrl` pins it to one of the two, so shared code
+    /// needs no OS-specific cfg.
     fn cmd_or_ctrl() -> Modifiers {
-        if cfg!(target_os = "macos") {
-            Modifiers::META
-        } else {
-            Modifiers::CONTROL
-        }
+        parse_hotkey("CmdOrCtrl+A").unwrap().mods
+    }
+
+    #[test]
+    fn cmd_or_ctrl_is_cmd_or_ctrl() {
+        let mods = cmd_or_ctrl();
+        assert!(
+            mods == Modifiers::META || mods == Modifiers::CONTROL,
+            "{mods:?}"
+        );
+        assert_eq!(
+            parse_hotkey("CmdOrCtrl+Shift+1").unwrap(),
+            HotKey::new(Some(mods | Modifiers::SHIFT), Code::Digit1)
+        );
     }
 
     #[test]

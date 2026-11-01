@@ -355,13 +355,13 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
 
 ### Task 11: Verify acceptance criteria
 
-- [ ] Run `cargo build --workspace` and `cargo test --workspace` (macOS arm64).
-- [ ] Run `cargo clippy --workspace --all-targets` (zero warnings) and `cargo fmt --all -- --check`.
-- [ ] Run `cargo check --workspace --target x86_64-pc-windows-msvc`.
-- [ ] Try `cargo check -p babound-engine --target x86_64-unknown-linux-gnu`, adding the target if needed. If it is blocked by pkg-config/ALSA cross-sysroot, record that and instead grep that every `cfg(target_os = "linux")` item has a matching module and that the shared code contains no `target_os` cfg.
-- [ ] Check there are no `unwrap(`/`expect(` outside `#[cfg(test)]` code (grep).
-- [ ] Check that the callback path (`mixer.rs` render path, `cpal_sink.rs` data closure) contains no `tracing`, `Vec::new`/`push`/`collect` or `lock()` (grep).
-- [ ] Verify test coverage meets 80%+ on engine logic modules (mixer, supervisor, sound, convert) and app config/hotkeys/actions. Use `cargo llvm-cov` if installed; otherwise review coverage by test inventory.
+- [x] Run `cargo build --workspace` and `cargo test --workspace` (macOS arm64). (100 engine + 68 app tests pass; 1 ignored real-device smoke test)
+- [x] Run `cargo clippy --workspace --all-targets` (zero warnings) and `cargo fmt --all -- --check`.
+- [x] Run `cargo check --workspace --target x86_64-pc-windows-msvc`. (also `cargo clippy --all-targets` for that target: zero warnings)
+- [x] Try `cargo check -p babound-engine --target x86_64-unknown-linux-gnu`, adding the target if needed. If it is blocked by pkg-config/ALSA cross-sysroot, record that and instead grep that every `cfg(target_os = "linux")` item has a matching module and that the shared code contains no `target_os` cfg. (Plain check is blocked by alsa-sys pkg-config cross-compilation. Ran it with a stub `PKG_CONFIG` wrapper (`PKG_CONFIG_ALLOW_CROSS=1`, type-check only, no linking): `cargo clippy --workspace --all-targets` for the Linux target is clean. A test-only dead-code warning was fixed. The grep found one test-only `cfg!(target_os)` in `hotkeys.rs`; it was removed.)
+- [x] Check there are no `unwrap(`/`expect(` outside `#[cfg(test)]` code (grep). (only hits are in test modules and the `#[cfg(test)]`-gated `test_support.rs`)
+- [x] Check that the callback path (`mixer.rs` render path, `cpal_sink.rs` data closure) contains no `tracing`, `Vec::new`/`push`/`collect` or `lock()` (grep). (the only `push` calls are on the lock-free `ArrayQueue` garbage queue; the only `lock()` in `cpal_sink.rs` is in `build()`, before the stream exists)
+- [x] Verify test coverage meets 80%+ on engine logic modules (mixer, supervisor, sound, convert) and app config/hotkeys/actions. Use `cargo llvm-cov` if installed; otherwise review coverage by test inventory. (cargo-llvm-cov is not installed. Measured with `-C instrument-coverage` and Xcode `llvm-cov`, non-test lines only: mixer 94.5%, supervisor 99.1%, sound 83.4% (was 70.2%; decoder error-path tests added), convert 100%, config 100%, hotkeys 100%, actions 93.5%)
 
 ### Task 12: Update documentation
 

@@ -433,6 +433,130 @@ mod tests {
         assert_eq!(a.handle_count(), 1);
     }
 
+    /// Serves `bytes` until absolute position `fail_at`, then every read fails
+    /// with a non-EOF I/O error.
+    struct FailingSource {
+        inner: Cursor<Vec<u8>>,
+        fail_at: u64,
+    }
+
+    impl std::io::Read for FailingSource {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let pos = self.inner.position();
+            if pos >= self.fail_at {
+                return Err(std::io::Error::other("device went away"));
+            }
+            let room = usize::try_from(self.fail_at - pos).unwrap_or(usize::MAX);
+            let len = buf.len().min(room);
+            self.inner.read(&mut buf[..len])
+        }
+    }
+
+    impl std::io::Seek for FailingSource {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    impl MediaSource for FailingSource {
+        fn is_seekable(&self) -> bool {
+            true
+        }
+
+        fn byte_len(&self) -> Option<u64> {
+            Some(self.inner.get_ref().len() as u64)
+        }
+    }
+
+    fn decode_failing(bytes: Vec<u8>, fail_at: u64) -> Result<Sound, LoadError> {
+        let source = FailingSource {
+            inner: Cursor::new(bytes),
+            fail_at,
+        };
+        decode(
+            Box::new(source),
+            hint_for(Path::new("x.wav")),
+            "x.wav".into(),
+        )
+    }
+
+    #[test]
+    fn io_error_before_any_audio_is_io() {
+        // A failure while probing the very first bytes reads as "no format";
+        // once the RIFF header is recognized, the I/O error is reported.
+        for fail_at in [12, 44] {
+            let err = decode_failing(wav_bytes(44_100, 1, &ramp(44_100)), fail_at).unwrap_err();
+            assert!(
+                matches!(err, LoadError::Io { .. }),
+                "{fail_at}: got {err:?}"
+            );
+            assert_eq!(err.label(), "x.wav");
+        }
+    }
+
+    #[test]
+    fn io_error_mid_stream_keeps_decoded_audio() {
+        // 4 s of mono audio; the source dies about halfway through.
+        let total = 4 * 44_100;
+        let bytes = wav_bytes(44_100, 1, &ramp(total));
+        let fail_at = 44 + total as u64;
+        let sound = decode_failing(bytes, fail_at).unwrap();
+        assert!(sound.frames() > 0, "nothing was kept");
+        assert!(sound.frames() < total, "{} frames", sound.frames());
+    }
+
+    #[test]
+    fn truncated_data_chunk_keeps_what_is_there() {
+        let mut bytes = wav_bytes(44_100, 1, &ramp(4410));
+        // Claim twice as much data as the file holds (RIFF size kept consistent).
+        let claimed = 2 * 4410u32 * 2;
+        bytes[4..8].copy_from_slice(&(36 + claimed).to_le_bytes());
+        bytes[40..44].copy_from_slice(&claimed.to_le_bytes());
+        let sound = Sound::load_bytes(bytes, "short.wav").unwrap();
+        assert!(
+            sound.frames() > 0 && sound.frames() <= 4410,
+            "{}",
+            sound.frames()
+        );
+    }
+
+    #[test]
+    fn codec_without_decoder_is_unsupported() {
+        // A WAV header for IMA ADPCM, a codec this build does not enable.
+        let block_align: u16 = 256;
+        let data = vec![0u8; usize::from(block_align) * 4];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(4 + 8 + 20 + 8 + data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&20u32.to_le_bytes());
+        bytes.extend_from_slice(&0x0011u16.to_le_bytes()); // IMA ADPCM
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&22_050u32.to_le_bytes());
+        bytes.extend_from_slice(&11_100u32.to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes()); // cbSize
+        bytes.extend_from_slice(&505u16.to_le_bytes()); // samples per block
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&data);
+        let err = Sound::load_bytes(bytes, "adpcm.wav").unwrap_err();
+        assert!(matches!(err, LoadError::Unsupported { .. }), "got {err:?}");
+        assert_eq!(err.label(), "adpcm.wav");
+    }
+
+    #[test]
+    fn debug_shows_the_stream_spec_not_the_samples() {
+        let s = Sound::from_interleaved(vec![0.25; 6], 48_000, 2, "dbg").unwrap();
+        let text = format!("{s:?}");
+        for part in ["\"dbg\"", "48000", "channels: 2", "frames: 3"] {
+            assert!(text.contains(part), "{text}");
+        }
+        assert!(!text.contains("0.25"), "{text}");
+    }
+
     #[test]
     fn from_interleaved_validates() {
         let s = Sound::from_interleaved(vec![0.1; 5], 44_100, 2, "odd").unwrap();
