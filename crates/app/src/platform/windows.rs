@@ -2,6 +2,8 @@
 
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 
+use super::HotkeyKeys;
+
 /// Attaches to the console of the parent process, if it has one.
 ///
 /// The binary is built for the GUI subsystem so tray mode opens no console
@@ -65,6 +67,12 @@ pub fn virtual_mic_not_found() -> &'static str {
 /// pattern.
 pub fn virtual_device_missing_hint() -> &'static str {
     "install VB-CABLE (or set [mic] virtual_device to the output of the virtual cable you use)"
+}
+
+/// Which key a hotkey names: global-hotkey registers a Windows hotkey by virtual key (`VK_A`), which
+/// follows the keyboard layout: it fires on the key that types A.
+pub fn hotkey_keys() -> HotkeyKeys {
+    HotkeyKeys::Layout
 }
 
 #[cfg(test)]

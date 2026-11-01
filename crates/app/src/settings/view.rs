@@ -9,6 +9,7 @@ use std::sync::PoisonError;
 use eframe::egui;
 
 use crate::hotkeys;
+use crate::platform;
 use crate::settings::StatusText;
 use crate::settings::form::{AUDIO_EXTENSIONS, SettingsForm};
 use crate::settings::keys::{self, KeyCapture, Mods};
@@ -63,9 +64,9 @@ impl SettingsApp {
                     modifiers,
                 } => {
                     if *pressed && !*repeat && captured.is_none() {
-                        // Global hotkeys are physical keys, so prefer the
-                        // physical key over the layout's.
-                        let name = physical_key.unwrap_or(*key).name();
+                        // macOS hotkeys are key positions, Windows and X11
+                        // ones follow the layout: the platform says which
+                        // of the two keys to record.
                         let mods = Mods::from_ui(
                             modifiers.command,
                             modifiers.ctrl,
@@ -73,7 +74,12 @@ impl SettingsApp {
                             modifiers.alt,
                             modifiers.shift,
                         );
-                        match keys::hotkey_text(mods, name) {
+                        match keys::capture_text(
+                            platform::hotkey_keys(),
+                            mods,
+                            key.name(),
+                            physical_key.map(|key| key.name()),
+                        ) {
                             KeyCapture::Ignore => {}
                             capture => captured = Some(capture),
                         }

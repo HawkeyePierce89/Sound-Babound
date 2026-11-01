@@ -3,6 +3,7 @@
 //! modifier flags.
 
 use crate::hotkeys;
+use crate::platform::HotkeyKeys;
 
 /// The letter keys, as both the UI and the config name them.
 const LETTERS: [&str; 26] = [
@@ -241,9 +242,72 @@ pub fn hotkey_text(mods: Mods, ui_key: &str) -> KeyCapture {
     }
 }
 
+/// Turns a key press into a [`KeyCapture`], choosing between egui's
+/// logical key (`ui_key`) and its physical key as `keys` says.
+pub fn capture_text(
+    keys: HotkeyKeys,
+    mods: Mods,
+    ui_key: &str,
+    physical_key: Option<&str>,
+) -> KeyCapture {
+    match (keys, physical_key) {
+        (HotkeyKeys::Position, Some(physical)) => hotkey_text(mods, physical),
+        (HotkeyKeys::Layout, Some(physical)) => match hotkey_text(mods, ui_key) {
+            KeyCapture::Ignore => hotkey_text(mods, physical),
+            capture => capture,
+        },
+        (_, None) => hotkey_text(mods, ui_key),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn position_platforms_record_the_physical_key() {
+        // AZERTY: the key labelled A sits where a US layout has Q.
+        assert_eq!(
+            capture_text(HotkeyKeys::Position, alt(), "A", Some("Q")),
+            KeyCapture::Set("Alt+Q".to_string())
+        );
+        assert_eq!(
+            capture_text(HotkeyKeys::Position, alt(), "A", None),
+            KeyCapture::Set("Alt+A".to_string())
+        );
+    }
+
+    #[test]
+    fn layout_platforms_record_the_layout_key() {
+        assert_eq!(
+            capture_text(HotkeyKeys::Layout, alt(), "A", Some("Q")),
+            KeyCapture::Set("Alt+A".to_string())
+        );
+        // A symbol the config cannot name (AZERTY's `&` on the 1 key, an
+        // AltGr character) falls back to the physical key.
+        assert_eq!(
+            capture_text(HotkeyKeys::Layout, alt(), "Exclamationmark", Some("1")),
+            KeyCapture::Set("Alt+1".to_string())
+        );
+        assert_eq!(
+            capture_text(HotkeyKeys::Layout, alt(), "Unknown", None),
+            KeyCapture::Ignore
+        );
+        // A lone modifier stays ignored either way.
+        assert_eq!(
+            capture_text(HotkeyKeys::Layout, shift(), "Shift", Some("ShiftLeft")),
+            KeyCapture::Ignore
+        );
+        assert_eq!(
+            capture_text(
+                HotkeyKeys::Layout,
+                Mods::default(),
+                "Escape",
+                Some("Escape")
+            ),
+            KeyCapture::Clear
+        );
+    }
 
     const ALL_MODS: Mods = Mods {
         cmd_or_ctrl: true,

@@ -5,6 +5,8 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 
+use super::HotkeyKeys;
+
 /// No-op: a Linux binary always keeps the console it was launched from.
 pub fn attach_parent_console() {}
 
@@ -134,6 +136,12 @@ impl VirtualMic {
 /// one OS where the app makes the device itself.
 pub fn create_virtual_mic() -> anyhow::Result<Option<VirtualMic>> {
     VirtualMic::create().map(Some)
+}
+
+/// Which key a hotkey names: global-hotkey grabs an X11 hotkey on the keycode that the current
+/// keyboard mapping gives its keysym, so it follows the layout.
+pub fn hotkey_keys() -> HotkeyKeys {
+    HotkeyKeys::Layout
 }
 
 #[cfg(test)]

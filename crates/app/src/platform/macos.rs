@@ -5,7 +5,7 @@ use tao::event_loop::EventLoop;
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::TrayIconBuilder;
 
-use super::MicrophoneAccess;
+use super::{HotkeyKeys, MicrophoneAccess};
 
 /// No-op: a macOS binary always keeps the console it was launched from.
 pub fn attach_parent_console() {}
@@ -79,6 +79,12 @@ fn access_of(permission: AVAudioApplicationRecordPermission) -> MicrophoneAccess
         AVAudioApplicationRecordPermission::Undetermined => MicrophoneAccess::Undetermined,
         _ => MicrophoneAccess::Unknown,
     }
+}
+
+/// Which key a hotkey names: global-hotkey registers a macOS hotkey by virtual key code, which is a
+/// key position (`KeyA` is the key where a US layout has A).
+pub fn hotkey_keys() -> HotkeyKeys {
+    HotkeyKeys::Position
 }
 
 #[cfg(test)]

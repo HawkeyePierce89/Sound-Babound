@@ -77,7 +77,7 @@ The tray's "Settings…" item opens a small settings window; `sound-babound sett
 The window has two parts:
 
 - "Virtual mic": the same report as `mic-check` (see [Checking the virtual microphone](#checking-the-virtual-microphone)), refreshed about once a second. The window cannot see the tray's running microphone capture: when the default input is the virtual device, it says so and notes that the tray's capture stays on the last real microphone it used, if there was one.
-- "Sounds": every configured sound with its name, file and hotkey. You can rename a sound, remove it, add sounds with "Add sound…" (a file picker for WAV, FLAC, OGG and MP3 files; the name starts as the file name without its extension, and the path is stored as an absolute path), and set a hotkey: click the hotkey field, then press the combination. The field records where the key sits, named as on a US layout (see [Hotkey syntax](#hotkey-syntax)): on AZERTY, the key labelled A shows as `Q`. Escape clears the hotkey. A key without a modifier, or with Shift alone, is accepted only for F1–F24, so a plain or capital letter never becomes a global hotkey. The copy, cut and paste shortcuts cannot be set either. The "Stop all" hotkey is shown, but it is set in the config file.
+- "Sounds": every configured sound with its name, file and hotkey. You can rename a sound, remove it, add sounds with "Add sound…" (a file picker for WAV, FLAC, OGG and MP3 files; the name starts as the file name without its extension, and the path is stored as an absolute path), and set a hotkey: click the hotkey field, then press the combination. The field records the key the way the tray will match it (see [Hotkey syntax](#hotkey-syntax)): on macOS where the key sits, named as on a US layout (on AZERTY, the key labelled A shows as `Q`); on Windows and Linux the key your layout types (the key labelled A shows as `A`; a symbol the config cannot name, such as `&` on AZERTY's digit row, is recorded by its position, `1`). Escape clears the hotkey. A key without a modifier, or with Shift alone, is accepted only for F1–F24, so a plain or capital letter never becomes a global hotkey. The copy, cut and paste shortcuts cannot be set either. The "Stop all" hotkey is shown, but it is set in the config file.
 
 Problems are shown next to their sound: a blank name, a hotkey from the file that does not parse, or a hotkey used twice (by two sounds, or by a sound and "Stop all"). Save stays disabled while there is any problem. If the config file does not parse, the window shows the error and cannot edit the sounds; fix the file first.
 
@@ -274,7 +274,7 @@ Keys:
 - numpad `Num0`–`Num9`
 - punctuation: `Minus`, `Equal`, `Comma`, `Period`, `Slash`, `Semicolon`, `Quote`, `Backquote`, `BracketLeft`, `BracketRight`, `Backslash`
 
-Key names are key positions, named as on a US layout: on another layout a name means the key in that place (on AZERTY, `Q` is the key labelled A).
+On macOS key names are key positions, named as on a US layout: on another layout a name means the key in that place (on AZERTY, `Q` is the key labelled A). On Windows and Linux letter and symbol names follow the keyboard layout: `A` is the key that types A (on AZERTY, the key labelled A), and digits are the digit row's keys.
 
 A hotkey that does not parse, or that is already used by an earlier entry, is skipped with a warning in the log. The sound stays playable from the tray menu. If another application already holds a hotkey, registering it fails. That failure is logged too, and the rest still work.
 
