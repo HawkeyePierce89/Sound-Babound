@@ -323,18 +323,18 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
 - Create: `crates/app/src/tray_app.rs`, `crates/app/src/actions.rs`, `crates/app/src/icon.rs`
 - Modify: `crates/app/src/main.rs`, `crates/app/src/platform/{mod.rs,macos.rs,linux.rs}`
 
-- [ ] `actions.rs`:
+- [x] `actions.rs`:
   - An `Action` enum with `Play(index)`, `StopAll`, `Reload`, `OpenConfigFolder` and `Quit`.
   - An `ActionMap` built from `ResolvedConfig` that maps menu item IDs and hotkey IDs to actions and carries the resolved `master_gain`. This logic is pure and testable.
   - A two-method `AudioControl` trait (`play`, `set_master_gain`) implemented for `Engine`, and `apply_config(&impl AudioControl, &ActionMap)` that calls `set_master_gain(map.master_gain())`. Startup and every successful reload go through `apply_config`; a failed reload does not call it.
-- [ ] `icon.rs`: a programmatically generated 32×32 RGBA tray icon (no image asset or decoder dependency), set as a template icon on macOS.
-- [ ] `tray_app.rs`, startup:
+- [x] `icon.rs`: a programmatically generated 32×32 RGBA tray icon (no image asset or decoder dependency), set as a template icon on macOS.
+- [x] `tray_app.rs`, startup:
   - A tao `EventLoop` with a user-event type.
   - On macOS, `ActivationPolicy::Accessory` (no Dock icon) via `platform::macos`.
   - Create the tray and menu inside the `StartCause::Init` handler.
   - The menu lists the sounds, then "Stop all", "Reload config", "Open config folder" and "Quit".
   - `MenuEvent` and `GlobalHotKeyEvent` handlers forward events through the `EventLoopProxy`.
-- [ ] `tray_app.rs`, hotkeys, reload and actions:
+- [x] `tray_app.rs`, hotkeys, reload and actions:
   - Hotkeys: `GlobalHotKeyManager` (Carbon on macOS, so no Accessibility permission). Each registration failure is logged and skipped.
   - On Linux, `platform::linux::is_wayland_session()` checks `XDG_SESSION_TYPE` and `WAYLAND_DISPLAY`. If it is Wayland, skip the manager and log a clear warning; the tray still works.
   - Reload:
@@ -345,13 +345,13 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
     - The engine is otherwise untouched; voices that are playing continue, and their `Arc`s are freed via the garbage queue.
   - "Open config folder" uses the `opener` crate.
   - "Quit" shuts down the engine, then exits the loop.
-- [ ] Startup sequence: `ensure_default_config`, load (falling back to the embedded demo only if the file is unreadable), start the engine, call `apply_config` (sets `master_gain`), then run the loop.
-- [ ] Write tests:
+- [x] Startup sequence: `ensure_default_config`, load (falling back to the embedded demo only if the file is unreadable), start the engine, call `apply_config` (sets `master_gain`), then run the loop.
+- [x] Write tests:
   - `ActionMap` construction (indices, stop-all mapping, entries with skipped hotkeys still appear in the menu, `master_gain` carried from the config including clamping)
   - `apply_config` with a recording fake `AudioControl`: startup applies the config's `master_gain`; a successful reload applies the new value; a failed reload leaves the fake untouched
   - Wayland detection over injected env values
   - icon buffer size and alpha
-- [ ] Run the test suite and the Windows-target check. They must pass before Task 11.
+- [x] Run the test suite and the Windows-target check. They must pass before Task 11.
 
 ### Task 11: Verify acceptance criteria
 
