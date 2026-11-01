@@ -10,7 +10,8 @@
 //! - An [`Endpoint`] is the state the stream's callback reads or writes and
 //!   the supervisor watches: the build target handed to the factory, the
 //!   callback heartbeat, the active flag and the housekeeping done while no
-//!   stream exists. [`MixerEndpoint`] serves both output roles.
+//!   stream exists. [`MixerEndpoint`] serves both output roles,
+//!   [`CaptureEndpoint`] the capture.
 //!
 //! The supervisor owns the factory, the endpoint and the stream. It drops the
 //! stream to stop it and asks the factory for a new one when the device
@@ -23,6 +24,7 @@ use std::time::Instant;
 
 use crate::error::BuildError;
 use crate::mixer::{Mixer, MixerShared};
+use crate::passthrough::PassthroughShared;
 use crate::supervisor::SupervisorMsg;
 
 /// Which stream a supervisor runs. Each role has its own rebuild policy (see
@@ -239,6 +241,51 @@ impl Endpoint for MixerEndpoint {
     }
 }
 
+/// The endpoint of the capture: the passthrough ring its callback writes.
+///
+/// A capture queues no commands and releases no sounds, so there is no
+/// play grace, nothing to purge and no garbage to drain.
+#[derive(Debug)]
+// Used by the engine's mic path once it exists.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct CaptureEndpoint {
+    shared: Arc<PassthroughShared>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl CaptureEndpoint {
+    /// An endpoint writing into `shared`.
+    pub fn new(shared: Arc<PassthroughShared>) -> CaptureEndpoint {
+        CaptureEndpoint { shared }
+    }
+}
+
+impl Endpoint for CaptureEndpoint {
+    type Target = Arc<PassthroughShared>;
+
+    fn target(&self) -> Arc<PassthroughShared> {
+        Arc::clone(&self.shared)
+    }
+
+    fn heartbeat(&self) -> u64 {
+        self.shared.heartbeat()
+    }
+
+    fn set_active(&self, active: bool) {
+        self.shared.set_active(active);
+    }
+
+    fn open_play_grace(&self, _until: Instant) {}
+
+    fn close_play_grace(&self) {}
+
+    fn purge_offline(&self, _now: Instant) -> usize {
+        0
+    }
+
+    fn drain_garbage(&self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -299,6 +346,29 @@ mod tests {
         endpoint.close_play_grace();
         assert_eq!(endpoint.purge_offline(now), 1);
         assert_eq!(sound.handle_count(), 1);
+    }
+
+    #[test]
+    fn capture_endpoint_wraps_the_passthrough() {
+        let shared = Arc::new(PassthroughShared::new());
+        let endpoint = CaptureEndpoint::new(Arc::clone(&shared));
+        assert!(Arc::ptr_eq(&endpoint.target(), &shared));
+        assert_eq!(endpoint.heartbeat(), 0);
+        endpoint.target().write(&[0.25f32, 0.75], 2);
+        assert_eq!(endpoint.heartbeat(), 1);
+
+        endpoint.set_active(true);
+        assert!(shared.is_active());
+        endpoint.set_active(false);
+        assert!(!shared.is_active());
+
+        // Nothing is queued on a capture, so housekeeping is a no-op.
+        let now = Instant::now();
+        endpoint.open_play_grace(now + Duration::from_secs(1));
+        endpoint.close_play_grace();
+        assert_eq!(endpoint.purge_offline(now), 0);
+        endpoint.drain_garbage();
+        assert_eq!(shared.fill(), 1);
     }
 
     #[test]

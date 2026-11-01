@@ -46,7 +46,6 @@ impl OutputSample for U24 {
 }
 
 /// A device sample type the capture can read from.
-#[cfg_attr(not(test), allow(dead_code))] // Used by the capture stream once it exists.
 pub trait InputSample: SizedSample {
     /// Convert to f32 in [-1, 1]. NaN becomes silence.
     fn to_mix(self) -> f32;

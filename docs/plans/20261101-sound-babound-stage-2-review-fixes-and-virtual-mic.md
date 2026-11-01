@@ -237,30 +237,30 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 - Create: `crates/engine/src/capture.rs`, `crates/engine/src/platform/{mod,macos,windows,linux}.rs`
 - Modify: `crates/engine/src/cpal_sink.rs`, `crates/engine/src/error.rs`, `crates/engine/Cargo.toml`, `crates/engine/src/lib.rs`
 
-- [ ] `platform::mic_host()`: the default host on macOS and Windows; the PulseAudio host on Linux, falling back to the default host. Selection happens only in `platform/mod.rs`.
-- [ ] Enable cpal's `pulseaudio` feature for the Linux target only.
-- [ ] Generalize `CpalSinkFactory` into an output factory with a target:
+- [x] `platform::mic_host()`: the default host on macOS and Windows; the PulseAudio host on Linux, falling back to the default host. Selection happens only in `platform/mod.rs`.
+- [x] Enable cpal's `pulseaudio` feature for the Linux target only.
+- [x] Generalize `CpalSinkFactory` into an output factory with a target:
   - `Default` (the monitor, as in stage 1);
   - `Named(pattern)` (the mic sink, on `mic_host()`). It re-enumerates output devices on every build and every identity query and never caches.
-- [ ] `BuildError` gains `DeviceNotFound(String)` and `FeedbackExcluded(String)`.
-- [ ] A pure `choose_input(default, available, last_physical, exclusions) -> InputChoice`:
+- [x] `BuildError` gains `DeviceNotFound(String)` and `FeedbackExcluded(String)`.
+- [x] A pure `choose_input(default, available, last_physical, exclusions) -> InputChoice`:
   - a default input matching an exclusion (the virtual device or its monitor) falls back to the most recent physical input if it is still present;
   - otherwise it returns `Excluded`.
   - The factory remembers the last non-excluded default input identity.
-- [ ] `CpalCaptureFactory`:
+- [x] `CpalCaptureFactory`:
   - re-queries the default input on every build;
   - applies `choose_input`;
   - logs the fallback, or the exclusion, at warn once per change;
   - `Excluded` becomes `BuildError::FeedbackExcluded`, so the supervisor retries and the Task 5 throttle applies;
   - calls `begin_capture(rate)`, then builds a typed input stream for every PCM format that writes through the passthrough writer.
-- [ ] `CaptureEndpoint` around `PassthroughShared`.
-- [ ] `probe()` on both factories: resolve the device and its default config without building a stream, for `mic-check`.
-- [ ] Unit tests:
+- [x] `CaptureEndpoint` around `PassthroughShared`.
+- [x] `probe()` on both factories: resolve the device and its default config without building a stream, for `mic-check`.
+- [x] Unit tests:
   - name matching (case, display name versus id, first match);
   - `choose_input` with fake identities: default is physical; default is the virtual device with a known physical input; default is the virtual monitor with no physical input known; the last physical input is gone;
   - the warn-once decision.
-- [ ] Extend the `#[ignore]` smoke test. When the `BABOUND_MIC_DEVICE` env var or the default pattern resolves, it builds monitor, mic sink and capture streams and checks their `StreamInfo`. It plays nothing.
-- [ ] Run the verification gates plus the Linux stub clippy. All must pass before Task 9.
+- [x] Extend the `#[ignore]` smoke test. When the `BABOUND_MIC_DEVICE` env var or the default pattern resolves, it builds monitor, mic sink and capture streams and checks their `StreamInfo`. It plays nothing. (Extended; not run here, it needs real devices and is human-run.)
+- [x] Run the verification gates plus the Linux stub clippy. All must pass before Task 9.
 
 ### Task 9: Engine mic path API and fan-out
 

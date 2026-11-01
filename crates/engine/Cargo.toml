@@ -13,6 +13,10 @@ symphonia.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# The mic paths use the PulseAudio host on Linux (see `platform/linux.rs`).
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { workspace = true, features = ["pulseaudio"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-audio = { workspace = true, features = ["std", "AudioHardware"] }
 

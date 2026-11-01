@@ -4,6 +4,9 @@
 //! per-stream supervisors that rebuild a stream when its device changes. It
 //! has no UI dependencies.
 
+// Used by the engine's mic path once it exists.
+#[cfg_attr(not(test), allow(dead_code))]
+mod capture;
 mod convert;
 mod cpal_sink;
 mod engine;
@@ -12,6 +15,7 @@ mod mixer;
 // Used by the mic mixer and the capture stream once they exist.
 #[cfg_attr(not(test), allow(dead_code))]
 mod passthrough;
+mod platform;
 mod sink;
 mod sound;
 mod supervisor;

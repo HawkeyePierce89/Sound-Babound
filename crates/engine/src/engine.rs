@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::cpal_sink::CpalSinkFactory;
+use crate::cpal_sink::CpalOutputFactory;
 use crate::error::StartError;
 use crate::mixer::{Command, Mixer, MixerShared};
 use crate::sink::{MixerEndpoint, StreamFactory};
@@ -43,7 +43,7 @@ impl Engine {
     /// Start the engine on the system default output device, following
     /// device changes reported by the platform watcher.
     pub fn start() -> Result<Engine, StartError> {
-        Engine::start_with(CpalSinkFactory, platform_watcher())
+        Engine::start_with(CpalOutputFactory::monitor(), platform_watcher())
     }
 
     /// Start the engine with a custom monitor factory and watcher.

@@ -5,13 +5,15 @@ A Rust tray soundboard. Plans live in `docs/plans/`.
 ## Crate layout
 
 - `crates/engine` (`babound-engine`): has no UI dependencies. Its modules are private. `lib.rs` re-exports only what the app needs: `Engine`, `Sound`, `StreamInfo`, `StreamRole`, `StreamStatus`, `DeviceEvent`, `RebuildPolicy`, the error types (with `BuildErrorKind`) and `VERSION`. Items that only tests use are `#[cfg(test)]`.
-  - `error.rs`: `LoadError`, `BuildError`, `StartError`, `WatcherError`.
+  - `error.rs`: `LoadError`, `BuildError` (including `DeviceNotFound` for an unmatched mic sink pattern and `FeedbackExcluded` for a refused capture), `StartError`, `WatcherError`.
   - `sound.rs`: symphonia decode into a cheap-clone `Sound` (`Arc<SoundData>`).
   - `mixer.rs`: the realtime mixer, the command queue and the garbage queue. The mic sink's mixer (`Mixer::with_passthrough`) owns a `PassthroughReader` and adds `input gain × passthrough` before the clamp, with the mono-sound mapping; the monitor's mixer (`Mixer::new`) has none. `Command::SetPathGains { sound, input }` sets the per-path gains (default 1.0).
   - `convert.rs`: f32 to device sample format (`OutputSample`). Every cpal PCM format is supported. I24 and U24 go through i32, because dasp overflows them at +1.0. `InputSample` is the reverse (device format to f32) for the capture.
   - `passthrough.rs`: the mic passthrough. `PassthroughShared` holds a mono `ArrayQueue<f32>` ring (0.5 s at 192 kHz) that the capture writes to. `PassthroughReader`, owned by the mic mixer, primes to 30 ms and resamples by linear interpolation. A PI controller, clamped to ±0.2 %, adjusts the ratio to hold the fill. Drift tests simulate both device clocks.
-  - `sink.rs`: `StreamRole`, the `StreamFactory`, `Endpoint` and `ActiveStream` traits, and `MixerEndpoint` (the endpoint of both output roles).
-  - `cpal_sink.rs`: the cpal implementation of those traits.
+  - `sink.rs`: `StreamRole`, the `StreamFactory`, `Endpoint` and `ActiveStream` traits, `MixerEndpoint` (the endpoint of both output roles) and `CaptureEndpoint` (around `PassthroughShared`).
+  - `cpal_sink.rs`: `CpalOutputFactory`, the cpal output factory of both output roles. `OutputTarget::Default` is the monitor (the default output of `platform::monitor_host()`); `OutputTarget::Named(pattern)` is the mic sink (the first output of `platform::mic_host()` whose display name or id contains the pattern, ignoring case; a blank pattern matches nothing). Both re-query on every build and identity query. `probe()` resolves the device and its default config without a stream. It also holds the helpers the capture shares: error mapping, `identity_of` and `name_matches`.
+  - `capture.rs`: `CpalCaptureFactory`, the capture on the default input of `platform::mic_host()`. The pure `choose_input` refuses an input that an exclusion names (the virtual device or its monitor): it falls back to the last physical default input if it is still present, otherwise the build fails with `FeedbackExcluded` and the supervisor retries. `NoticeLog` warns once per change of that decision. A build calls `begin_capture(rate)` before the stream starts.
+  - `platform/`: the cpal host per role. The monitor uses the default host, except ALSA on Linux (as in stage 1, since the `pulseaudio` feature makes PulseAudio cpal's Linux default). The mic paths use the default host, except PulseAudio on Linux (falling back to the default host).
   - `supervisor.rs`: the pure `SupervisorCore` state machine, the pure `FailureLog` build-failure throttle, `StreamStatus`, and the one generic supervisor thread (`spawn_supervisor`), one instance per role, each starting its own watcher.
   - `watcher/`: OS device-change listeners.
   - `engine.rs`: the public `Engine` API (non-blocking queue pushes and atomic reads).
@@ -63,9 +65,10 @@ The classification is `DeviceEvent::rebuild_policy(role)`; the rules above are t
 Platform code lives only in:
 
 - `crates/engine/src/watcher/{macos,windows,linux}.rs`
+- `crates/engine/src/platform/{macos,windows,linux}.rs`
 - `crates/app/src/platform/{macos,windows,linux}.rs`
 
-Each set is selected by `#[cfg(target_os = ...)]` in its `mod.rs`. Shared code contains no `cfg(target_os)`. The only `target_os` cfgs outside the per-OS files are in those `mod.rs` files: the watcher selection, `NoopWatcher` (built only outside macOS and Windows), and a dead-code allow on `EventSender::send`, which only the macOS and Windows watchers call.
+Each set is selected by `#[cfg(target_os = ...)]` in its `mod.rs`. Shared code contains no `cfg(target_os)`. The only `target_os` cfgs outside the per-OS files are in those `mod.rs` files: the watcher selection, `NoopWatcher` (built only outside macOS and Windows), the engine host selection (with a default-host fallback for other OSes), and a dead-code allow on `EventSender::send`, which only the macOS and Windows watchers call.
 
 The macOS watcher uses `objc2-core-audio` rather than `coreaudio-sys`, which would need libclang. The Linux watcher is a no-op, because ALSA `default` follows PipeWire/PulseAudio.
 
