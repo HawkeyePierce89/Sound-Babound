@@ -8,7 +8,7 @@ A Rust tray soundboard. Plans live in `docs/plans/`.
   - `error.rs`: `LoadError`, `BuildError`, `StartError`, `WatcherError`.
   - `sound.rs`: symphonia decode into a cheap-clone `Sound` (`Arc<SoundData>`).
   - `mixer.rs`: the realtime mixer, the command queue and the garbage queue.
-  - `convert.rs`: f32 to device sample format.
+  - `convert.rs`: f32 to device sample format (`OutputSample`). Every cpal PCM format is supported. I24 and U24 go through i32, because dasp overflows them at +1.0.
   - `sink.rs`: the `SinkFactory` and `ActiveSink` traits.
   - `cpal_sink.rs`: the cpal implementation of those traits.
   - `supervisor.rs`: the pure `SupervisorCore` state machine and the supervisor thread.
@@ -42,6 +42,8 @@ Pending-release rule: every `Sound` that leaves a voice (finished, evicted or st
 ## Mixer handoff invariant
 
 The mixer lives in `Arc<Mutex<Mixer>>`. To rebuild, the supervisor drops the old sink and then calls `SinkFactory::build`, so `build` only ever runs while no stream exists. `build` may lock the mixer freely, and it must call `configure(rate, channels)` before it starts the stream. Once the stream runs, only its callback touches the mixer, through `try_lock`, so that lock never contends. `configure` keeps the voices and their source positions, which is how playback continues across a rebuild.
+
+Only a running stream drains the command queue. `MixerShared::output_active` (`Engine::has_output`) reports whether a stream runs; the supervisor sets it only after `build` returns. `Engine::play` rejects a play (returns false) while it is false, so presses made with no device, or during a build started with no stream, never start late when a stream comes up. A rebuild from a live stream keeps the command queue: plays accepted while the old stream ran, including one whose push races the teardown (the check and the push are not atomic), are applied by the new stream, like the voices it continues. While no stream exists (failed build, retry backoff), each supervisor loop, and every build started with no stream, locks the mixer, which cannot contend then, and calls `Mixer::apply_offline`. It drops any play that passed the check just before the stream went away, and it still applies `StopAll` and `SetMasterGain`. The headless `play` waits for `has_output` before queuing its play, and once the mixer reports no voices it keeps the stream up for the measured output latency (`Engine::output_latency`: the cpal callback timestamps' `playback - callback` plus the duration of the callback's buffer, so it reaches the last written frame; capped at 5 s) plus a 200 ms margin, so the device buffer is heard.
 
 ## Rebuild policy
 

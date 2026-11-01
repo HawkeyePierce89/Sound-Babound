@@ -129,7 +129,8 @@ impl ActionMap {
 
 /// The audio controls the tray needs from the engine.
 pub trait AudioControl {
-    /// Queues a play. Returns false if the engine rejected it.
+    /// Queues a play. Returns false if the engine rejected it (no output
+    /// stream, or a full command queue).
     fn play(&self, sound: &Sound, gain: f32) -> bool;
     /// Queues a master gain change. Returns false if the engine rejected it.
     fn set_master_gain(&self, gain: f32) -> bool;
@@ -209,7 +210,7 @@ impl Soundboard {
         if !control.play(&entry.sound, entry.gain) {
             tracing::warn!(
                 sound = entry.sound.label(),
-                "engine command queue is full; play dropped"
+                "no output stream or engine command queue is full; play dropped"
             );
         }
     }

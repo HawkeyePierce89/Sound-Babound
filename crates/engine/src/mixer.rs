@@ -19,9 +19,19 @@
 //! `StopAll`), so every release triggered by a command always finds a slot.
 //! A voice that finishes while no slot is free stays in its voice slot, marked
 //! finished and silent, and is released on a later render.
+//!
+//! # No output
+//!
+//! Only a running stream drains the command queue. `Engine::play` rejects
+//! plays while no stream runs (so presses made with no device do not all
+//! start at once when one comes back). While none exists the supervisor
+//! calls [`Mixer::apply_offline`], which drops any play that passed that
+//! check just before the stream went away and still applies `StopAll` and
+//! `SetMasterGain`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crossbeam_queue::ArrayQueue;
 
@@ -56,6 +66,8 @@ pub struct MixerShared {
     active_voices: AtomicUsize,
     commands_applied: AtomicU64,
     callback_heartbeat: AtomicU64,
+    output_active: AtomicBool,
+    output_latency_nanos: AtomicU64,
 }
 
 impl MixerShared {
@@ -67,6 +79,8 @@ impl MixerShared {
             active_voices: AtomicUsize::new(0),
             commands_applied: AtomicU64::new(0),
             callback_heartbeat: AtomicU64::new(0),
+            output_active: AtomicBool::new(false),
+            output_latency_nanos: AtomicU64::new(0),
         }
     }
 
@@ -103,6 +117,31 @@ impl MixerShared {
     pub fn callback_heartbeat(&self) -> u64 {
         self.callback_heartbeat.load(Ordering::Acquire)
     }
+
+    /// Whether an output stream is running. Plays queued while it is false
+    /// are dropped by the supervisor.
+    pub fn output_active(&self) -> bool {
+        self.output_active.load(Ordering::Acquire)
+    }
+
+    /// Set by the supervisor around every build.
+    pub fn set_output_active(&self, active: bool) {
+        self.output_active.store(active, Ordering::Release);
+    }
+
+    /// How long until the last frame the latest callback wrote is played:
+    /// the backend's reported latency for the buffer's first frame plus the
+    /// buffer's own duration (zero before the first callback).
+    pub fn output_latency(&self) -> Duration {
+        Duration::from_nanos(self.output_latency_nanos.load(Ordering::Acquire))
+    }
+
+    /// Record the latency the backend reported for the current callback.
+    /// Realtime-safe: one atomic store.
+    fn set_output_latency(&self, latency: Duration) {
+        let nanos = u64::try_from(latency.as_nanos()).unwrap_or(u64::MAX);
+        self.output_latency_nanos.store(nanos, Ordering::Release);
+    }
 }
 
 impl Default for MixerShared {
@@ -119,6 +158,7 @@ impl std::fmt::Debug for MixerShared {
             .field("active_voices", &self.active_voices())
             .field("commands_applied", &self.commands_applied())
             .field("callback_heartbeat", &self.callback_heartbeat())
+            .field("output_active", &self.output_active())
             .finish()
     }
 }
@@ -167,6 +207,12 @@ impl Mixer {
         }
     }
 
+    /// Publish the output latency measured for the current callback, up to
+    /// its last frame (see [`MixerShared::output_latency`]). Realtime-safe.
+    pub fn record_output_latency(&mut self, latency: Duration) {
+        self.shared.set_output_latency(latency);
+    }
+
     /// The shared state this mixer reads commands from.
     #[cfg(test)]
     pub fn shared(&self) -> &Arc<MixerShared> {
@@ -185,7 +231,6 @@ impl Mixer {
     }
 
     /// Output sample rate in Hz (0 while unconfigured).
-    #[cfg(test)]
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
@@ -324,6 +369,44 @@ impl Mixer {
                 break;
             }
         }
+    }
+
+    /// Empty the command queue while no stream exists, dropping every play.
+    ///
+    /// Not realtime: the supervisor calls it, with the mixer locked, only
+    /// while no stream exists, so the lock never contends and sounds may be
+    /// dropped here directly. Without it, every play queued while there is
+    /// no output would start at once when a device comes back. `StopAll` and
+    /// `SetMasterGain` still apply. Dropped plays do not count as applied.
+    ///
+    /// Returns the number of plays dropped.
+    pub fn apply_offline(&mut self) -> usize {
+        let mut dropped = 0;
+        let mut applied = 0;
+        while let Some(command) = self.shared.commands.pop() {
+            match command {
+                Command::Play { sound, .. } => {
+                    drop(sound);
+                    dropped += 1;
+                }
+                Command::StopAll => {
+                    self.voices.iter_mut().for_each(|voice| drop(voice.take()));
+                    applied += 1;
+                }
+                Command::SetMasterGain(gain) => {
+                    self.master_gain = sanitize_gain(gain);
+                    applied += 1;
+                }
+            }
+        }
+        if applied > 0 {
+            let active = self.voices.iter().flatten().filter(|v| !v.finished).count();
+            self.shared.active_voices.store(active, Ordering::Release);
+            self.shared
+                .commands_applied
+                .fetch_add(applied, Ordering::Release);
+        }
+        dropped
     }
 
     /// Apply queued commands; returns how many were applied.
@@ -576,6 +659,39 @@ mod tests {
         assert_eq!(s.handle_count(), 3);
         assert_eq!(m.shared().drain_garbage(), 2);
         assert_eq!(s.handle_count(), 1);
+    }
+
+    #[test]
+    fn offline_drops_plays_and_applies_the_rest() {
+        let mut m = mixer(48_000, 1);
+        let playing = constant(0.5, 48_000, 48_000, 1);
+        play(&m, &playing, 1.0);
+        render(&mut m, 32);
+        assert_eq!(m.shared().commands_applied(), 1);
+
+        // The stream is gone; presses and a gain change queue up meanwhile.
+        let pressed = constant(0.5, 48_000, 48_000, 1);
+        play(&m, &pressed, 1.0);
+        play(&m, &pressed, 1.0);
+        m.shared().push(Command::SetMasterGain(0.25)).unwrap();
+        assert_eq!(m.apply_offline(), 2);
+        assert_eq!(pressed.handle_count(), 1);
+        assert_close(m.master_gain(), 0.25);
+        assert_eq!(m.shared().commands_applied(), 2);
+        // The voice that was already playing is kept for the next stream.
+        assert_eq!(playing.handle_count(), 2);
+        assert_eq!(m.shared().active_voices(), 1);
+
+        m.shared().push(Command::StopAll).unwrap();
+        assert_eq!(m.apply_offline(), 0);
+        assert_eq!(playing.handle_count(), 1);
+        assert_eq!(m.shared().active_voices(), 0);
+        assert_eq!(m.shared().commands_applied(), 3);
+
+        // Once a stream runs again, plays are applied as usual.
+        play(&m, &pressed, 1.0);
+        render(&mut m, 32);
+        assert_eq!(m.shared().active_voices(), 1);
     }
 
     #[test]

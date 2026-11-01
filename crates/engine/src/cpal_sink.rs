@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{ErrorKind, FromSample, SampleFormat, SizedSample, StreamConfig};
+use cpal::{ErrorKind, I24, OutputStreamTimestamp, SampleFormat, StreamConfig, U24};
 
-use crate::convert::{fill_silence, write_samples};
+use crate::convert::{OutputSample, fill_silence, write_samples};
 use crate::error::BuildError;
 use crate::mixer::Mixer;
 use crate::sink::{ActiveSink, BuiltSink, DeviceIdentity, SinkFactory, StreamInfo};
@@ -58,10 +58,15 @@ impl SinkFactory for CpalSinkFactory {
             SampleFormat::F64 => build_typed::<f64>(&device, &config, mixer, on_error),
             SampleFormat::I8 => build_typed::<i8>(&device, &config, mixer, on_error),
             SampleFormat::I16 => build_typed::<i16>(&device, &config, mixer, on_error),
+            SampleFormat::I24 => build_typed::<I24>(&device, &config, mixer, on_error),
             SampleFormat::I32 => build_typed::<i32>(&device, &config, mixer, on_error),
+            SampleFormat::I64 => build_typed::<i64>(&device, &config, mixer, on_error),
             SampleFormat::U8 => build_typed::<u8>(&device, &config, mixer, on_error),
             SampleFormat::U16 => build_typed::<u16>(&device, &config, mixer, on_error),
+            SampleFormat::U24 => build_typed::<U24>(&device, &config, mixer, on_error),
             SampleFormat::U32 => build_typed::<u32>(&device, &config, mixer, on_error),
+            SampleFormat::U64 => build_typed::<u64>(&device, &config, mixer, on_error),
+            // DSD bitstreams are not PCM; the f32 mix cannot be written to them.
             other => return Err(BuildError::UnsupportedFormat(other.to_string())),
         }?;
         stream.play().map_err(build_error)?;
@@ -115,12 +120,14 @@ fn build_typed<T>(
     on_error: Sender<SupervisorMsg>,
 ) -> Result<cpal::Stream, BuildError>
 where
-    T: SizedSample + FromSample<f32> + Send + 'static,
+    T: OutputSample + Send + 'static,
 {
     device
         .build_output_stream::<T, _, _>(
             *config,
-            move |out: &mut [T], _info: &cpal::OutputCallbackInfo| fill_from_mixer(&mixer, out),
+            move |out: &mut [T], info: &cpal::OutputCallbackInfo| {
+                fill_from_mixer(&mixer, out, callback_latency(info.timestamp()));
+            },
             move |err: cpal::Error| {
                 if needs_rebuild(err.kind()) {
                     let _ = on_error.send(SupervisorMsg::StreamError(err.to_string()));
@@ -131,11 +138,25 @@ where
         .map_err(build_error)
 }
 
-/// The data-callback body: render the mix into `out`, or silence if the
-/// mixer is locked. Realtime-safe: `try_lock` only, no allocation, no I/O.
-pub(crate) fn fill_from_mixer<T>(mixer: &Mutex<Mixer>, out: &mut [T])
+/// How long the samples written in this callback take to reach the output.
+/// The backends fold their buffering and the device's own latency into
+/// `playback`, so this covers large buffers and wireless outputs too.
+fn callback_latency(timestamp: OutputStreamTimestamp) -> Duration {
+    timestamp
+        .playback
+        .saturating_duration_since(timestamp.callback)
+}
+
+/// The data-callback body: record the output latency and render the mix
+/// into `out`, or silence if the mixer is locked. Realtime-safe: `try_lock`
+/// only, no allocation, no I/O.
+///
+/// `latency` is when the first frame of `out` is played. The recorded latency
+/// adds the duration of `out` itself, so it covers the last frame written
+/// here, which is the one a drain must wait for.
+pub(crate) fn fill_from_mixer<T>(mixer: &Mutex<Mixer>, out: &mut [T], latency: Duration)
 where
-    T: SizedSample + FromSample<f32>,
+    T: OutputSample,
 {
     let mut guard = match mixer.try_lock() {
         Ok(guard) => guard,
@@ -146,7 +167,20 @@ where
             return;
         }
     };
+    let buffer = buffer_duration(out.len(), guard.channels(), guard.sample_rate());
+    guard.record_output_latency(latency.saturating_add(buffer));
     render_into(&mut guard, out);
+}
+
+/// How long `samples` interleaved samples play at `rate` with `channels`.
+/// Zero for an unconfigured mixer. Realtime-safe: integer math only.
+fn buffer_duration(samples: usize, channels: u16, rate: u32) -> Duration {
+    let frames = samples.checked_div(usize::from(channels)).unwrap_or(0);
+    let frames = u64::try_from(frames).unwrap_or(u64::MAX);
+    match u64::from(rate) {
+        0 => Duration::ZERO,
+        rate => Duration::from_nanos(frames.saturating_mul(1_000_000_000) / rate),
+    }
 }
 
 /// Render `out` in chunks of the mixer's preallocated scratch size and
@@ -154,7 +188,7 @@ where
 /// mixer, a trailing partial frame) is filled with silence.
 pub(crate) fn render_into<T>(mixer: &mut Mixer, out: &mut [T])
 where
-    T: SizedSample + FromSample<f32>,
+    T: OutputSample,
 {
     let channels = usize::from(mixer.channels());
     let mut rest = out;
@@ -262,15 +296,44 @@ mod tests {
         let sound = tone(1_000, 48_000);
         let mixer = Mutex::new(playing_mixer(&sound, 48_000, 2));
         let held = mixer.lock().unwrap();
-        let mut out = [0.5f32; 8];
-        fill_from_mixer(&mixer, &mut out);
-        assert_eq!(out, [0.0; 8]);
+        // 480 stereo frames at 48 kHz: a 10 ms buffer.
+        let mut out = [0.5f32; 960];
+        fill_from_mixer(&mixer, &mut out, Duration::from_millis(40));
+        assert_eq!(out, [0.0; 960]);
         assert_eq!(held.shared().callback_heartbeat(), 0);
+        assert_eq!(held.shared().output_latency(), Duration::ZERO);
         drop(held);
 
-        fill_from_mixer(&mixer, &mut out);
+        fill_from_mixer(&mixer, &mut out, Duration::from_millis(40));
         assert!(out.iter().any(|s| *s != 0.0));
-        assert_eq!(mixer.lock().unwrap().shared().callback_heartbeat(), 1);
+        let guard = mixer.lock().unwrap();
+        assert_eq!(guard.shared().callback_heartbeat(), 1);
+        // The reported latency plus the buffer just written.
+        assert_eq!(guard.shared().output_latency(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn buffer_duration_counts_frames_at_the_rate() {
+        assert_eq!(buffer_duration(960, 2, 48_000), Duration::from_millis(10));
+        assert_eq!(buffer_duration(44_100, 1, 44_100), Duration::from_secs(1));
+        // A large buffer is not hidden by the fixed drain margin.
+        assert_eq!(
+            buffer_duration(48_000, 2, 48_000),
+            Duration::from_millis(500)
+        );
+        assert_eq!(buffer_duration(960, 0, 48_000), Duration::ZERO);
+        assert_eq!(buffer_duration(960, 2, 0), Duration::ZERO);
+    }
+
+    #[test]
+    fn callback_latency_is_playback_minus_callback() {
+        let callback = cpal::StreamInstant::from_millis(1_000);
+        let playback = cpal::StreamInstant::from_millis(3_250);
+        let latency =
+            |callback, playback| callback_latency(OutputStreamTimestamp { callback, playback });
+        assert_eq!(latency(callback, playback), Duration::from_millis(2_250));
+        // A backend that predicts playback before the callback reports zero.
+        assert_eq!(latency(playback, callback), Duration::ZERO);
     }
 
     #[test]

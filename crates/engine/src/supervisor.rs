@@ -24,10 +24,16 @@
 //!
 //! While no stream is running (initial start, retry backoff) every
 //! non-ignored event rebuilds. A failed build is retried after a backoff, and
-//! a stream whose callback heartbeat stops advancing is rebuilt.
+//! a stream whose callback heartbeat stops advancing is rebuilt. `Engine::play`
+//! rejects plays while no stream runs; a play that passed that check just
+//! before the stream went away is dropped here if no stream replaces it (see
+//! `Mixer::apply_offline`). A rebuild from a live stream keeps the command
+//! queue, so plays accepted while the old stream ran (including one whose push
+//! races the teardown) are applied by the new stream, like the voices it
+//! continues.
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -355,6 +361,9 @@ impl<F: SinkFactory> Worker<F> {
                 Some(Action::CheckDefault) => self.check_default(),
                 None => {}
             }
+            if self.sink.is_none() {
+                self.drop_offline_plays();
+            }
             self.shared.drain_garbage();
 
             let wait = self
@@ -376,6 +385,7 @@ impl<F: SinkFactory> Worker<F> {
         }
 
         drop(self.sink.take());
+        self.shared.set_output_active(false);
         drop(guard);
         self.shared.drain_garbage();
         debug!("supervisor stopped");
@@ -407,10 +417,32 @@ impl<F: SinkFactory> Worker<F> {
         }
     }
 
+    /// Drop the plays queued while no stream exists, and apply the other
+    /// commands. No stream means no callback, so the lock cannot contend.
+    fn drop_offline_plays(&mut self) {
+        let dropped = self
+            .mixer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .apply_offline();
+        if dropped > 0 {
+            info!(dropped, "no output stream; dropped queued plays");
+        }
+    }
+
     /// Drop the stream, then build a new one. The factory configures the
     /// mixer while no stream exists, so the callback never contends for it.
+    ///
+    /// When no stream existed, plays queued since the last loop's purge are
+    /// dropped first, so the new stream never starts a press made offline.
+    /// When a stream existed, the queue is kept on purpose: its plays were
+    /// accepted while that stream ran, and the new stream applies them.
     fn rebuild(&mut self) {
+        if self.sink.is_none() {
+            self.drop_offline_plays();
+        }
         drop(self.sink.take());
+        self.shared.set_output_active(false);
         match self
             .factory
             .build(Arc::clone(&self.mixer), self.sender.clone())
@@ -424,6 +456,7 @@ impl<F: SinkFactory> Worker<F> {
                     "output stream started"
                 );
                 self.sink = Some(sink);
+                self.shared.set_output_active(true);
                 self.core
                     .on_build_result(Some(info.identity), Instant::now());
             }
@@ -868,6 +901,87 @@ mod tests {
         assert!(wait_until(WAIT, || factory.builds().len() == 1));
         assert_eq!(factory.attempts(), 3);
         handle.shutdown();
+    }
+
+    #[test]
+    fn plays_queued_without_output_are_dropped() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        factory.fail_next(usize::MAX);
+        let watcher = FakeWatcher::default();
+        let shared = Arc::new(MixerShared::new());
+        let handle = spawn_supervisor(
+            factory.clone(),
+            watcher.clone(),
+            Arc::clone(&shared),
+            fast(),
+        )
+        .unwrap();
+        assert!(wait_until(WAIT, || factory.attempts() >= 1));
+        assert!(!shared.output_active());
+
+        let sound = Sound::from_interleaved(vec![0.5; 4800], 48_000, 1, "press").unwrap();
+        for _ in 0..5 {
+            shared
+                .push(Command::Play {
+                    sound: sound.clone(),
+                    gain: 1.0,
+                })
+                .unwrap();
+        }
+        shared.push(Command::SetMasterGain(0.5)).unwrap();
+        // The plays are dropped off the realtime thread; the gain applies.
+        assert!(wait_until(WAIT, || sound.handle_count() == 1));
+        assert!(wait_until(WAIT, || shared.commands_applied() == 1));
+
+        // A device comes back: nothing stale starts, new plays do.
+        factory.fail_next(0);
+        assert!(wait_until(WAIT, || factory.builds().len() == 1));
+        assert!(shared.output_active());
+        let mixer = factory.mixer().unwrap();
+        assert_eq!(mixer.lock().unwrap().master_gain(), 0.5);
+        let mut out = vec![0.0; 64];
+        mixer.lock().unwrap().render(&mut out);
+        assert_eq!(shared.active_voices(), 0);
+        handle.shutdown();
+        assert!(!shared.output_active());
+    }
+
+    #[test]
+    fn rebuild_from_offline_drops_plays_queued_since_the_last_purge() {
+        let factory = FakeSinkFactory::new(48_000, 2, "spk");
+        let shared = Arc::new(MixerShared::new());
+        let (sender, _receiver) = mpsc::channel();
+        let mut worker = Worker::new(factory.clone(), Arc::clone(&shared), fast(), sender);
+
+        // A press lands after the loop's purge but before the scheduled build.
+        let sound = Sound::from_interleaved(vec![0.5; 4800], 48_000, 1, "late").unwrap();
+        shared
+            .push(Command::Play {
+                sound: sound.clone(),
+                gain: 1.0,
+            })
+            .unwrap();
+        worker.rebuild();
+        assert!(worker.sink.is_some());
+        assert_eq!(sound.handle_count(), 1);
+
+        let mixer = factory.mixer().unwrap();
+        let mut out = vec![0.0; 64];
+        mixer.lock().unwrap().render(&mut out);
+        assert_eq!(shared.active_voices(), 0);
+        assert!(out.iter().all(|s| *s == 0.0));
+
+        // A rebuild of a running stream keeps queued plays: they are live.
+        shared
+            .push(Command::Play {
+                sound: sound.clone(),
+                gain: 1.0,
+            })
+            .unwrap();
+        worker.rebuild();
+        mixer.lock().unwrap().render(&mut out);
+        assert_eq!(shared.active_voices(), 1);
+        drop(worker);
     }
 
     #[test]

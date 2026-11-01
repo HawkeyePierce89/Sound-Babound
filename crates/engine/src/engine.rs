@@ -6,6 +6,7 @@
 //! and hotkey handlers without waiting on the audio thread.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::cpal_sink::CpalSinkFactory;
 use crate::error::StartError;
@@ -20,6 +21,12 @@ use crate::watcher::{DeviceWatcher, platform_watcher};
 /// The output stream is built on the supervisor thread, so starting the
 /// engine succeeds even when there is no output device yet: the supervisor
 /// keeps retrying and playback starts once a device appears.
+///
+/// Plays are only accepted while an output stream runs. A press made with no
+/// stream (no device, a failed build, or a build still in progress) is
+/// rejected rather than held, so presses do not all start at once when a
+/// device comes back. Use [`Engine::has_output`] to wait for a stream before
+/// a play that must be heard. Stop and gain commands always apply.
 ///
 /// Dropping the engine shuts it down, like [`Engine::shutdown`] (through the
 /// supervisor handle's `Drop`).
@@ -51,9 +58,21 @@ impl Engine {
 
     /// Queue a new voice playing `sound` at `gain`. Plays overlap.
     ///
-    /// Returns false if the command queue is full; the play is dropped and
-    /// the caller decides whether to log it.
+    /// Returns false if the play was dropped, because no output stream runs
+    /// or the command queue is full; the caller decides whether to log it.
+    /// The check happens before the push, so a play made while no stream runs
+    /// (no device, a failed build, or a build started with no stream) is never
+    /// queued. A play accepted while a stream runs belongs to that stream even
+    /// if the push lands just after a rebuild starts tearing it down: the
+    /// queue is kept across a rebuild from a live stream, so the replacement
+    /// stream applies it, just as it applies plays the old callback had not
+    /// popped yet and continues the voices already playing. If the rebuild
+    /// fails instead, the supervisor drops the play (see
+    /// `Mixer::apply_offline`).
     pub fn play(&self, sound: &Sound, gain: f32) -> bool {
+        if !self.shared.output_active() {
+            return false;
+        }
         self.push(Command::Play {
             sound: sound.clone(),
             gain,
@@ -76,9 +95,22 @@ impl Engine {
         self.shared.active_voices()
     }
 
-    /// Total number of commands the mixer has applied.
+    /// Total number of commands the mixer has applied. Plays dropped for
+    /// lack of an output stream are not counted.
     pub fn commands_applied(&self) -> u64 {
         self.shared.commands_applied()
+    }
+
+    /// Whether an output stream is running, so a play would be heard.
+    pub fn has_output(&self) -> bool {
+        self.shared.output_active()
+    }
+
+    /// How long until the last frame the latest callback wrote is played. It
+    /// includes the backend buffer, the device's own latency and the
+    /// callback's buffer. Zero before the first callback.
+    pub fn output_latency(&self) -> Duration {
+        self.shared.output_latency()
     }
 
     /// Stop the stream, unregister the watcher and join the supervisor thread.
@@ -97,7 +129,6 @@ impl Engine {
 mod tests {
     use std::sync::{Mutex, PoisonError};
     use std::thread;
-    use std::time::Duration;
 
     use super::*;
     use crate::mixer::{COMMAND_CAPACITY, Mixer};
@@ -120,6 +151,7 @@ mod tests {
         let watcher = FakeWatcher::default();
         let engine = Engine::start_with(factory.clone(), watcher.clone()).unwrap();
         assert!(wait_until(TIMEOUT, || factory.builds().len() == 1));
+        assert!(wait_until(TIMEOUT, || engine.has_output()));
         let mixer = factory.mixer().unwrap();
         (engine, factory, watcher, mixer)
     }
@@ -147,6 +179,29 @@ mod tests {
         assert!(!is_silent(&block));
         assert_eq!(engine.active_voices(), 1);
         assert_eq!(engine.commands_applied(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
+    fn play_without_output_is_rejected() {
+        let factory = FakeSinkFactory::new(48_000, 2, "speakers");
+        factory.fail_next(usize::MAX);
+        let engine = Engine::start_with(factory.clone(), FakeWatcher::default()).unwrap();
+        assert!(wait_until(TIMEOUT, || factory.attempts() >= 1));
+        assert!(!engine.has_output());
+
+        let sound = tone();
+        assert!(!engine.play(&sound, 1.0));
+        // Nothing was queued: the rejected handle was dropped on this thread.
+        assert_eq!(sound.handle_count(), 1);
+        // Stop and gain still queue.
+        assert!(engine.stop_all());
+        assert!(engine.set_master_gain(0.5));
+
+        // Once a stream runs, plays are accepted again.
+        factory.fail_next(0);
+        assert!(wait_until(TIMEOUT, || engine.has_output()));
+        assert!(engine.play(&sound, 1.0));
         engine.shutdown();
     }
 

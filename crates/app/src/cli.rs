@@ -39,6 +39,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// machine with no audio output would wait forever.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Slack added to the reported output latency before `play` stops the
+/// stream. It covers the poll interval; the reported latency already
+/// includes the duration of the last callback's buffer.
+const OUTPUT_DRAIN_MARGIN: Duration = Duration::from_millis(200);
+
+/// The most output latency `play` waits out, so a bogus backend timestamp
+/// cannot hold the process.
+const MAX_OUTPUT_LATENCY: Duration = Duration::from_secs(5);
+
 /// How long past the sound's own duration `play` waits for it to finish.
 /// If the output device disappears mid-playback the voice never finishes,
 /// so without a limit `play` would wait forever.
@@ -61,18 +70,37 @@ pub fn run_play(file: Option<PathBuf>) -> Result<()> {
     );
 
     let engine = Engine::start().context("failed to start the audio engine")?;
-    if !engine.play(&sound, 1.0) {
-        engine.shutdown();
-        bail!("the engine rejected the play command");
+    let outcome = play_to_end(&engine, &sound);
+    engine.shutdown();
+    outcome
+}
+
+/// Waits for an output stream, plays `sound` on it and waits until it has
+/// finished and the output has had time to drain.
+fn play_to_end(engine: &Engine, sound: &Sound) -> Result<()> {
+    // A play queued while no stream runs is dropped, so wait for one first.
+    wait_for_output(|| engine.has_output(), POLL_INTERVAL, START_TIMEOUT)?;
+    if !engine.play(sound, 1.0) {
+        bail!("the engine rejected the play command: the output stream went away");
     }
-    let outcome = wait_for_playback(
+    wait_for_playback(
         || (engine.commands_applied(), engine.active_voices()),
         POLL_INTERVAL,
         START_TIMEOUT,
-        sound_duration(&sound) + FINISH_MARGIN,
-    );
-    engine.shutdown();
-    outcome
+        sound_duration(sound) + FINISH_MARGIN,
+    )?;
+    // The mixer reports no voices once it has rendered the last samples, but
+    // they have not reached the output yet; stopping now would cut them off.
+    thread::sleep(output_drain(engine.output_latency()));
+    Ok(())
+}
+
+/// How long to keep the stream up after the mixer has finished: the output
+/// latency the engine measured until the last written frame is played
+/// (backend buffering, device latency and the callback buffer itself, so
+/// large buffers and wireless outputs are covered), capped, plus a margin.
+fn output_drain(latency: Duration) -> Duration {
+    latency.min(MAX_OUTPUT_LATENCY) + OUTPUT_DRAIN_MARGIN
 }
 
 /// Decodes the sound `play` should play: `file` if given, otherwise the
@@ -94,6 +122,22 @@ fn sound_duration(sound: &Sound) -> Duration {
         0 => Duration::ZERO,
         rate => Duration::from_secs_f64(sound.frames() as f64 / f64::from(rate)),
     }
+}
+
+/// Polls `ready` every `poll` until it holds. Fails after `timeout`, which
+/// means no output stream came up.
+fn wait_for_output(ready: impl Fn() -> bool, poll: Duration, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    while !ready() {
+        if started.elapsed() >= timeout {
+            bail!(
+                "no output stream within {}s: no usable output device",
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(poll);
+    }
+    Ok(())
 }
 
 /// Polls `probe` (returning `(commands_applied, active_voices)`) every
@@ -216,6 +260,42 @@ mod tests {
         let embedded = load_play_sound(None).unwrap();
         assert_eq!(from_file.frames(), embedded.frames());
         assert_eq!(from_file.channels(), embedded.channels());
+    }
+
+    #[test]
+    fn output_drain_follows_the_reported_latency() {
+        assert_eq!(output_drain(Duration::ZERO), OUTPUT_DRAIN_MARGIN);
+        // A wireless output with two seconds of latency is waited out.
+        assert_eq!(
+            output_drain(Duration::from_secs(2)),
+            Duration::from_secs(2) + OUTPUT_DRAIN_MARGIN
+        );
+        assert_eq!(
+            output_drain(Duration::from_secs(600)),
+            MAX_OUTPUT_LATENCY + OUTPUT_DRAIN_MARGIN
+        );
+    }
+
+    #[test]
+    fn wait_for_output_returns_once_ready() {
+        let calls = Cell::new(0);
+        let ready = || {
+            calls.set(calls.get() + 1);
+            calls.get() >= 4
+        };
+        wait_for_output(ready, Duration::ZERO, LONG).unwrap();
+        assert_eq!(calls.get(), 4);
+    }
+
+    #[test]
+    fn wait_for_output_times_out_without_a_device() {
+        let err = wait_for_output(
+            || false,
+            Duration::from_millis(1),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("output device"), "{err}");
     }
 
     #[test]

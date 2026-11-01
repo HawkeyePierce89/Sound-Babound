@@ -7,6 +7,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::{Mutex, PoisonError};
 
 use objc2_core_audio::{
     AudioObjectAddPropertyListener, AudioObjectID, AudioObjectPropertyAddress,
@@ -53,9 +54,38 @@ fn address(selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress 
     }
 }
 
-/// The CoreAudio listener. `client_data` is the `EventSender` boxed by
-/// [`CoreAudioWatcher::start`], alive until the guard has removed every
-/// listener.
+/// The context CoreAudio passes to [`listener`].
+///
+/// CoreAudio does not promise that a callback already running has returned
+/// once `AudioObjectRemovePropertyListener` succeeds, so the context is
+/// leaked and never freed. On shutdown the guard only takes the sender out,
+/// which closes the channel; the leaked remainder is an empty `Mutex`, once
+/// per started watcher.
+struct ListenerContext(Mutex<Option<EventSender>>);
+
+impl ListenerContext {
+    /// Send `event` if the guard has not taken the sender yet.
+    fn send(&self, event: DeviceEvent) {
+        let sender = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(events) = sender.as_ref() {
+            // A send failure means the supervisor is shutting down; the guard
+            // will unregister shortly. The send never blocks.
+            let _ = events.send(event);
+        }
+    }
+
+    /// Drop the sender. Later callbacks find nothing to send to.
+    fn close(&self) {
+        drop(self.0.lock().unwrap_or_else(PoisonError::into_inner).take());
+    }
+
+    fn as_client_data(&'static self) -> *mut c_void {
+        std::ptr::from_ref(self).cast_mut().cast()
+    }
+}
+
+/// The CoreAudio listener. `client_data` is the leaked [`ListenerContext`]
+/// registered by [`CoreAudioWatcher::start`], valid for the whole process.
 unsafe extern "C-unwind" fn listener(
     _object: AudioObjectID,
     count: u32,
@@ -65,16 +95,15 @@ unsafe extern "C-unwind" fn listener(
     if client_data.is_null() {
         return 0;
     }
-    // SAFETY: client_data is the `Box<EventSender>` pointer registered in
-    // `start`; the guard frees it only after removing all listeners.
-    let events = unsafe { &*(client_data as *const EventSender) };
+    // SAFETY: client_data is the `&'static ListenerContext` registered in
+    // `start`; it is leaked, so it outlives every callback, even one still
+    // running after its listener was removed.
+    let context = unsafe { &*(client_data as *const ListenerContext) };
     // SAFETY: CoreAudio passes `count` valid addresses.
     let addresses = unsafe { std::slice::from_raw_parts(addresses.as_ptr(), count as usize) };
     for address in addresses {
         if let Some(event) = event_for_selector(address.mSelector) {
-            // A send failure means the supervisor is shutting down; the guard
-            // will unregister shortly.
-            let _ = events.send(event);
+            context.send(event);
         }
     }
     0
@@ -85,13 +114,14 @@ unsafe extern "C-unwind" fn listener(
 pub struct CoreAudioWatcher;
 
 struct CoreAudioGuard {
-    /// The boxed `EventSender` passed to CoreAudio as client data.
-    client_data: *mut EventSender,
+    /// The leaked context passed to CoreAudio as client data.
+    context: &'static ListenerContext,
     /// The selectors whose listener was added successfully.
     registered: Vec<AudioObjectPropertySelector>,
 }
 
 impl CoreAudioGuard {
+    /// Remove every registered listener, logging any removal that fails.
     fn remove_all(&mut self) {
         for selector in self.registered.drain(..) {
             let address = address(selector);
@@ -102,7 +132,7 @@ impl CoreAudioGuard {
                     SYSTEM_OBJECT,
                     NonNull::from(&address),
                     Some(listener),
-                    self.client_data.cast(),
+                    self.context.as_client_data(),
                 )
             };
             if status != 0 {
@@ -117,31 +147,30 @@ impl WatcherGuard for CoreAudioGuard {}
 impl Drop for CoreAudioGuard {
     fn drop(&mut self) {
         self.remove_all();
-        if !self.client_data.is_null() {
-            // SAFETY: created by `Box::into_raw` in `start` and freed only here,
-            // after every listener using it was removed.
-            drop(unsafe { Box::from_raw(self.client_data) });
-            self.client_data = std::ptr::null_mut();
-        }
+        // The context itself stays leaked: a callback may still be running,
+        // or, after a failed removal, may still be called.
+        self.context.close();
     }
 }
 
 impl DeviceWatcher for CoreAudioWatcher {
     fn start(&mut self, events: EventSender) -> Result<Box<dyn WatcherGuard>, WatcherError> {
+        let context: &'static ListenerContext =
+            Box::leak(Box::new(ListenerContext(Mutex::new(Some(events)))));
         let mut guard = CoreAudioGuard {
-            client_data: Box::into_raw(Box::new(events)),
+            context,
             registered: Vec::with_capacity(SELECTORS.len()),
         };
         for selector in SELECTORS {
             let address = address(selector);
-            // SAFETY: the address is valid for the call; the client data stays
-            // alive until the guard removes this listener.
+            // SAFETY: the address is valid for the call; the client data is
+            // leaked, so it stays valid for every callback.
             let status = unsafe {
                 AudioObjectAddPropertyListener(
                     SYSTEM_OBJECT,
                     NonNull::from(&address),
                     Some(listener),
-                    guard.client_data.cast(),
+                    context.as_client_data(),
                 )
             };
             if status != 0 {
@@ -206,7 +235,9 @@ mod tests {
     #[test]
     fn listener_forwards_every_address() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let client = Box::into_raw(Box::new(EventSender::new(tx)));
+        let context: &'static ListenerContext = Box::leak(Box::new(ListenerContext(Mutex::new(
+            Some(EventSender::new(tx)),
+        ))));
         let addresses = [
             address(kAudioHardwarePropertyDefaultOutputDevice),
             address(0x1234),
@@ -217,11 +248,10 @@ mod tests {
                 SYSTEM_OBJECT,
                 addresses.len() as u32,
                 NonNull::from(&addresses[0]),
-                client.cast(),
+                context.as_client_data(),
             )
         };
         assert_eq!(status, 0);
-        drop(unsafe { Box::from_raw(client) });
         let got: Vec<_> = rx
             .try_iter()
             .map(|msg| match msg {
@@ -239,12 +269,38 @@ mod tests {
     }
 
     #[test]
+    fn listener_after_close_sends_nothing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let context: &'static ListenerContext = Box::leak(Box::new(ListenerContext(Mutex::new(
+            Some(EventSender::new(tx)),
+        ))));
+        context.close();
+        // A callback still in flight after removal finds a valid, empty
+        // context: no use-after-free, nothing sent.
+        let addresses = [address(kAudioHardwarePropertyDefaultOutputDevice)];
+        let status = unsafe {
+            listener(
+                SYSTEM_OBJECT,
+                1,
+                NonNull::from(&addresses[0]),
+                context.as_client_data(),
+            )
+        };
+        assert_eq!(status, 0);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
     fn start_and_drop_guard() {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = CoreAudioWatcher;
         let guard = watcher.start(EventSender::new(tx)).unwrap();
         drop(guard);
-        // The guard freed the boxed sender, so the channel is disconnected.
+        // The guard took the sender out of the leaked context, so the
+        // channel is disconnected.
         assert!(matches!(
             rx.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Disconnected)

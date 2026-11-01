@@ -1,11 +1,48 @@
 //! Sample-format conversion from the f32 mix to the device format.
 //!
 //! These are pure, allocation-free functions that run inside the audio
-//! callback. Conversion goes through cpal's [`FromSample`], so every integer
+//! callback. Conversion goes through cpal's `FromSample`, so every integer
 //! format gets the same scaling; input is clamped to [-1, 1] first (and NaN
 //! becomes silence) so a stray value can never wrap around.
+//!
+//! The 24-bit formats are the exception: dasp maps +1.0 to `1 << 23` (one
+//! past the I24 maximum), which wraps to full negative once packed into 24
+//! bits. They convert through `i32`, which saturates, instead.
 
-use cpal::{FromSample, Sample};
+use cpal::{I24, Sample, SizedSample, U24};
+
+/// A device sample type the f32 mix can be written to.
+pub trait OutputSample: SizedSample {
+    /// Convert a sample already clamped to [-1, 1], saturating at full scale.
+    fn from_mix(sample: f32) -> Self;
+}
+
+macro_rules! direct_output_sample {
+    ($($t:ty),*) => {$(
+        impl OutputSample for $t {
+            #[inline]
+            fn from_mix(sample: f32) -> Self {
+                <$t>::from_sample(sample)
+            }
+        }
+    )*};
+}
+
+direct_output_sample!(f32, f64, i8, i16, i32, i64, u8, u16, u32, u64);
+
+impl OutputSample for I24 {
+    #[inline]
+    fn from_mix(sample: f32) -> Self {
+        I24::from_sample(i32::from_sample(sample))
+    }
+}
+
+impl OutputSample for U24 {
+    #[inline]
+    fn from_mix(sample: f32) -> Self {
+        U24::from_sample(i32::from_sample(sample))
+    }
+}
 
 /// Clamp a mixed sample to the valid range. NaN maps to silence.
 #[inline]
@@ -20,15 +57,11 @@ fn clamp(sample: f32) -> f32 {
 /// Convert `src` into `dst`, sample by sample.
 ///
 /// Only `min(src.len(), dst.len())` samples are written; the rest of `dst`
-/// is left untouched. Works for `f32`, `i16`, `u16`, `i32`, `u8` and every
-/// other cpal sample type.
+/// is left untouched. Works for every cpal PCM sample type.
 #[inline]
-pub fn write_samples<T>(src: &[f32], dst: &mut [T])
-where
-    T: Sample + FromSample<f32>,
-{
+pub fn write_samples<T: OutputSample>(src: &[f32], dst: &mut [T]) {
     for (out, &sample) in dst.iter_mut().zip(src) {
-        *out = T::from_sample(clamp(sample));
+        *out = T::from_mix(clamp(sample));
     }
 }
 
@@ -43,7 +76,7 @@ pub fn fill_silence<T: Sample>(dst: &mut [T]) {
 mod tests {
     use super::*;
 
-    fn convert<T: Sample + FromSample<f32>>(src: &[f32]) -> Vec<T> {
+    fn convert<T: OutputSample>(src: &[f32]) -> Vec<T> {
         let mut out = vec![T::EQUILIBRIUM; src.len()];
         write_samples(src, &mut out);
         out
@@ -91,6 +124,32 @@ mod tests {
 
         let out: Vec<u8> = convert(&[-1.0, 0.0, 1.0, -3.0]);
         assert_eq!(out, [0, 128, u8::MAX, 0]);
+    }
+
+    #[test]
+    fn twenty_four_and_sixty_four_bit_boundaries() {
+        let out: Vec<I24> = convert(&[-1.0, 0.0, 1.0, 3.0, f32::NAN]);
+        let raw: Vec<i32> = out.iter().map(|s| s.inner()).collect();
+        assert_eq!(raw, [-(1 << 23), 0, (1 << 23) - 1, (1 << 23) - 1, 0]);
+
+        let out: Vec<U24> = convert(&[-1.0, 0.0, 1.0, -3.0]);
+        let raw: Vec<i32> = out.iter().map(|s| s.inner()).collect();
+        assert_eq!(raw, [0, 1 << 23, (1 << 24) - 1, 0]);
+
+        let out: Vec<i64> = convert(&[-1.0, 0.0, 2.0]);
+        assert_eq!(out[0], i64::MIN);
+        assert_eq!(out[1], 0);
+        assert!(out[2] > i64::MAX / 2);
+
+        let out: Vec<u64> = convert(&[-1.0, 0.0]);
+        assert_eq!(out, [0, 1 << 63]);
+
+        let mut i = [I24::new_unchecked(5); 2];
+        fill_silence(&mut i);
+        assert_eq!(i.map(|s| s.inner()), [0; 2]);
+        let mut u = [U24::new_unchecked(5); 2];
+        fill_silence(&mut u);
+        assert_eq!(u.map(|s| s.inner()), [1 << 23; 2]);
     }
 
     #[test]
