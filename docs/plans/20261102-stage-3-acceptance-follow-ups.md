@@ -133,12 +133,12 @@ Item 6, the probe hold-off ceiling:
 
 Item 7, retire a vanished device:
 
-- [ ] `DeviceState::Retired` becomes `Retired { vanished: bool }`. `drop_device` retires with `vanished: false`. `has_retired_device` and `shutdown` match `Retired { .. }`.
-- [ ] In `checked`, after `stop_path`: if `mic_stopped()`, it sends `Release` and then `begin_create()` (as today); otherwise it warns and sets `Retired { vanished: true }`, sending nothing.
-- [ ] In `release_retired`, once `mic_stopped()`, a vanished device sends `Release`, then `begin_create()` (a new epoch) if the mic is on, and otherwise goes to `Absent`. It is never taken back.
-- [ ] In `set_mic(Some)` on `Retired { vanished: true }` with the stream ended, it sends `Release` and then `begin_create()` instead of reusing the device. While the stream runs, it waits as today.
-- [ ] Update the docs of `checked`, `release_retired` and `DeviceState`.
-- [ ] Tests (recording `FakeRequests`, `with_slow_stop`-style control):
+- [x] `DeviceState::Retired` becomes `Retired { vanished: bool }`. `drop_device` retires with `vanished: false`. `has_retired_device` and `shutdown` match `Retired { .. }`.
+- [x] In `checked`, after `stop_path`: if `mic_stopped()`, it sends `Release` and then `begin_create()` (as today); otherwise it warns and sets `Retired { vanished: true }`, sending nothing.
+- [x] In `release_retired`, once `mic_stopped()`, a vanished device sends `Release`, then `begin_create()` (a new epoch) if the mic is on, and otherwise goes to `Absent`. It is never taken back.
+- [x] In `set_mic(Some)` on `Retired { vanished: true }` with the stream ended, it sends `Release` and then `begin_create()` instead of reusing the device. While the stream runs, it waits as today.
+- [x] Update the docs of `checked`, `release_retired` and `DeviceState`.
+- [x] Tests (recording `FakeRequests`, `with_slow_stop`-style control):
   - `Checked(false)` with `mic_stopped` false: the path stops, `has_retired_device()` is true, and no request is sent;
   - a later `release_retired` with `mic_stopped` true sends `Release`, then `Create { epoch: n+1 }`; a `Created(Ok)` for it starts the path;
   - `Checked(false)` with `mic_stopped` true still sends `Release` then `Create` at once (today's behavior; keep or extend the existing test);
@@ -146,13 +146,13 @@ Item 7, retire a vanished device:
 
 Item 8, stale-epoch test:
 
-- [ ] Add a test that runs mic on, `Created(Ok)` (epoch 1), mic off, mic on again (`Create` epoch 2), then `Checked { epoch: 1, present: false }`. Assert no extra `set_mic(None)`, no `Release` and no second `Create` after epoch 2's.
+- [x] Add a test that runs mic on, `Created(Ok)` (epoch 1), mic off, mic on again (`Create` epoch 2), then `Checked { epoch: 1, present: false }`. Assert no extra `set_mic(None)`, no `Release` and no second `Create` after epoch 2's.
 
 Item 9, `WORKER_FINISH_TIMEOUT`:
 
-- [ ] Rewrite the comment. The 10 s timeout bounds how long quit and mic-off may freeze the event loop. It deliberately does not cover the worst case: a create is `list`, up to two `unload`s and two `load`s at 3 s each, about 15 to 18 s, and a `Release` queued behind it brings that to about 27 s. The comment also says what happens when it fires: the worker is left running, the device may stay loaded, and the next start unloads it as stale.
-- [ ] `finish_within`'s warning says the same in one sentence. The value stays 10 s.
-- [ ] Run `cargo test -p sound-babound`; it must pass before Task 4.
+- [x] Rewrite the comment. The 10 s timeout bounds how long quit and mic-off may freeze the event loop. It deliberately does not cover the worst case: a create is `list`, up to two `unload`s and two `load`s at 3 s each, about 15 to 18 s, and a `Release` queued behind it brings that to about 27 s. The comment also says what happens when it fires: the worker is left running, the device may stay loaded, and the next start unloads it as stale.
+- [x] `finish_within`'s warning says the same in one sentence. The value stays 10 s.
+- [x] Run `cargo test -p sound-babound`; it must pass before Task 4.
 
 ### Task 4: Verify acceptance criteria
 

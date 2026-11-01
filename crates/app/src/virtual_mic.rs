@@ -23,8 +23,12 @@ use crate::platform;
 pub const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long [`DeviceWorker::finish_within`] waits for the worker at
-/// shutdown: unloading the device takes at most three `pactl` calls of 3 s
-/// each.
+/// shutdown. It bounds how long quitting and turning the mic off may freeze
+/// the event loop; it deliberately does not cover the worst case. A create is
+/// a `list`, up to two `unload`s and two `load`s at 3 s each, about 15 to
+/// 18 s, and a `Release` queued behind it brings that to about 27 s. When the
+/// timeout fires, the worker is left running, the device may stay loaded, and
+/// the next start unloads it as stale.
 pub const WORKER_FINISH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A virtual device the app created itself, which can vanish behind its
@@ -182,7 +186,9 @@ impl DeviceWorker {
         drop(requests);
         match done.recv_timeout(timeout) {
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                tracing::warn!("the virtual mic worker did not finish in time; leaving it");
+                tracing::warn!(
+                    "the virtual mic worker did not finish in time; leaving it running, and the virtual mic may stay loaded until the next start unloads it as stale"
+                );
                 false
             }
             _ => {
@@ -218,8 +224,11 @@ enum DeviceState {
     /// worker made none).
     Present { owned: bool },
     /// The mic path stopped while a mic stream may still run, so the worker
-    /// keeps the device (see [`WithVirtualMic::release_retired`]).
-    Retired,
+    /// keeps the device (see [`WithVirtualMic::release_retired`]). `vanished`
+    /// is true when the device's modules are already gone (a sound server
+    /// restart): it is never reused, and is released and created again once
+    /// the stream ended.
+    Retired { vanished: bool },
 }
 
 /// Why the mic path waits while the mic is on.
@@ -321,7 +330,7 @@ impl<C, R: DeviceRequests> WithVirtualMic<C, R> {
 
     /// Whether a retired device waits for a mic stream to end.
     pub fn has_retired_device(&self) -> bool {
-        self.state == DeviceState::Retired
+        matches!(self.state, DeviceState::Retired { .. })
     }
 
     /// Hands the control to `stop` (the engine shuts down, returning whether
@@ -340,7 +349,7 @@ impl<C, R: DeviceRequests> WithVirtualMic<C, R> {
         let holds_device = matches!(
             state,
             DeviceState::Present { owned: true }
-                | DeviceState::Retired
+                | DeviceState::Retired { .. }
                 | DeviceState::Creating { .. }
         );
         if stop(control) || !holds_device {
@@ -412,7 +421,11 @@ where
     }
 
     /// A vanished device stops the mic path before it is released, so the
-    /// path never runs without it, and is created again.
+    /// path never runs without it, and is created again. If the stop left a
+    /// mic stream running, the device goes through the retire decision like
+    /// any other: it is kept as retired (vanished), nothing is sent, and
+    /// [`WithVirtualMic::release_retired`] releases it and creates it again
+    /// once the stream ended.
     fn checked(&mut self, epoch: u64, present: bool) {
         if self.checking == Some(epoch) {
             self.checking = None;
@@ -429,9 +442,16 @@ where
         if let Err(err) = self.stop_path() {
             tracing::error!("{err:#}; could not stop the mic path");
         }
-        // Its modules are gone already, so releasing it unloads nothing.
-        self.requests.send(DeviceRequest::Release);
-        self.begin_create();
+        if self.control.mic_stopped() {
+            // Its modules are gone already, so releasing it unloads nothing.
+            self.requests.send(DeviceRequest::Release);
+            self.begin_create();
+        } else {
+            tracing::warn!(
+                "a mic stream did not stop in time; the virtual mic is created again once it does"
+            );
+            self.state = DeviceState::Retired { vanished: true };
+        }
     }
 
     /// Starts (or updates) the mic path with the stored settings. If that
@@ -462,7 +482,7 @@ where
                     tracing::warn!(
                         "a mic stream did not stop in time; keeping the virtual mic until it does"
                     );
-                    self.state = DeviceState::Retired;
+                    self.state = DeviceState::Retired { vanished: false };
                 }
             }
             DeviceState::Present { owned: false } => self.state = DeviceState::Absent,
@@ -470,19 +490,31 @@ where
                 self.requests.send(DeviceRequest::Release);
                 self.state = DeviceState::Absent;
             }
-            DeviceState::Absent | DeviceState::Retired => {}
+            DeviceState::Absent | DeviceState::Retired { .. } => {}
         }
     }
 
     /// Once every mic stream has ended, starts the mic path on the retired
     /// device if the mic path waits for it (the mic was turned on again
-    /// meanwhile), and otherwise releases it. The tray calls it every mic
-    /// poll while there is one.
+    /// meanwhile), and otherwise releases it. A vanished device is never
+    /// taken back: it is released, and created again (a new epoch) if the mic
+    /// is on. The tray calls it every mic poll while there is one.
     pub fn release_retired(&mut self) {
-        if self.state != DeviceState::Retired || !self.control.mic_stopped() {
+        let DeviceState::Retired { vanished } = self.state else {
+            return;
+        };
+        if !self.control.mic_stopped() {
             return;
         }
-        if self.settings.is_some() && !self.running {
+        if vanished {
+            tracing::info!("the stopped mic stream has ended; replacing the vanished virtual mic");
+            self.requests.send(DeviceRequest::Release);
+            if self.settings.is_some() {
+                self.begin_create();
+            } else {
+                self.state = DeviceState::Absent;
+            }
+        } else if self.settings.is_some() && !self.running {
             tracing::info!("the stopped mic stream has ended; starting the mic path");
             self.state = DeviceState::Present { owned: true };
             if let Err(err) = self.start_path() {
@@ -588,10 +620,16 @@ where
                 self.begin_create();
                 Ok(())
             }
-            DeviceState::Retired => {
+            DeviceState::Retired { vanished } => {
                 if self.control.mic_stopped() {
-                    self.state = DeviceState::Present { owned: true };
-                    self.start_path()
+                    if vanished {
+                        self.requests.send(DeviceRequest::Release);
+                        self.begin_create();
+                        Ok(())
+                    } else {
+                        self.state = DeviceState::Present { owned: true };
+                        self.start_path()
+                    }
                 } else {
                     // A new mic path never runs beside the old one;
                     // `release_retired` starts it once the old stream ended.
@@ -1541,6 +1579,161 @@ mod tests {
         run(&mut audio, &mut host);
         assert!(audio.has_retired_device());
         assert!(!log.borrow().contains(&"device dropped"));
+    }
+
+    /// A mic on a device that is created (epoch 1) and a stop that may not
+    /// finish, ready for a `Checked { present: false }` reply.
+    fn running_on_slow_stop(
+        log: &Log,
+        stopped: &Rc<Cell<bool>>,
+    ) -> Rig<SlowStopAudio, impl FnMut() -> Result<Option<FakeDevice>> + use<>> {
+        let (mut audio, mut host) = with_slow_stop(log, stopped);
+        audio.set_mic(on()).unwrap();
+        run(&mut audio, &mut host);
+        assert!(audio.has_device());
+        (audio, host)
+    }
+
+    fn gone(epoch: u64) -> DeviceReply {
+        DeviceReply::Checked {
+            epoch,
+            present: false,
+        }
+    }
+
+    #[test]
+    fn a_vanished_device_with_a_stream_still_running_is_retired_and_created_again_later() {
+        let log = Log::default();
+        let stopped = Rc::new(Cell::new(true));
+        let (mut audio, mut host) = running_on_slow_stop(&log, &stopped);
+        stopped.set(false);
+        audio.on_reply(gone(1));
+        // The path stopped, the device is kept, and nothing is sent.
+        assert!(audio.has_retired_device());
+        assert!(!audio.has_device());
+        assert_eq!(audio.requests.sent(), [DeviceRequest::Create { epoch: 1 }]);
+        assert_eq!(*log.borrow(), ["device created", "mic on", "mic off"]);
+        assert_eq!(audio.waiting_for_device(), Some(DeviceWait::Pending));
+
+        // The stream still runs: it is not released, nor taken back.
+        audio.release_retired();
+        audio.restore_device(Instant::now());
+        assert_eq!(audio.requests.sent(), [DeviceRequest::Create { epoch: 1 }]);
+
+        stopped.set(true);
+        audio.release_retired();
+        assert_eq!(
+            audio.requests.queued(),
+            [DeviceRequest::Release, DeviceRequest::Create { epoch: 2 }]
+        );
+        assert!(!audio.has_retired_device());
+        run(&mut audio, &mut host);
+        assert!(audio.has_device());
+        assert_eq!(audio.waiting_for_device(), None);
+        assert_eq!(
+            *log.borrow(),
+            [
+                "device created",
+                "mic on",
+                "mic off",
+                "device dropped",
+                "device created",
+                "mic on"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_vanished_device_with_every_stream_ended_is_released_and_created_at_once() {
+        let log = Log::default();
+        let stopped = Rc::new(Cell::new(true));
+        let (mut audio, mut host) = running_on_slow_stop(&log, &stopped);
+        audio.on_reply(gone(1));
+        assert!(!audio.has_retired_device());
+        assert_eq!(
+            audio.requests.queued(),
+            [DeviceRequest::Release, DeviceRequest::Create { epoch: 2 }]
+        );
+        run(&mut audio, &mut host);
+        assert!(audio.has_device());
+    }
+
+    #[test]
+    fn a_vanished_retired_device_is_only_released_when_the_mic_went_off() {
+        let log = Log::default();
+        let stopped = Rc::new(Cell::new(true));
+        let (mut audio, mut host) = running_on_slow_stop(&log, &stopped);
+        stopped.set(false);
+        audio.on_reply(gone(1));
+        audio.set_mic(None).unwrap();
+        assert!(audio.has_retired_device());
+        stopped.set(true);
+        audio.release_retired();
+        assert!(!audio.has_retired_device());
+        assert_eq!(
+            audio.requests.sent(),
+            [DeviceRequest::Create { epoch: 1 }, DeviceRequest::Release]
+        );
+        run(&mut audio, &mut host);
+        assert_eq!(audio.waiting_for_device(), None);
+        assert_eq!(log.borrow().last(), Some(&"device dropped"));
+    }
+
+    #[test]
+    fn a_mic_turned_on_again_never_reuses_a_vanished_retired_device() {
+        let log = Log::default();
+        let stopped = Rc::new(Cell::new(true));
+        let (mut audio, mut host) = running_on_slow_stop(&log, &stopped);
+        stopped.set(false);
+        audio.on_reply(gone(1));
+        // The old stream still runs: the new path waits for it.
+        audio.set_mic(on()).unwrap();
+        assert!(audio.has_retired_device());
+        assert_eq!(audio.requests.sent(), [DeviceRequest::Create { epoch: 1 }]);
+        // It ended: a fresh device is created rather than the vanished one.
+        stopped.set(true);
+        audio.set_mic(on()).unwrap();
+        assert_eq!(
+            audio.requests.queued(),
+            [DeviceRequest::Release, DeviceRequest::Create { epoch: 2 }]
+        );
+        run(&mut audio, &mut host);
+        assert!(audio.has_device());
+        assert_eq!(log.borrow().last(), Some(&"mic on"));
+    }
+
+    #[test]
+    fn a_vanished_answer_from_an_older_epoch_after_mic_off_on_changes_nothing() {
+        let log = Log::default();
+        let (mut audio, mut host) = with_device(&log, false);
+        audio.set_mic(on()).unwrap();
+        run(&mut audio, &mut host);
+        audio.set_mic(None).unwrap();
+        audio.set_mic(on()).unwrap();
+        assert_eq!(
+            audio.requests.sent(),
+            [
+                DeviceRequest::Create { epoch: 1 },
+                DeviceRequest::Release,
+                DeviceRequest::Create { epoch: 2 }
+            ]
+        );
+        let offs = log.borrow().iter().filter(|e| **e == "mic off").count();
+        // A check of the first device is answered late, as gone.
+        audio.on_reply(gone(1));
+        assert_eq!(
+            audio.requests.sent(),
+            [
+                DeviceRequest::Create { epoch: 1 },
+                DeviceRequest::Release,
+                DeviceRequest::Create { epoch: 2 }
+            ]
+        );
+        assert_eq!(
+            log.borrow().iter().filter(|e| **e == "mic off").count(),
+            offs
+        );
+        assert_eq!(audio.waiting_for_device(), Some(DeviceWait::Pending));
     }
 
     #[test]
