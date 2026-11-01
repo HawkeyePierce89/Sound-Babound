@@ -24,10 +24,10 @@
 //!
 //! - The writer side ([`PassthroughShared::write`]) runs in the capture
 //!   callback. It downmixes to mono, pushes, and trims the oldest audio if
-//!   the fill passes the high mark: the published target (or the fallback
-//!   target, `max(TARGET_FILL, capture block + BLOCK_MARGIN)`, before the
-//!   reader published one) plus `max(HIGH_MARK_MARGIN, capture block +
-//!   BLOCK_MARGIN)`.
+//!   the fill passes the high mark: the published target (at least the
+//!   fallback target, `max(TARGET_FILL, capture block + BLOCK_MARGIN)`,
+//!   which also covers a target published before the first capture block)
+//!   plus `max(HIGH_MARK_MARGIN, capture block + BLOCK_MARGIN)`.
 //! - The reader side ([`PassthroughReader::read`]) runs in the mic sink
 //!   callback. It outputs silence until the ring holds the effective target
 //!   (priming), and re-primes after an underrun, when a new capture starts,
@@ -195,10 +195,11 @@ impl PassthroughShared {
     /// capture block. One overrun is counted per block that displaced the
     /// oldest samples from a full ring or pushed the fill past the high mark;
     /// in the latter case the oldest samples are popped until the fill is
-    /// back at the target (the published one, or the fallback target
-    /// `max(TARGET_FILL, capture block + BLOCK_MARGIN)` before the reader
-    /// published any, so the first two capture blocks never trim). Once the passthrough is closed, the block is
-    /// dropped (the heartbeat still moves).
+    /// back at the target: the published one, but at least the fallback
+    /// target `max(TARGET_FILL, capture block + BLOCK_MARGIN)`, so the first
+    /// two capture blocks never trim, even when the reader published a
+    /// target before the first capture block. Once the passthrough is
+    /// closed, the block is dropped (the heartbeat still moves).
     pub fn write<T: InputSample>(&self, data: &[T], channels: usize) {
         if channels > 0 && !self.is_closed() {
             let scale = 1.0 / channels as f32;
@@ -212,10 +213,13 @@ impl PassthroughShared {
                 .fetch_max(data.len() / channels, Ordering::AcqRel)
                 .max(data.len() / channels);
             let rate = self.capture_rate.load(Ordering::Acquire);
-            let target = match self.target.load(Ordering::Acquire) {
-                0 => fallback_target(rate, capture_block),
-                published => published,
-            };
+            // The published target, but never below the fallback: a reader
+            // that read before the first capture block published a target
+            // without it.
+            let target = self
+                .target
+                .load(Ordering::Acquire)
+                .max(fallback_target(rate, capture_block));
             if rate > 0 && self.ring.len() > high_mark_samples(rate, target, capture_block) {
                 while self.ring.len() > target && self.ring.pop().is_some() {}
                 overrun = true;
@@ -945,6 +949,25 @@ mod tests {
             assert_eq!(shared.overruns(), 0, "{block}-frame blocks");
             assert_eq!(shared.fill(), fill, "{block}-frame blocks");
         }
+    }
+
+    #[test]
+    fn a_target_published_before_the_first_capture_block_does_not_trim() {
+        // The mic sink is already running when the capture starts: its read
+        // publishes a target without the capture block, which is still 0.
+        let shared = shared_at(48_000);
+        let mut reader = shared.reader();
+        reader.set_sink_rate(48_000);
+        let mut out = vec![0.0f32; 480];
+        reader.read(&mut out);
+        assert_eq!(shared.published_target(), 1_440);
+
+        // Two 4096-frame capture blocks arrive back to back.
+        let data = vec![0.0f32; 4_096];
+        shared.write(&data, 1);
+        shared.write(&data, 1);
+        assert_eq!(shared.overruns(), 0);
+        assert_eq!(shared.fill(), 8_192);
     }
 
     #[test]
