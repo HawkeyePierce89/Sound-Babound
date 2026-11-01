@@ -96,35 +96,35 @@ Item 4, the `Settled` note:
 
 Item 5, one deadline:
 
-- [ ] `server_answers` computes `deadline = Instant::now() + timeout` once. `connect_within` and `wait_connected` take the deadline; they wait out an `EINPROGRESS` until the deadline and no longer set fixed socket timeouts.
-- [ ] All handshake I/O goes through a small wrapper over `&UnixStream` that implements `Read` and `Write`, used by the `BufReader` and by `roundtrip`'s writer:
+- [x] `server_answers` computes `deadline = Instant::now() + timeout` once. `connect_within` and `wait_connected` take the deadline; they wait out an `EINPROGRESS` until the deadline and no longer set fixed socket timeouts.
+- [x] All handshake I/O goes through a small wrapper over `&UnixStream` that implements `Read` and `Write`, used by the `BufReader` and by `roundtrip`'s writer:
   - before every call, it sets the socket's read or write timeout to the time left until the deadline;
   - with no time left, it fails with `io::ErrorKind::TimedOut`, since a zero timeout is not allowed.
   The bound then holds even against a server that trickles bytes. A timeout still maps to `Answer::Silent`. Result: a probe never takes longer than `PROBE_TIMEOUT` plus one `CONNECT_POLL`.
-- [ ] Update the docs:
+- [x] Update the docs:
   - `PROBE_TIMEOUT`: the whole probe's deadline;
   - `connect_within` and `server_answers`: one deadline over the connect and both messages;
   - `connect_pulse`: "blocks every mic caller behind that lock for at most the probe's deadline".
-- [ ] Linux-only test `a_server_that_answers_slowly_fails_the_probe_within_one_deadline`: the fake server reads `Auth`, waits about 70 % of a 500 ms timeout, replies to `Auth`, then reads `SetClientName` and never answers; assert `!server_answers(...)` and an elapsed time below the timeout plus 300 ms (before the fix it takes about 1.7× the timeout).
-- [ ] Linux-only test with a server that trickles the `Auth` reply one byte at a time, below the timeout per byte: assert it is bounded the same way.
-- [ ] Keep the existing never-answers, stall-after-`Auth` and saturated-backlog tests passing.
+- [x] Linux-only test `a_server_that_answers_slowly_fails_the_probe_within_one_deadline`: the fake server reads `Auth`, waits about 70 % of a 500 ms timeout, replies to `Auth`, then reads `SetClientName` and never answers; assert `!server_answers(...)` and an elapsed time below the timeout plus 300 ms (before the fix it takes about 1.7× the timeout).
+- [x] Linux-only test with a server that trickles the `Auth` reply one byte at a time, below the timeout per byte: assert it is bounded the same way.
+- [x] Keep the existing never-answers, stall-after-`Auth` and saturated-backlog tests passing.
 
 Item 6, the probe hold-off ceiling:
 
-- [ ] Add `PROBE_HOLD_OFF_MAX: Duration = 10 s`.
-- [ ] `Backoff` gets a `connect_failed: bool` field: the current streak includes a failed connect. `failed` sets it and `succeeded` clears it.
-- [ ] `hold_off(now, cap)`: `probe_failed` passes `PROBE_HOLD_OFF_MAX`, or `BACKOFF_MAX` when `connect_failed` is set, so a probe failure after a failed (stalled) connect keeps the full doubling and never shortens the connect's hold-off; `failed` always passes `BACKOFF_MAX`.
-- [ ] The shared failure count, `STALL_THRESHOLD` and `MAX_STALLED_CONNECTS` are unchanged.
-- [ ] Update the docs of `Backoff`, `probe_failed`, `try_connect`, the `shared_host.rs` module and `connect_pulse` (no longer "doubling up to a minute" for probes).
-- [ ] `try_connect` tests (every OS, fake clock):
+- [x] Add `PROBE_HOLD_OFF_MAX: Duration = 10 s`.
+- [x] `Backoff` gets a `connect_failed: bool` field: the current streak includes a failed connect. `failed` sets it and `succeeded` clears it.
+- [x] `hold_off(now, cap)`: `probe_failed` passes `PROBE_HOLD_OFF_MAX`, or `BACKOFF_MAX` when `connect_failed` is set, so a probe failure after a failed (stalled) connect keeps the full doubling and never shortens the connect's hold-off; `failed` always passes `BACKOFF_MAX`.
+- [x] The shared failure count, `STALL_THRESHOLD` and `MAX_STALLED_CONNECTS` are unchanged.
+- [x] Update the docs of `Backoff`, `probe_failed`, `try_connect`, the `shared_host.rs` module and `connect_pulse` (no longer "doubling up to a minute" for probes).
+- [x] `try_connect` tests (every OS, fake clock):
   - a probe-only streak gives 2, 4, 8, 10, 10 s; update `the_hold_off_doubles_over_failed_probes_up_to_its_cap` to the 10 s cap;
   - a connect-failure streak still reaches and holds 60 s;
   - a mixed streak, a stalled connect then failed probes, gives 4, 8, 16, 32, 60 s (never capped at 10);
   - a success resets the cap to the probe ceiling;
   - `failed_probes_never_exhaust_the_backoff` still passes.
-- [ ] Run `cargo test -p babound-engine` and the Linux cross clippy with the stub `PKG_CONFIG`.
-- [ ] If Docker is available, run the engine's `platform::` tests in a local `rust:1.98` container. Install `libasound2-dev` and `pkg-config`, and use a separate `CARGO_TARGET_DIR` (no audio device is needed). Record the result in the task notes.
-- [ ] Everything must pass before Task 3.
+- [x] Run `cargo test -p babound-engine` and the Linux cross clippy with the stub `PKG_CONFIG`.
+- [x] If Docker is available, run the engine's `platform::` tests in a local `rust:1.98` container. Install `libasound2-dev` and `pkg-config`, and use a separate `CARGO_TARGET_DIR` (no audio device is needed). Record the result in the task notes. (Done: Docker available, 26 `platform::` tests passed, including the new slow-answer and trickle probe tests.)
+- [x] Everything must pass before Task 3.
 
 ### Task 3: Virtual mic worker: retire a vanished device, the stale-epoch test, the finish timeout
 

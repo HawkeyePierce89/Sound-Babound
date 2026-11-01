@@ -22,8 +22,12 @@
 //! leaks more than that many threads, even against a server that always
 //! stalls. A failed probe holds further probes off the same way (a probe
 //! that times out blocks every mic caller behind the lock for its whole
-//! timeout), but never counts as a stalled connect: its socket is its own
-//! and leaves nothing behind. [`try_connect`] is that decision.
+//! deadline), but never counts as a stalled connect: its socket is its own
+//! and leaves nothing behind, so a hold-off made only of failed probes is
+//! capped at [`PROBE_HOLD_OFF_MAX`] (10 s), to notice a server that came up.
+//! A streak that includes a failed connect keeps the full doubling to a
+//! minute, and a probe failure after one never shortens it.
+//! [`try_connect`] is that decision.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -84,6 +88,11 @@ const BACKOFF_FIRST: Duration = Duration::from_secs(2);
 /// The longest hold-off.
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// The longest hold-off in a streak of failed probes only: a probe leaks
+/// nothing, so a server that comes up is noticed within this long. A streak
+/// with a failed connect in it is held off up to [`BACKOFF_MAX`] instead.
+pub(crate) const PROBE_HOLD_OFF_MAX: Duration = Duration::from_secs(10);
+
 /// A failed connect that took at least this long gave up on a stalled
 /// handshake (the client's handshake timeout is 2 s) and left its
 /// connecting thread behind; a faster failure leaves nothing.
@@ -93,9 +102,12 @@ pub(crate) const STALL_THRESHOLD: Duration = Duration::from_millis(1500);
 /// after that, [`Backoff`] never allows a connect again.
 pub(crate) const MAX_STALLED_CONNECTS: u32 = 8;
 
-/// Holds connects off after connects that failed although the server
-/// answered the probe: [`BACKOFF_FIRST`], doubling with each failure in a
-/// row up to [`BACKOFF_MAX`]. A successful connect resets the hold-off, but
+/// Holds probes and connects off after failures: [`BACKOFF_FIRST`], doubling
+/// with each failure in a row. A failed connect (the server answered the
+/// probe) doubles up to [`BACKOFF_MAX`]; a streak of failed probes only
+/// stops at [`PROBE_HOLD_OFF_MAX`], and a probe failure in a streak that has
+/// a failed connect keeps the connect's cap. A successful connect resets the
+/// hold-off and the cap, but
 /// not the count of connects that stalled ([`STALL_THRESHOLD`]): once that
 /// reaches [`MAX_STALLED_CONNECTS`], no connect is allowed again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +115,8 @@ pub(crate) struct Backoff {
     failures: u32,
     until: Option<Instant>,
     stalled: u32,
+    /// The current streak includes a failed connect.
+    connect_failed: bool,
 }
 
 impl Backoff {
@@ -111,6 +125,7 @@ impl Backoff {
             failures: 0,
             until: None,
             stalled: 0,
+            connect_failed: false,
         }
     }
 
@@ -130,22 +145,30 @@ impl Backoff {
         if took >= STALL_THRESHOLD {
             self.stalled = self.stalled.saturating_add(1);
         }
-        self.hold_off(now)
+        self.connect_failed = true;
+        self.hold_off(now, BACKOFF_MAX)
     }
 
     /// Records a probe that failed at `now`; returns the hold-off it starts
-    /// (the same doubling as [`Backoff::failed`]). A probe uses a socket of
-    /// its own and leaks nothing however long it took, so it never counts
-    /// as a stalled connect.
+    /// (the same doubling as [`Backoff::failed`], but at most
+    /// [`PROBE_HOLD_OFF_MAX`] unless the streak has a failed connect). A
+    /// probe uses a socket of its own and leaks nothing however long it
+    /// took, so it never counts as a stalled connect.
     pub(crate) fn probe_failed(&mut self, now: Instant) -> Duration {
-        self.hold_off(now)
+        let cap = if self.connect_failed {
+            BACKOFF_MAX
+        } else {
+            PROBE_HOLD_OFF_MAX
+        };
+        self.hold_off(now, cap)
     }
 
-    /// Starts the next hold-off from `now` and counts the failure.
-    fn hold_off(&mut self, now: Instant) -> Duration {
+    /// Starts the next hold-off from `now`, at most `cap`, and counts the
+    /// failure.
+    fn hold_off(&mut self, now: Instant, cap: Duration) -> Duration {
         let delay = BACKOFF_FIRST
             .saturating_mul(1 << self.failures.min(16))
-            .min(BACKOFF_MAX);
+            .min(cap);
         self.failures = self.failures.saturating_add(1);
         self.until = Some(now + delay);
         delay
@@ -156,6 +179,7 @@ impl Backoff {
     pub(crate) fn succeeded(&mut self) {
         self.failures = 0;
         self.until = None;
+        self.connect_failed = false;
     }
 }
 
@@ -179,7 +203,8 @@ pub(crate) enum ConnectOutcome<H, E> {
 
 /// One connect attempt under `backoff`: nothing while it holds connects
 /// off, then `probe`, then `connect` only if the probe passed. A failed
-/// probe arms the hold-off ([`Backoff::probe_failed`]); a failed connect
+/// probe arms the hold-off ([`Backoff::probe_failed`], at most 10 s unless
+/// a connect failed in the streak); a failed connect
 /// arms it and counts a stall if it took [`STALL_THRESHOLD`] or longer
 /// ([`Backoff::failed`]); a successful connect resets it. `now` reads the
 /// clock.
@@ -457,7 +482,59 @@ mod tests {
             delays.push(delay);
             clock.advance(Duration::from_secs(delay));
         }
+        assert_eq!(delays, [2, 4, 8, 10, 10, 10, 10, 10]);
+    }
+
+    #[test]
+    fn a_connect_failure_streak_reaches_and_holds_sixty_seconds() {
+        let clock = Clock::new(Instant::now());
+        let mut backoff = Backoff::new();
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            let result = attempt(&mut backoff, &clock, true, Err(()), Duration::ZERO);
+            assert_eq!(result.outcome, "failed");
+            let delay = result.delay.expect("a delay");
+            delays.push(delay);
+            clock.advance(Duration::from_secs(delay));
+        }
         assert_eq!(delays, [2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+
+    #[test]
+    fn failed_probes_after_a_stalled_connect_keep_the_full_doubling() {
+        let clock = Clock::new(Instant::now());
+        let mut backoff = Backoff::new();
+        let stalled = attempt(&mut backoff, &clock, true, Err(()), STALL_THRESHOLD);
+        assert_eq!(stalled.delay, Some(2));
+        clock.advance(Duration::from_secs(2));
+        let mut delays = Vec::new();
+        for _ in 0..6 {
+            let result = attempt(&mut backoff, &clock, false, Ok(()), Duration::ZERO);
+            assert_eq!(result.outcome, "probe failed");
+            let delay = result.delay.expect("a delay");
+            delays.push(delay);
+            clock.advance(Duration::from_secs(delay));
+        }
+        // Never capped at the probe ceiling.
+        assert_eq!(delays, [4, 8, 16, 32, 60, 60]);
+    }
+
+    #[test]
+    fn a_success_resets_the_cap_to_the_probe_ceiling() {
+        let clock = Clock::new(Instant::now());
+        let mut backoff = Backoff::new();
+        attempt(&mut backoff, &clock, true, Err(()), Duration::ZERO);
+        clock.advance(BACKOFF_MAX);
+        let connected = attempt(&mut backoff, &clock, true, Ok(()), Duration::ZERO);
+        assert_eq!(connected.outcome, "connected");
+        let mut delays = Vec::new();
+        for _ in 0..5 {
+            let result = attempt(&mut backoff, &clock, false, Ok(()), Duration::ZERO);
+            let delay = result.delay.expect("a delay");
+            delays.push(delay);
+            clock.advance(Duration::from_secs(delay));
+        }
+        assert_eq!(delays, [2, 4, 8, 10, 10]);
     }
 
     #[test]
