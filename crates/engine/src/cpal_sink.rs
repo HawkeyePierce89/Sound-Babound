@@ -4,8 +4,10 @@
 //!
 //! - [`OutputTarget::Default`], the monitor: the system default output
 //!   device of [`platform::monitor_host`].
-//! - [`OutputTarget::Named`], the mic sink: the first output device of
-//!   [`platform::mic_host`] whose name or id contains the pattern.
+//! - [`OutputTarget::Named`], the mic sink: an output device of
+//!   [`platform::mic_host`] whose name or id contains the pattern, the
+//!   first one that also contains the preference if any does, otherwise the
+//!   first one.
 //!
 //! It holds no device, host or identity between calls. Every build and every
 //! identity query re-queries the host (and, for a named target, re-enumerates
@@ -42,9 +44,15 @@ pub(crate) const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 pub enum OutputTarget {
     /// The current default output device (the monitor).
     Default,
-    /// The first output device whose display name or id contains this
-    /// pattern, ignoring case (the mic sink).
-    Named(String),
+    /// The mic sink: among the output devices whose display name or id
+    /// contains `pattern` (ignoring case), the first that also contains
+    /// `prefer`, otherwise the first.
+    Named {
+        /// Which devices qualify.
+        pattern: String,
+        /// Which of them to pick when several qualify.
+        prefer: Option<String>,
+    },
 }
 
 /// Builds cpal output streams on the device its [`OutputTarget`] picks.
@@ -61,10 +69,14 @@ impl CpalOutputFactory {
         }
     }
 
-    /// The mic sink: the first output device matching `pattern`.
-    pub fn mic_sink(pattern: impl Into<String>) -> CpalOutputFactory {
+    /// The mic sink: the output device matching `pattern`, preferring one
+    /// that also contains `prefer` (see [`best_match`]).
+    pub fn mic_sink(pattern: impl Into<String>, prefer: Option<String>) -> CpalOutputFactory {
         CpalOutputFactory {
-            target: OutputTarget::Named(pattern.into()),
+            target: OutputTarget::Named {
+                pattern: pattern.into(),
+                prefer,
+            },
         }
     }
 
@@ -80,11 +92,11 @@ impl CpalOutputFactory {
             OutputTarget::Default => opened(platform::monitor_host())?
                 .default_output_device()
                 .ok_or(BuildError::NoDevice),
-            OutputTarget::Named(pattern) => {
+            OutputTarget::Named { pattern, prefer } => {
                 let devices = opened(platform::mic_host())?
                     .output_devices()
                     .map_err(build_error)?;
-                first_match(devices, pattern, device_labels)
+                best_match(devices, pattern, prefer.as_deref(), device_labels)
                     .ok_or_else(|| BuildError::DeviceNotFound(pattern.clone()))
             }
         }
@@ -112,7 +124,7 @@ impl StreamFactory for CpalOutputFactory {
     fn role(&self) -> StreamRole {
         match self.target {
             OutputTarget::Default => StreamRole::Monitor,
-            OutputTarget::Named(_) => StreamRole::MicSink,
+            OutputTarget::Named { .. } => StreamRole::MicSink,
         }
     }
 
@@ -126,7 +138,7 @@ impl StreamFactory for CpalOutputFactory {
         let info = stream_info(&device, &supported);
         let sample_format = supported.sample_format();
         let mut config = supported.config();
-        if matches!(self.target, OutputTarget::Named(_)) {
+        if matches!(self.target, OutputTarget::Named { .. }) {
             config.buffer_size = mic_buffer_size(
                 supported.buffer_size(),
                 config.sample_rate,
@@ -224,16 +236,30 @@ pub(crate) fn name_matches(pattern: &str, name: &str, id: Option<&str>) -> bool 
         || id.is_some_and(|id| id.to_lowercase().contains(&pattern))
 }
 
-/// The first of `devices`, in enumeration order, that `pattern` names.
-pub(crate) fn first_match<D>(
+/// The device of `devices` that `pattern` names. Pure. Among the devices
+/// `pattern` names, the first, in enumeration order, that `prefer` names
+/// too (matched like the pattern, so a blank preference names nothing);
+/// otherwise the first one `pattern` names.
+pub(crate) fn best_match<D>(
     devices: impl IntoIterator<Item = D>,
     pattern: &str,
+    prefer: Option<&str>,
     labels: impl Fn(&D) -> (String, Option<String>),
 ) -> Option<D> {
-    devices.into_iter().find(|device| {
-        let (name, id) = labels(device);
-        name_matches(pattern, &name, id.as_deref())
-    })
+    let mut first = None;
+    for device in devices {
+        let (name, id) = labels(&device);
+        if !name_matches(pattern, &name, id.as_deref()) {
+            continue;
+        }
+        if prefer.is_some_and(|prefer| name_matches(prefer, &name, id.as_deref())) {
+            return Some(device);
+        }
+        if first.is_none() {
+            first = Some(device);
+        }
+    }
+    first
 }
 
 /// The buffer size a mic path stream (the mic sink or the capture) asks
@@ -369,13 +395,18 @@ fn buffer_duration(samples: usize, channels: u16, rate: u32) -> Duration {
 }
 
 /// Render `out` in chunks of the mixer's preallocated scratch size and
-/// convert each chunk. Anything that cannot be rendered (an unconfigured
-/// mixer, a trailing partial frame) is filled with silence.
+/// convert each chunk. The whole callback's frame count is announced first
+/// ([`Mixer::begin_callback`]), so the passthrough sizes its target to the
+/// device block rather than to a chunk. Anything that cannot be rendered (an
+/// unconfigured mixer, a trailing partial frame) is filled with silence.
 pub(crate) fn render_into<T>(mixer: &mut Mixer, out: &mut [T])
 where
     T: OutputSample,
 {
     let channels = usize::from(mixer.channels());
+    if let Some(frames) = out.len().checked_div(channels) {
+        mixer.begin_callback(frames);
+    }
     let mut rest = out;
     // `checked_div` is `None` for an unconfigured mixer (0 channels).
     while let Some(frames @ 1..) = rest.len().checked_div(channels) {
@@ -502,6 +533,36 @@ mod tests {
     }
 
     #[test]
+    fn render_into_announces_the_whole_callback_before_chunking() {
+        let passthrough = Arc::new(crate::passthrough::PassthroughShared::new());
+        passthrough.begin_capture(48_000);
+        let mut mixer = Mixer::with_passthrough(Arc::new(MixerShared::new()), passthrough.reader());
+        mixer.configure(48_000, 2);
+        let block = [0.5f32; 2_048];
+        let mut out = vec![0.0f32; 2 * 2_048];
+
+        // 2048-frame capture and sink blocks. The first callback publishes the
+        // target for the whole callback (one sink block plus one capture block
+        // plus 5 ms), not for a 1024-frame chunk (3312 samples).
+        passthrough.write(&block, 1);
+        render_into(&mut mixer, &mut out);
+        assert_eq!(passthrough.published_target(), 4_336);
+        assert!(out.iter().all(|&s| s == 0.0), "still priming");
+
+        // With a chunk-sized target, the high mark (3312 + 2400) would trim
+        // this, and every callback would run the ring empty.
+        passthrough.write(&block, 1);
+        passthrough.write(&block, 1);
+        for _ in 0..20 {
+            render_into(&mut mixer, &mut out);
+            assert!(out.iter().all(|&s| (s - 0.5).abs() < 1e-6), "primed");
+            passthrough.write(&block, 1);
+        }
+        assert_eq!(passthrough.underruns(), 0);
+        assert_eq!(passthrough.overruns(), 0);
+    }
+
+    #[test]
     fn trailing_partial_frame_is_silent() {
         let sound = tone(1_000, 48_000);
         let mut mixer = playing_mixer(&sound, 48_000, 2);
@@ -625,23 +686,75 @@ mod tests {
         assert!(!name_matches("   ", "BlackHole 2ch", Some("id")));
     }
 
+    const DEVICES: [(&str, &str); 3] = [
+        ("Speakers", "spk"),
+        ("BlackHole 16ch", "bh16"),
+        ("BlackHole 2ch", "bh2"),
+    ];
+
+    fn labels(device: &(&str, &str)) -> (String, Option<String>) {
+        (device.0.to_string(), Some(device.1.to_string()))
+    }
+
     #[test]
-    fn the_first_match_in_enumeration_order_wins() {
-        let devices = [
-            ("Speakers", "spk"),
-            ("BlackHole 16ch", "bh16"),
-            ("BlackHole 2ch", "bh2"),
-        ];
-        let labels = |d: &(&str, &str)| (d.0.to_string(), Some(d.1.to_string()));
+    fn without_a_preference_the_first_match_in_enumeration_order_wins() {
         assert_eq!(
-            first_match(devices, "blackhole", labels),
+            best_match(DEVICES, "blackhole", None, labels),
             Some(("BlackHole 16ch", "bh16"))
         );
         assert_eq!(
-            first_match(devices, "BH2", labels),
+            best_match(DEVICES, "BH2", None, labels),
             Some(("BlackHole 2ch", "bh2"))
         );
-        assert_eq!(first_match(devices, "cable", labels), None);
+        assert_eq!(best_match(DEVICES, "cable", None, labels), None);
+    }
+
+    #[test]
+    fn a_preference_picks_among_the_matches() {
+        assert_eq!(
+            best_match(DEVICES, "BlackHole", Some("2ch"), labels),
+            Some(("BlackHole 2ch", "bh2"))
+        );
+        // Matched against the id too, ignoring case.
+        assert_eq!(
+            best_match(DEVICES, "blackhole", Some("BH2"), labels),
+            Some(("BlackHole 2ch", "bh2"))
+        );
+        // The first preferred match wins when several are preferred.
+        let both = [("BlackHole 2ch A", "a"), ("BlackHole 2ch B", "b")];
+        assert_eq!(
+            best_match(both, "BlackHole", Some("2ch"), labels),
+            Some(("BlackHole 2ch A", "a"))
+        );
+    }
+
+    #[test]
+    fn a_preference_never_widens_the_pattern() {
+        // "Speakers" contains "spk" but not the pattern.
+        assert_eq!(
+            best_match(DEVICES, "BlackHole", Some("spk"), labels),
+            Some(("BlackHole 16ch", "bh16"))
+        );
+        assert_eq!(best_match(DEVICES, "cable", Some("2ch"), labels), None);
+    }
+
+    #[test]
+    fn an_unmatched_or_blank_preference_falls_back_to_the_first_match() {
+        for prefer in ["64ch", "", "  "] {
+            assert_eq!(
+                best_match(DEVICES, "BlackHole", Some(prefer), labels),
+                Some(("BlackHole 16ch", "bh16")),
+                "{prefer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_pattern_matches_nothing_even_with_a_preference() {
+        for pattern in ["", "   "] {
+            assert_eq!(best_match(DEVICES, pattern, None, labels), None);
+            assert_eq!(best_match(DEVICES, pattern, Some("2ch"), labels), None);
+        }
     }
 
     #[test]
@@ -649,9 +762,15 @@ mod tests {
         let monitor = CpalOutputFactory::monitor();
         assert_eq!(monitor.role(), StreamRole::Monitor);
         assert_eq!(monitor.target(), &OutputTarget::Default);
-        let mic = CpalOutputFactory::mic_sink("BlackHole");
+        let mic = CpalOutputFactory::mic_sink("BlackHole", Some("2ch".into()));
         assert_eq!(mic.role(), StreamRole::MicSink);
-        assert_eq!(mic.target(), &OutputTarget::Named("BlackHole".into()));
+        assert_eq!(
+            mic.target(),
+            &OutputTarget::Named {
+                pattern: "BlackHole".into(),
+                prefer: Some("2ch".into()),
+            }
+        );
     }
 
     /// Needs real devices: `cargo test -p babound-engine -- --ignored`.
@@ -679,7 +798,7 @@ mod tests {
 
         let pattern = std::env::var("BABOUND_MIC_DEVICE")
             .unwrap_or_else(|_| crate::platform::SMOKE_MIC_PATTERN.to_string());
-        let mut mic = CpalOutputFactory::mic_sink(pattern.clone());
+        let mut mic = CpalOutputFactory::mic_sink(pattern.clone(), None);
         let Ok(probe) = mic.probe() else {
             eprintln!("no output device matches {pattern:?}; mic streams skipped");
             return;

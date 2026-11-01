@@ -20,7 +20,10 @@
 //! a minute), and gives up on connecting for good after
 //! [`MAX_STALLED_CONNECTS`] connects that stalled, so the process never
 //! leaks more than that many threads, even against a server that always
-//! stalls.
+//! stalls. A failed probe holds further probes off the same way (a probe
+//! that times out blocks every mic caller behind the lock for its whole
+//! timeout), but never counts as a stalled connect: its socket is its own
+//! and leaves nothing behind. [`try_connect`] is that decision.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -127,6 +130,19 @@ impl Backoff {
         if took >= STALL_THRESHOLD {
             self.stalled = self.stalled.saturating_add(1);
         }
+        self.hold_off(now)
+    }
+
+    /// Records a probe that failed at `now`; returns the hold-off it starts
+    /// (the same doubling as [`Backoff::failed`]). A probe uses a socket of
+    /// its own and leaks nothing however long it took, so it never counts
+    /// as a stalled connect.
+    pub(crate) fn probe_failed(&mut self, now: Instant) -> Duration {
+        self.hold_off(now)
+    }
+
+    /// Starts the next hold-off from `now` and counts the failure.
+    fn hold_off(&mut self, now: Instant) -> Duration {
         let delay = BACKOFF_FIRST
             .saturating_mul(1 << self.failures.min(16))
             .min(BACKOFF_MAX);
@@ -140,6 +156,61 @@ impl Backoff {
     pub(crate) fn succeeded(&mut self) {
         self.failures = 0;
         self.until = None;
+    }
+}
+
+/// What [`try_connect`] did.
+#[derive(Debug)]
+pub(crate) enum ConnectOutcome<H, E> {
+    /// The backoff holds connects off: nothing was probed or connected.
+    HeldOff,
+    /// The probe failed; the backoff holds probes off for this long.
+    ProbeFailed { delay: Duration },
+    /// The probe passed and the connect succeeded.
+    Connected(H),
+    /// The probe passed but the connect failed; the backoff holds connects
+    /// off for `delay`, or for good if `exhausted`.
+    Failed {
+        error: E,
+        delay: Duration,
+        exhausted: bool,
+    },
+}
+
+/// One connect attempt under `backoff`: nothing while it holds connects
+/// off, then `probe`, then `connect` only if the probe passed. A failed
+/// probe arms the hold-off ([`Backoff::probe_failed`]); a failed connect
+/// arms it and counts a stall if it took [`STALL_THRESHOLD`] or longer
+/// ([`Backoff::failed`]); a successful connect resets it. `now` reads the
+/// clock.
+pub(crate) fn try_connect<H, E>(
+    backoff: &mut Backoff,
+    mut now: impl FnMut() -> Instant,
+    probe: impl FnOnce() -> bool,
+    connect: impl FnOnce() -> Result<H, E>,
+) -> ConnectOutcome<H, E> {
+    if !backoff.allows(now()) {
+        return ConnectOutcome::HeldOff;
+    }
+    if !probe() {
+        let delay = backoff.probe_failed(now());
+        return ConnectOutcome::ProbeFailed { delay };
+    }
+    let started = now();
+    match connect() {
+        Ok(host) => {
+            backoff.succeeded();
+            ConnectOutcome::Connected(host)
+        }
+        Err(error) => {
+            let ended = now();
+            let delay = backoff.failed(ended, ended.saturating_duration_since(started));
+            ConnectOutcome::Failed {
+                error,
+                delay,
+                exhausted: backoff.exhausted(),
+            }
+        }
     }
 }
 
@@ -259,6 +330,230 @@ mod tests {
         backoff.succeeded();
         assert!(backoff.allows(start));
         assert_eq!(backoff.failed(start, Duration::ZERO), BACKOFF_FIRST);
+    }
+
+    /// A fake clock that a probe or a connect can move forward.
+    struct Clock {
+        now: std::cell::Cell<Instant>,
+    }
+
+    impl Clock {
+        fn new(start: Instant) -> Clock {
+            Clock {
+                now: std::cell::Cell::new(start),
+            }
+        }
+
+        fn read(&self) -> Instant {
+            self.now.get()
+        }
+
+        fn advance(&self, by: Duration) {
+            self.now.set(self.now.get() + by);
+        }
+    }
+
+    /// What one [`try_connect`] call ran, and its outcome without the host.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Attempt {
+        probed: bool,
+        connected: bool,
+        outcome: &'static str,
+        delay: Option<u64>,
+    }
+
+    /// Runs [`try_connect`] at the clock's time with a probe that answers
+    /// `probe` and a connect that returns `connect` after taking `took`.
+    fn attempt(
+        backoff: &mut Backoff,
+        clock: &Clock,
+        probe: bool,
+        connect: Result<(), ()>,
+        took: Duration,
+    ) -> Attempt {
+        let probed = std::cell::Cell::new(false);
+        let connected = std::cell::Cell::new(false);
+        let outcome = try_connect(
+            backoff,
+            || clock.read(),
+            || {
+                probed.set(true);
+                probe
+            },
+            || {
+                connected.set(true);
+                clock.advance(took);
+                connect
+            },
+        );
+        let (outcome, delay) = match outcome {
+            ConnectOutcome::HeldOff => ("held off", None),
+            ConnectOutcome::ProbeFailed { delay } => ("probe failed", Some(delay.as_secs())),
+            ConnectOutcome::Connected(()) => ("connected", None),
+            ConnectOutcome::Failed {
+                exhausted: true, ..
+            } => ("exhausted", None),
+            ConnectOutcome::Failed { delay, .. } => ("failed", Some(delay.as_secs())),
+        };
+        Attempt {
+            probed: probed.get(),
+            connected: connected.get(),
+            outcome,
+            delay,
+        }
+    }
+
+    #[test]
+    fn a_failed_probe_holds_off_further_probes_and_connects() {
+        let clock = Clock::new(Instant::now());
+        let mut backoff = Backoff::new();
+        // The probe itself timed out: the hold-off starts after it.
+        let first = try_connect(
+            &mut backoff,
+            || clock.read(),
+            || {
+                clock.advance(Duration::from_secs(2));
+                false
+            },
+            || -> Result<(), ()> { panic!("must not connect after a failed probe") },
+        );
+        assert!(matches!(first, ConnectOutcome::ProbeFailed { delay } if delay == BACKOFF_FIRST));
+
+        clock.advance(Duration::from_millis(1999));
+        let held = attempt(&mut backoff, &clock, true, Ok(()), Duration::ZERO);
+        assert_eq!(
+            held,
+            Attempt {
+                probed: false,
+                connected: false,
+                outcome: "held off",
+                delay: None,
+            }
+        );
+
+        clock.advance(Duration::from_millis(1));
+        let next = attempt(&mut backoff, &clock, true, Ok(()), Duration::ZERO);
+        assert_eq!(
+            next,
+            Attempt {
+                probed: true,
+                connected: true,
+                outcome: "connected",
+                delay: None,
+            }
+        );
+    }
+
+    #[test]
+    fn the_hold_off_doubles_over_failed_probes_up_to_its_cap() {
+        let clock = Clock::new(Instant::now());
+        let mut backoff = Backoff::new();
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            let result = attempt(&mut backoff, &clock, false, Ok(()), Duration::ZERO);
+            assert!(result.probed && !result.connected);
+            assert_eq!(result.outcome, "probe failed");
+            let delay = result.delay.expect("a delay");
+            delays.push(delay);
+            clock.advance(Duration::from_secs(delay));
+        }
+        assert_eq!(delays, [2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+
+    #[test]
+    fn failed_probes_never_exhaust_the_backoff() {
+        let start = Instant::now();
+        let mut backoff = Backoff::new();
+        for _ in 0..10 {
+            backoff.probe_failed(start);
+        }
+        assert!(!backoff.exhausted());
+        assert!(backoff.allows(start + BACKOFF_MAX));
+
+        // However long each probe took (a timed-out probe takes 2 s).
+        let clock = Clock::new(start);
+        let mut backoff = Backoff::new();
+        for _ in 0..10 {
+            let outcome = try_connect(
+                &mut backoff,
+                || clock.read(),
+                || {
+                    clock.advance(Duration::from_secs(2));
+                    false
+                },
+                || -> Result<(), ()> { panic!("must not connect") },
+            );
+            assert!(matches!(outcome, ConnectOutcome::ProbeFailed { .. }));
+            clock.advance(BACKOFF_MAX);
+        }
+        assert!(!backoff.exhausted());
+    }
+
+    #[test]
+    fn a_successful_connect_resets_the_hold_off() {
+        let clock = Clock::new(Instant::now());
+        let mut backoff = Backoff::new();
+        for _ in 0..3 {
+            attempt(&mut backoff, &clock, false, Ok(()), Duration::ZERO);
+            clock.advance(BACKOFF_MAX);
+        }
+        let connected = attempt(&mut backoff, &clock, true, Ok(()), Duration::ZERO);
+        assert_eq!(connected.outcome, "connected");
+        assert_eq!(backoff, Backoff::new());
+        let again = attempt(&mut backoff, &clock, false, Ok(()), Duration::ZERO);
+        assert_eq!(again.delay, Some(BACKOFF_FIRST.as_secs()));
+    }
+
+    #[test]
+    fn a_failed_connect_after_a_passed_probe_backs_off_and_counts_stalls() {
+        let clock = Clock::new(Instant::now());
+        let mut backoff = Backoff::new();
+
+        // A fast failure: a hold-off, but no stall.
+        let fast = attempt(&mut backoff, &clock, true, Err(()), Duration::ZERO);
+        assert_eq!(
+            fast,
+            Attempt {
+                probed: true,
+                connected: true,
+                outcome: "failed",
+                delay: Some(2),
+            }
+        );
+        let held = attempt(&mut backoff, &clock, true, Ok(()), Duration::ZERO);
+        assert_eq!(held.outcome, "held off");
+        assert!(!held.probed);
+
+        // Stalled connects, each held off and counted, until none is allowed.
+        for stall in 1..=MAX_STALLED_CONNECTS {
+            clock.advance(BACKOFF_MAX);
+            let result = attempt(&mut backoff, &clock, true, Err(()), STALL_THRESHOLD);
+            assert!(result.connected);
+            if stall < MAX_STALLED_CONNECTS {
+                assert_eq!(result.outcome, "failed");
+            } else {
+                assert_eq!(result.outcome, "exhausted");
+            }
+        }
+        clock.advance(Duration::from_secs(3600));
+        let after = attempt(&mut backoff, &clock, true, Ok(()), Duration::ZERO);
+        assert_eq!(after.outcome, "held off");
+        assert!(!after.probed);
+    }
+
+    #[test]
+    fn a_connect_error_is_handed_back() {
+        let mut backoff = Backoff::new();
+        let start = Instant::now();
+        let outcome = try_connect(&mut backoff, || start, || true, || Err::<(), _>("refused"));
+        assert!(matches!(
+            outcome,
+            ConnectOutcome::Failed {
+                error: "refused",
+                exhausted: false,
+                ..
+            }
+        ));
     }
 
     #[test]

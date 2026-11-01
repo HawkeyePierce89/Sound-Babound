@@ -441,7 +441,7 @@ impl StreamFactory for FakeCaptureFactory {
 #[derive(Default)]
 struct BackendRequests {
     monitors: usize,
-    mic_sinks: Vec<String>,
+    mic_sinks: Vec<(String, Option<String>)>,
     captures: Vec<Vec<String>>,
     watchers: Vec<StreamRole>,
 }
@@ -479,7 +479,20 @@ impl FakeBackends {
 
     /// The pattern of every mic sink factory handed out, in order.
     pub(crate) fn mic_sink_requests(&self) -> Vec<String> {
-        lock(&self.requests).mic_sinks.clone()
+        lock(&self.requests)
+            .mic_sinks
+            .iter()
+            .map(|(pattern, _)| pattern.clone())
+            .collect()
+    }
+
+    /// The preference of every mic sink factory handed out, in order.
+    pub(crate) fn mic_sink_preferences(&self) -> Vec<Option<String>> {
+        lock(&self.requests)
+            .mic_sinks
+            .iter()
+            .map(|(_, prefer)| prefer.clone())
+            .collect()
     }
 
     /// The exclusions of every capture factory handed out, in order.
@@ -505,8 +518,10 @@ impl Backends for FakeBackends {
         Box::new(self.monitor.clone())
     }
 
-    fn mic_sink(&self, pattern: &str) -> OutputFactory {
-        lock(&self.requests).mic_sinks.push(pattern.to_owned());
+    fn mic_sink(&self, pattern: &str, prefer: Option<&str>) -> OutputFactory {
+        lock(&self.requests)
+            .mic_sinks
+            .push((pattern.to_owned(), prefer.map(str::to_owned)));
         Box::new(self.mic_sink.clone())
     }
 

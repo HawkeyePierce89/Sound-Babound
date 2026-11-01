@@ -2,6 +2,8 @@
 
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 
+use super::HotkeyKeys;
+
 /// Attaches to the console of the parent process, if it has one.
 ///
 /// The binary is built for the GUI subsystem so tray mode opens no console
@@ -18,6 +20,11 @@ pub fn attach_parent_console() {
 /// VB-CABLE.
 pub fn default_virtual_device() -> &'static str {
     "CABLE Input"
+}
+
+/// No preference: the default pattern names one device.
+pub fn default_virtual_device_preference() -> Option<&'static str> {
+    None
 }
 
 /// The inputs the capture must never open, since they carry what the mic
@@ -62,6 +69,12 @@ pub fn virtual_device_missing_hint() -> &'static str {
     "install VB-CABLE (or set [mic] virtual_device to the output of the virtual cable you use)"
 }
 
+/// Which key a hotkey names: global-hotkey registers a Windows hotkey by virtual key (`VK_A`), which
+/// follows the keyboard layout: it fires on the key that types A.
+pub fn hotkey_keys() -> HotkeyKeys {
+    HotkeyKeys::Layout
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +82,7 @@ mod tests {
     #[test]
     fn mic_defaults_target_vb_cable() {
         assert_eq!(default_virtual_device(), "CABLE Input");
+        assert_eq!(default_virtual_device_preference(), None);
         assert_eq!(
             virtual_input_exclusions("CABLE Input"),
             ["CABLE Input", "CABLE Output"]

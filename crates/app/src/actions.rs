@@ -7,10 +7,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use babound_engine::{CaptureStatus, Engine, MicSettings, MicStatus, Sound};
+use babound_engine::{BuildErrorKind, CaptureStatus, Engine, MicSettings, MicStatus, Sound};
 use global_hotkey::hotkey::HotKey;
 
 use crate::config::{self, DEFAULT_CONFIG, MicConfig, RawConfig, ResolvedConfig};
@@ -25,6 +24,8 @@ pub enum Action {
     StopAll,
     /// Turn the virtual mic on or off, and save that to the config.
     ToggleMic,
+    /// Open the settings window (one at a time).
+    OpenSettings,
     Reload,
     OpenConfigFolder,
     Quit,
@@ -34,6 +35,8 @@ pub enum Action {
 pub const MENU_STOP_ALL: &str = "stop-all";
 /// Menu id of the "Mic to call" item.
 pub const MENU_TOGGLE_MIC: &str = "toggle-mic";
+/// Menu id of the "Settings…" item.
+pub const MENU_SETTINGS: &str = "settings";
 /// Menu id of the "Reload config" item.
 pub const MENU_RELOAD: &str = "reload";
 /// Menu id of the "Open config folder" item.
@@ -93,6 +96,7 @@ impl ActionMap {
         for (id, action) in [
             (MENU_STOP_ALL, Action::StopAll),
             (MENU_TOGGLE_MIC, Action::ToggleMic),
+            (MENU_SETTINGS, Action::OpenSettings),
             (MENU_RELOAD, Action::Reload),
             (MENU_OPEN_CONFIG, Action::OpenConfigFolder),
             (MENU_QUIT, Action::Quit),
@@ -200,6 +204,7 @@ pub fn mic_settings(mic: &MicConfig, capture: bool) -> Option<MicSettings> {
 pub fn settings_for(mic: &MicConfig, capture: bool) -> MicSettings {
     MicSettings {
         device_match: mic.virtual_device.clone(),
+        device_prefer: mic.device_prefer.clone(),
         excluded_inputs: platform::virtual_input_exclusions(&mic.virtual_device),
         sound_gain: mic.sound_gain,
         mic_gain: mic.mic_gain,
@@ -327,7 +332,8 @@ pub fn mic_toggle_label(enabled: bool) -> &'static str {
 /// The text of the tray's mic status line. `not_found` is the platform's
 /// note for a virtual device that no output matches (see
 /// `platform::virtual_mic_not_found`). The capture state is appended only
-/// when the microphone cannot be heard.
+/// when the microphone cannot be heard, with a short reason when the capture
+/// is unavailable ([`capture_unavailable_reason`]).
 pub fn mic_status_label(status: &MicStatus, not_found: &str) -> String {
     match status {
         MicStatus::Off => "Virtual mic: off".to_string(),
@@ -341,335 +347,22 @@ pub fn mic_status_label(status: &MicStatus, not_found: &str) -> String {
             CaptureStatus::Disabled => {
                 format!("Virtual mic: {device} (active, microphone access denied)")
             }
-            CaptureStatus::Unavailable(_) => {
-                format!("Virtual mic: {device} (active, microphone unavailable)")
-            }
+            CaptureStatus::Unavailable { kind, .. } => format!(
+                "Virtual mic: {device} (active, microphone unavailable: {})",
+                capture_unavailable_reason(*kind)
+            ),
         },
     }
 }
 
-/// An [`AudioControl`] that keeps the virtual device the app creates itself
-/// (on Linux) in step with the mic path.
-///
-/// Turning the mic path on creates the device first, if it does not exist
-/// yet; turning it off (or a mic path that fails to start) drops the device
-/// after the engine has stopped using it. If the engine's stop timed out
-/// (a mic supervisor is still blocked in a device query and may still hold
-/// its stream), the device and its lock are kept as retired until
-/// [`AudioControl::mic_stopped`] says the stream has ended
-/// ([`WithVirtualMic::release_retired`]); unloading it under a live stream
-/// would let the server move the stream, the live microphone included, to
-/// the speakers. A mic turned on again meanwhile reuses it.
-///
-/// The mic path runs only while this process owns the device: a device
-/// that cannot be created is logged and
-/// the mic path stays stopped, waiting for it
-/// ([`WithVirtualMic::waiting_for_device`], shown as not found), and
-/// [`WithVirtualMic::restore_device`] tries again and starts it once the
-/// device exists. The device's names are fixed, so a mic path started
-/// without it could find another instance's device (creating it fails on
-/// that instance's lock) and play the live microphone into it, or, once that
-/// instance unloads it, onto the speakers the server moves the stream to.
-/// `create` returns `Ok(None)` on the OSes where the user installs the
-/// device; the mic path then always starts.
-pub struct WithVirtualMic<C, G, F> {
-    control: C,
-    device: Option<G>,
-    /// The device after the mic path stopped while a mic stream may still
-    /// run (see [`WithVirtualMic::release_retired`]). Never set together
-    /// with `device`.
-    retired: Option<G>,
-    create: F,
-    /// The settings of the enabled mic; `None` while the mic is off.
-    settings: Option<MicSettings>,
-    /// Whether the engine's mic path runs. False while `settings` is set
-    /// means the mic path waits for the device.
-    running: bool,
-    /// The last attempt to create the device failed (so repeats log at
-    /// debug).
-    create_failed: bool,
-    /// When [`WithVirtualMic::restore_device`] may next check the device.
-    next_check: Option<Instant>,
-}
-
-/// How often [`WithVirtualMic::restore_device`] asks whether the virtual
-/// device still exists. Each check runs `pactl` on the caller's thread.
-pub const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
-
-/// A virtual device the app created itself, which can vanish behind its
-/// back: a sound server restart drops the modules behind the Linux one.
-pub trait VirtualDevice {
-    /// Whether the device still exists; true when that cannot be told.
-    fn is_present(&mut self) -> bool;
-}
-
-impl VirtualDevice for platform::VirtualMic {
-    fn is_present(&mut self) -> bool {
-        platform::VirtualMic::is_present(self)
-    }
-}
-
-impl<C, G, F> WithVirtualMic<C, G, F>
-where
-    F: FnMut() -> Result<Option<G>>,
-{
-    pub fn new(control: C, create: F) -> Self {
-        WithVirtualMic {
-            control,
-            device: None,
-            retired: None,
-            create,
-            settings: None,
-            running: false,
-            create_failed: false,
-            next_check: None,
-        }
-    }
-
-    /// The wrapped control.
-    pub fn control(&self) -> &C {
-        &self.control
-    }
-
-    /// The virtual device pattern while the mic is on but its path waits for
-    /// the device to be created; `None` otherwise.
-    pub fn waiting_for_device(&self) -> Option<&str> {
-        match &self.settings {
-            Some(settings) if !self.running => Some(&settings.device_match),
-            _ => None,
-        }
-    }
-
-    /// Whether the virtual device currently exists.
-    #[cfg(test)]
-    fn has_device(&self) -> bool {
-        self.device.is_some()
-    }
-
-    /// Whether a retired device waits for a mic stream to end.
-    pub fn has_retired_device(&self) -> bool {
-        self.retired.is_some()
-    }
-
-    /// Hands the control to `stop` (the engine shuts down, returning whether
-    /// every stream ended), then drops the virtual device, so no stream is
-    /// left writing to it. If a stream may still run, the device is left
-    /// loaded instead (the next start unloads it as stale): the process
-    /// ends right after, and that ends the stream without moving it.
-    pub fn shutdown(self, stop: impl FnOnce(C) -> bool) {
-        let WithVirtualMic {
-            control,
-            device,
-            retired,
-            ..
-        } = self;
-        if stop(control) {
-            drop(device);
-            drop(retired);
-        } else if device.is_some() || retired.is_some() {
-            tracing::warn!(
-                "a mic stream did not stop in time; the virtual mic stays loaded until the next start"
-            );
-            std::mem::forget(device);
-            std::mem::forget(retired);
-        }
-    }
-}
-
-impl<C, G, F> WithVirtualMic<C, G, F>
-where
-    C: AudioControl,
-    F: FnMut() -> Result<Option<G>>,
-{
-    /// Creates the device, or takes back the retired one, which this
-    /// process still owns; true if that worked (also when `create` makes
-    /// none). A failure is logged (at error for the first of a streak, at
-    /// debug for repeats). While a retired device waits for a mic stream
-    /// that did not stop in time, this fails without creating anything, so
-    /// a new mic path never runs beside the old one; the path waits, and
-    /// [`WithVirtualMic::release_retired`] starts it once the old stream
-    /// has ended.
-    fn create_device(&mut self) -> bool {
-        if self.retired.is_some() {
-            if !self.control.mic_stopped() {
-                tracing::debug!("the stopped mic stream has not ended; the mic path waits for it");
-                return false;
-            }
-            self.device = self.retired.take();
-            return true;
-        }
-        match (self.create)() {
-            Ok(device) => {
-                if self.create_failed {
-                    tracing::info!("the virtual mic is created");
-                }
-                self.device = device;
-                self.create_failed = false;
-                true
-            }
-            Err(err) => {
-                if self.create_failed {
-                    tracing::debug!("{err:#}; the virtual mic is still unavailable");
-                } else {
-                    tracing::error!(
-                        "{err:#}; the virtual mic is unavailable, the mic path waits for it"
-                    );
-                }
-                self.create_failed = true;
-                false
-            }
-        }
-    }
-
-    /// Starts (or updates) the mic path with the stored settings. If that
-    /// fails, the mic is treated as off and the device is dropped (or
-    /// retired).
-    fn start_path(&mut self) -> Result<()> {
-        let result = self.control.set_mic(self.settings.clone());
-        self.running = result.is_ok();
-        if result.is_err() {
-            self.settings = None;
-            self.drop_device();
-            self.create_failed = false;
-        }
-        result
-    }
-
-    /// Drops the device once the mic path is stopped, or retires it if a
-    /// mic stream may still run (see [`WithVirtualMic::release_retired`]).
-    fn drop_device(&mut self) {
-        let Some(device) = self.device.take() else {
-            return;
-        };
-        if self.control.mic_stopped() {
-            drop(device);
-        } else {
-            tracing::warn!(
-                "a mic stream did not stop in time; keeping the virtual mic until it does"
-            );
-            self.retired = Some(device);
-        }
-    }
-
-    /// Once every mic stream has ended, starts the mic path on the retired
-    /// device if the mic path waits for it (the mic was turned on again
-    /// meanwhile), and otherwise drops it. The tray calls it every mic poll
-    /// while there is one.
-    pub fn release_retired(&mut self) {
-        if self.retired.is_none() || !self.control.mic_stopped() {
-            return;
-        }
-        if self.settings.is_some() && !self.running && self.device.is_none() {
-            tracing::info!("the stopped mic stream has ended; starting the mic path");
-            self.device = self.retired.take();
-            if let Err(err) = self.start_path() {
-                tracing::error!("{err:#}; the mic path did not start");
-            }
-        } else {
-            tracing::info!("the stopped mic stream has ended; dropping the virtual mic");
-            self.retired = None;
-        }
-    }
-
-    /// Stops the mic path if it runs; the settings stay, so it waits for the
-    /// device.
-    fn stop_path(&mut self) -> Result<()> {
-        if !self.running {
-            return Ok(());
-        }
-        self.running = false;
-        self.control.set_mic(None)
-    }
-}
-
-impl<C, G, F> WithVirtualMic<C, G, F>
-where
-    C: AudioControl,
-    G: VirtualDevice,
-    F: FnMut() -> Result<Option<G>>,
-{
-    /// Creates the virtual device again if it is gone (for example, the
-    /// sound server restarted and dropped its modules) or if the mic path
-    /// waits for it because creating it failed (for example, the sound
-    /// server was not up yet), and then starts the mic path. A vanished
-    /// device stops the mic path before it is dropped, so the path never
-    /// runs without it. Does nothing with the mic off or no device to look
-    /// after (the user installs the device), and acts at most every
-    /// [`DEVICE_CHECK_INTERVAL`]. The tray calls it while the mic status is
-    /// not found.
-    pub fn restore_device(&mut self, now: Instant) {
-        if self.settings.is_none() || (self.device.is_none() && self.running) {
-            return;
-        }
-        if self.next_check.is_some_and(|next| now < next) {
-            return;
-        }
-        self.next_check = Some(now + DEVICE_CHECK_INTERVAL);
-        if let Some(device) = &mut self.device {
-            if device.is_present() {
-                return;
-            }
-            tracing::warn!(
-                "the virtual mic is gone (did the sound server restart?); creating it again"
-            );
-            if let Err(err) = self.stop_path() {
-                tracing::error!("{err:#}; could not stop the mic path");
-            }
-            // Its modules are gone already, so dropping it unloads nothing.
-            self.device = None;
-        }
-        if self.create_device()
-            && let Err(err) = self.start_path()
-        {
-            tracing::error!("{err:#}; the mic path did not start");
-        }
-    }
-}
-
-impl<C, G, F> AudioControl for WithVirtualMic<C, G, F>
-where
-    C: AudioControl,
-    F: FnMut() -> Result<Option<G>>,
-{
-    fn play(&self, sound: &Sound, gain: f32) -> bool {
-        self.control.play(sound, gain)
-    }
-
-    fn set_master_gain(&self, gain: f32) -> bool {
-        self.control.set_master_gain(gain)
-    }
-
-    fn mic_stopped(&mut self) -> bool {
-        self.control.mic_stopped()
-    }
-
-    /// Like a failed start, a failed deferred start turns the mic off and
-    /// drops (or retires) the device.
-    fn resume_mic(&mut self) -> Result<()> {
-        let result = self.control.resume_mic();
-        if result.is_err() {
-            self.running = false;
-            self.settings = None;
-            self.drop_device();
-            self.create_failed = false;
-        }
-        result
-    }
-
-    fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<()> {
-        let Some(settings) = settings else {
-            let result = self.control.set_mic(None);
-            self.running = false;
-            self.settings = None;
-            self.drop_device();
-            self.create_failed = false;
-            return result;
-        };
-        self.settings = Some(settings);
-        if self.device.is_none() && !self.create_device() {
-            return self.stop_path();
-        }
-        self.start_path()
+/// A short reason, for the tray's status line, why the capture failed to
+/// build with this kind of error. The full error is in the log.
+fn capture_unavailable_reason(kind: BuildErrorKind) -> &'static str {
+    match kind {
+        BuildErrorKind::FeedbackExcluded => "default input is the virtual mic device",
+        BuildErrorKind::NoDevice => "no input device",
+        BuildErrorKind::DeviceNotFound => "input device not found",
+        BuildErrorKind::UnsupportedFormat | BuildErrorKind::Backend => "error, see log",
     }
 }
 
@@ -815,9 +508,8 @@ pub fn reload(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::path::PathBuf;
-    use std::rc::Rc;
 
     use global_hotkey::hotkey::{Code, Modifiers};
 
@@ -900,6 +592,7 @@ mod tests {
         MicConfig {
             enabled: true,
             virtual_device: device.into(),
+            device_prefer: None,
             sound_gain: 0.5,
             mic_gain: 2.0,
         }
@@ -939,6 +632,7 @@ mod tests {
     fn fixed_menu_items_map_to_actions() {
         let map = ActionMap::new(&sample_config());
         assert_eq!(map.for_menu_id(MENU_STOP_ALL), Some(Action::StopAll));
+        assert_eq!(map.for_menu_id(MENU_SETTINGS), Some(Action::OpenSettings));
         assert_eq!(map.for_menu_id(MENU_RELOAD), Some(Action::Reload));
         assert_eq!(
             map.for_menu_id(MENU_OPEN_CONFIG),
@@ -1187,6 +881,7 @@ mod tests {
                 mic_settings(&mic_on("My Cable"), capture),
                 Some(MicSettings {
                     device_match: "My Cable".into(),
+                    device_prefer: None,
                     excluded_inputs: platform::virtual_input_exclusions("My Cable"),
                     sound_gain: 0.5,
                     mic_gain: 2.0,
@@ -1194,6 +889,18 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn mic_settings_carry_the_device_preference() {
+        let preferring = MicConfig {
+            device_prefer: Some("2ch".into()),
+            ..mic_on("BlackHole")
+        };
+        let settings = settings_for(&preferring, true);
+        assert_eq!(settings.device_match, "BlackHole");
+        assert_eq!(settings.device_prefer.as_deref(), Some("2ch"));
+        assert_eq!(settings_for(&mic_on("BlackHole"), true).device_prefer, None);
     }
 
     #[test]
@@ -1385,6 +1092,12 @@ mod tests {
             device: "BlackHole 2ch".into(),
             capture,
         };
+        let unavailable = |kind| {
+            active(CaptureStatus::Unavailable {
+                kind,
+                error: "the full error".into(),
+            })
+        };
         let cases = [
             (MicStatus::Off, "Virtual mic: off"),
             (MicStatus::Starting, "Virtual mic: starting"),
@@ -1409,8 +1122,26 @@ mod tests {
                 "Virtual mic: BlackHole 2ch (active, microphone access denied)",
             ),
             (
-                active(CaptureStatus::Unavailable("no input".into())),
-                "Virtual mic: BlackHole 2ch (active, microphone unavailable)",
+                unavailable(BuildErrorKind::FeedbackExcluded),
+                "Virtual mic: BlackHole 2ch (active, microphone unavailable: \
+                 default input is the virtual mic device)",
+            ),
+            (
+                unavailable(BuildErrorKind::NoDevice),
+                "Virtual mic: BlackHole 2ch (active, microphone unavailable: no input device)",
+            ),
+            (
+                unavailable(BuildErrorKind::DeviceNotFound),
+                "Virtual mic: BlackHole 2ch (active, microphone unavailable: \
+                 input device not found)",
+            ),
+            (
+                unavailable(BuildErrorKind::UnsupportedFormat),
+                "Virtual mic: BlackHole 2ch (active, microphone unavailable: error, see log)",
+            ),
+            (
+                unavailable(BuildErrorKind::Backend),
+                "Virtual mic: BlackHole 2ch (active, microphone unavailable: error, see log)",
             ),
         ];
         for (status, label) in cases {
@@ -1531,576 +1262,5 @@ mod tests {
         assert_eq!(fake.mics[1], mic_settings(after.map().mic(), true));
         // The master gain is re-sent unchanged.
         assert_eq!(*fake.gains.borrow(), [1.0, 1.0]);
-    }
-
-    type Log = std::rc::Rc<RefCell<Vec<&'static str>>>;
-
-    /// Logs `set_mic` calls into a shared log, so their order against the
-    /// virtual device's creation and drop can be checked.
-    struct LoggingAudio {
-        log: Log,
-        fail_mic: bool,
-    }
-
-    impl AudioControl for LoggingAudio {
-        fn play(&self, _sound: &Sound, _gain: f32) -> bool {
-            self.log.borrow_mut().push("play");
-            true
-        }
-
-        fn set_master_gain(&self, _gain: f32) -> bool {
-            self.log.borrow_mut().push("gain");
-            true
-        }
-
-        fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<()> {
-            self.log.borrow_mut().push(if settings.is_some() {
-                "mic on"
-            } else {
-                "mic off"
-            });
-            if self.fail_mic {
-                anyhow::bail!("no thread for you");
-            }
-            Ok(())
-        }
-    }
-
-    /// Logs its drop.
-    struct FakeDevice(Log);
-
-    impl Drop for FakeDevice {
-        fn drop(&mut self) {
-            self.0.borrow_mut().push("device dropped");
-        }
-    }
-
-    fn with_device(
-        log: &Log,
-        fail_mic: bool,
-    ) -> WithVirtualMic<LoggingAudio, FakeDevice, impl FnMut() -> Result<Option<FakeDevice>>> {
-        let device_log = log.clone();
-        WithVirtualMic::new(
-            LoggingAudio {
-                log: log.clone(),
-                fail_mic,
-            },
-            move || {
-                device_log.borrow_mut().push("device created");
-                Ok(Some(FakeDevice(device_log.clone())))
-            },
-        )
-    }
-
-    fn on() -> Option<MicSettings> {
-        mic_settings(&mic_on("Cable"), true)
-    }
-
-    /// A control whose deferred mic start fails.
-    struct FailingResumeAudio(Log);
-
-    impl AudioControl for FailingResumeAudio {
-        fn play(&self, _sound: &Sound, _gain: f32) -> bool {
-            true
-        }
-
-        fn set_master_gain(&self, _gain: f32) -> bool {
-            true
-        }
-
-        fn set_mic(&mut self, _settings: Option<MicSettings>) -> Result<()> {
-            self.0.borrow_mut().push("mic deferred");
-            Ok(())
-        }
-
-        fn resume_mic(&mut self) -> Result<()> {
-            self.0.borrow_mut().push("mic resumed");
-            anyhow::bail!("no thread for you");
-        }
-    }
-
-    #[test]
-    fn a_failed_deferred_start_turns_the_mic_off_and_drops_the_device() {
-        let log = Log::default();
-        let device_log = log.clone();
-        let mut audio = WithVirtualMic::new(FailingResumeAudio(log.clone()), move || {
-            device_log.borrow_mut().push("device created");
-            Ok(Some(FakeDevice(device_log.clone())))
-        });
-        audio.set_mic(on()).unwrap();
-        assert!(audio.resume_mic().is_err());
-        assert!(!audio.has_device());
-        assert_eq!(audio.waiting_for_device(), None);
-        assert_eq!(
-            *log.borrow(),
-            [
-                "device created",
-                "mic deferred",
-                "mic resumed",
-                "device dropped"
-            ]
-        );
-    }
-
-    #[test]
-    fn the_virtual_device_is_created_before_the_mic_starts_and_dropped_after_it_stops() {
-        let log = Log::default();
-        let mut audio = with_device(&log, false);
-        audio.set_mic(on()).unwrap();
-        // A gains-only change keeps the existing device.
-        audio.set_mic(on()).unwrap();
-        assert!(audio.has_device());
-        audio.set_mic(None).unwrap();
-        assert!(!audio.has_device());
-        // Off again: nothing to create or drop.
-        audio.set_mic(None).unwrap();
-        assert_eq!(
-            *log.borrow(),
-            [
-                "device created",
-                "mic on",
-                "mic on",
-                "mic off",
-                "device dropped",
-                "mic off"
-            ]
-        );
-    }
-
-    #[test]
-    fn a_mic_path_that_fails_to_start_drops_the_device() {
-        let log = Log::default();
-        let mut audio = with_device(&log, true);
-        assert!(audio.set_mic(on()).is_err());
-        assert!(!audio.has_device());
-        assert_eq!(
-            *log.borrow(),
-            ["device created", "mic on", "device dropped"]
-        );
-    }
-
-    #[test]
-    fn a_device_that_cannot_be_created_keeps_the_mic_path_stopped() {
-        let log = Log::default();
-        let attempts = std::rc::Rc::new(RefCell::new(0));
-        let counter = attempts.clone();
-        let mut audio = WithVirtualMic::new(
-            LoggingAudio {
-                log: log.clone(),
-                fail_mic: false,
-            },
-            move || -> Result<Option<FakeDevice>> {
-                *counter.borrow_mut() += 1;
-                anyhow::bail!("another Sound-Babound instance owns the virtual mic")
-            },
-        );
-        // Another instance's device may exist under the same name: the mic
-        // path must not start and find it.
-        audio.set_mic(on()).unwrap();
-        audio.set_mic(on()).unwrap();
-        assert!(!audio.has_device());
-        assert_eq!(audio.waiting_for_device(), Some("Cable"));
-        assert_eq!(*attempts.borrow(), 2);
-        assert!(log.borrow().is_empty());
-        audio.set_mic(None).unwrap();
-        assert_eq!(audio.waiting_for_device(), None);
-        assert_eq!(*log.borrow(), ["mic off"]);
-    }
-
-    /// A device whose presence the test controls; logs its checks and drop.
-    struct VanishingDevice {
-        log: Log,
-        present: Rc<Cell<bool>>,
-    }
-
-    impl VirtualDevice for VanishingDevice {
-        fn is_present(&mut self) -> bool {
-            self.log.borrow_mut().push("device checked");
-            self.present.get()
-        }
-    }
-
-    impl Drop for VanishingDevice {
-        fn drop(&mut self) {
-            self.log.borrow_mut().push("device dropped");
-        }
-    }
-
-    #[test]
-    fn a_vanished_device_is_created_again_at_most_every_check_interval() {
-        let log = Log::default();
-        let present = Rc::new(Cell::new(true));
-        let (device_log, device_present) = (log.clone(), present.clone());
-        let mut audio = WithVirtualMic::new(
-            LoggingAudio {
-                log: log.clone(),
-                fail_mic: false,
-            },
-            move || -> Result<Option<VanishingDevice>> {
-                device_log.borrow_mut().push("device created");
-                device_present.set(true);
-                Ok(Some(VanishingDevice {
-                    log: device_log.clone(),
-                    present: device_present.clone(),
-                }))
-            },
-        );
-        let start = Instant::now();
-        // With no device there is nothing to check.
-        audio.restore_device(start);
-        audio.set_mic(on()).unwrap();
-        audio.restore_device(start);
-        present.set(false);
-        // Too early for another check.
-        audio.restore_device(start + DEVICE_CHECK_INTERVAL / 2);
-        audio.restore_device(start + DEVICE_CHECK_INTERVAL);
-        assert!(audio.has_device());
-        assert_eq!(audio.waiting_for_device(), None);
-        // The mic path stops before the vanished device is dropped and
-        // starts again once the new one exists.
-        assert_eq!(
-            *log.borrow(),
-            [
-                "device created",
-                "mic on",
-                "device checked",
-                "device checked",
-                "mic off",
-                "device dropped",
-                "device created",
-                "mic on"
-            ]
-        );
-    }
-
-    /// A create function for [`VanishingDevice`] whose calls fail where
-    /// `fails` says so (by call index); logs every attempt.
-    fn flaky_create(
-        log: &Log,
-        present: &Rc<Cell<bool>>,
-        fails: &'static [usize],
-    ) -> impl FnMut() -> Result<Option<VanishingDevice>> + use<> {
-        let (log, present) = (log.clone(), present.clone());
-        let mut calls = 0;
-        move || {
-            let call = calls;
-            calls += 1;
-            if fails.contains(&call) {
-                log.borrow_mut().push("create failed");
-                anyhow::bail!("pactl did not finish within 3s");
-            }
-            log.borrow_mut().push("device created");
-            present.set(true);
-            Ok(Some(VanishingDevice {
-                log: log.clone(),
-                present: present.clone(),
-            }))
-        }
-    }
-
-    #[test]
-    fn a_device_that_cannot_be_created_again_is_retried_at_the_next_check() {
-        let log = Log::default();
-        let present = Rc::new(Cell::new(true));
-        let mut audio = WithVirtualMic::new(
-            LoggingAudio {
-                log: log.clone(),
-                fail_mic: false,
-            },
-            flaky_create(&log, &present, &[1]),
-        );
-        let start = Instant::now();
-        audio.set_mic(on()).unwrap();
-        present.set(false);
-        audio.restore_device(start);
-        assert!(!audio.has_device());
-        assert_eq!(audio.waiting_for_device(), Some("Cable"));
-        // Too early for another attempt.
-        audio.restore_device(start + DEVICE_CHECK_INTERVAL / 2);
-        assert!(!audio.has_device());
-        audio.restore_device(start + DEVICE_CHECK_INTERVAL);
-        assert!(audio.has_device());
-        assert_eq!(audio.waiting_for_device(), None);
-        assert_eq!(
-            *log.borrow(),
-            [
-                "device created",
-                "mic on",
-                "device checked",
-                "mic off",
-                "device dropped",
-                "create failed",
-                "device created",
-                "mic on"
-            ]
-        );
-    }
-
-    #[test]
-    fn a_device_that_failed_to_create_at_mic_on_is_retried_until_the_mic_goes_off() {
-        let log = Log::default();
-        let present = Rc::new(Cell::new(true));
-        let mut audio = WithVirtualMic::new(
-            LoggingAudio {
-                log: log.clone(),
-                fail_mic: false,
-            },
-            flaky_create(&log, &present, &[0, 1, 3]),
-        );
-        let start = Instant::now();
-        // The sound server is not up yet: the mic path waits for the device.
-        audio.set_mic(on()).unwrap();
-        assert!(!audio.has_device());
-        assert_eq!(audio.waiting_for_device(), Some("Cable"));
-        audio.restore_device(start);
-        audio.restore_device(start + DEVICE_CHECK_INTERVAL / 2);
-        assert!(!audio.has_device());
-        audio.restore_device(start + DEVICE_CHECK_INTERVAL);
-        assert!(audio.has_device());
-        audio.set_mic(None).unwrap();
-        // A failure while the mic is on is forgotten once it goes off.
-        audio.set_mic(on()).unwrap();
-        audio.set_mic(None).unwrap();
-        audio.restore_device(start + DEVICE_CHECK_INTERVAL * 3);
-        assert!(!audio.has_device());
-        assert_eq!(
-            *log.borrow(),
-            [
-                "create failed",
-                "create failed",
-                "device created",
-                "mic on",
-                "mic off",
-                "device dropped",
-                "create failed",
-                "mic off"
-            ]
-        );
-    }
-
-    #[test]
-    fn no_device_is_made_where_the_user_installs_it() {
-        let log = Log::default();
-        let mut audio = WithVirtualMic::new(
-            LoggingAudio {
-                log: log.clone(),
-                fail_mic: false,
-            },
-            || -> Result<Option<FakeDevice>> { Ok(None) },
-        );
-        audio.set_mic(on()).unwrap();
-        assert!(!audio.has_device());
-        assert_eq!(*log.borrow(), ["mic on"]);
-    }
-
-    #[test]
-    fn startup_with_the_mic_enabled_creates_the_device_before_applying() {
-        let log = Log::default();
-        let mut audio = with_device(&log, false);
-        let config = ResolvedConfig {
-            mic: mic_on("Cable"),
-            ..sample_config()
-        };
-        apply_config(&mut audio, &ActionMap::new(&config), true);
-        assert_eq!(*log.borrow(), ["gain", "device created", "mic on"]);
-    }
-
-    #[test]
-    fn toggling_through_the_wrapper_creates_and_drops_the_device() {
-        let dir = TempDir::new("actions-toggle-device");
-        let path = write_config(&dir, MIC_CONFIG);
-        let mut board = load_board(&path).unwrap();
-        let log = Log::default();
-        let mut audio = with_device(&log, false);
-        toggle_mic(&mut audio, &mut board, Some(&path), |_| true);
-        assert!(audio.has_device());
-        toggle_mic(&mut audio, &mut board, Some(&path), |_| true);
-        assert!(!audio.has_device());
-        assert_eq!(
-            *log.borrow(),
-            ["device created", "mic on", "mic off", "device dropped"]
-        );
-    }
-
-    #[test]
-    fn shutdown_stops_the_engine_before_dropping_the_device() {
-        let log = Log::default();
-        let mut audio = with_device(&log, false);
-        audio.set_mic(on()).unwrap();
-        let stop_log = log.clone();
-        audio.shutdown(move |control| {
-            stop_log.borrow_mut().push("engine shut down");
-            drop(control);
-            true
-        });
-        assert_eq!(
-            *log.borrow(),
-            [
-                "device created",
-                "mic on",
-                "engine shut down",
-                "device dropped"
-            ]
-        );
-    }
-    /// A control whose mic stop can leave a stream running, as the engine's
-    /// does when a supervisor is blocked in a device query.
-    struct SlowStopAudio {
-        inner: LoggingAudio,
-        stopped: Rc<Cell<bool>>,
-    }
-
-    impl AudioControl for SlowStopAudio {
-        fn play(&self, sound: &Sound, gain: f32) -> bool {
-            self.inner.play(sound, gain)
-        }
-
-        fn set_master_gain(&self, gain: f32) -> bool {
-            self.inner.set_master_gain(gain)
-        }
-
-        fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<()> {
-            self.inner.set_mic(settings)
-        }
-
-        fn mic_stopped(&mut self) -> bool {
-            self.stopped.get()
-        }
-    }
-
-    fn with_slow_stop(
-        log: &Log,
-        stopped: &Rc<Cell<bool>>,
-    ) -> WithVirtualMic<SlowStopAudio, FakeDevice, impl FnMut() -> Result<Option<FakeDevice>>> {
-        let device_log = log.clone();
-        WithVirtualMic::new(
-            SlowStopAudio {
-                inner: LoggingAudio {
-                    log: log.clone(),
-                    fail_mic: false,
-                },
-                stopped: stopped.clone(),
-            },
-            move || {
-                device_log.borrow_mut().push("device created");
-                Ok(Some(FakeDevice(device_log.clone())))
-            },
-        )
-    }
-
-    #[test]
-    fn a_timed_out_mic_stop_keeps_the_device_until_the_stream_ends() {
-        let log = Log::default();
-        let stopped = Rc::new(Cell::new(true));
-        let mut audio = with_slow_stop(&log, &stopped);
-        audio.set_mic(on()).unwrap();
-        stopped.set(false);
-        audio.set_mic(None).unwrap();
-        assert!(!audio.has_device());
-        assert!(audio.has_retired_device());
-        assert_eq!(*log.borrow(), ["device created", "mic on", "mic off"]);
-
-        // Still running: kept.
-        audio.release_retired();
-        assert!(audio.has_retired_device());
-        assert_eq!(log.borrow().len(), 3);
-
-        stopped.set(true);
-        audio.release_retired();
-        assert!(!audio.has_retired_device());
-        assert_eq!(log.borrow().last(), Some(&"device dropped"));
-    }
-
-    #[test]
-    fn a_mic_turned_on_again_waits_for_the_old_stream_then_reuses_the_retired_device() {
-        let log = Log::default();
-        let stopped = Rc::new(Cell::new(false));
-        let mut audio = with_slow_stop(&log, &stopped);
-        audio.set_mic(on()).unwrap();
-        audio.set_mic(None).unwrap();
-        assert!(audio.has_retired_device());
-
-        // The old stream still runs: no second mic path beside it.
-        audio.set_mic(on()).unwrap();
-        assert!(audio.waiting_for_device().is_some());
-        assert!(audio.has_retired_device());
-        assert!(!audio.has_device());
-        audio.release_retired();
-        assert!(audio.waiting_for_device().is_some());
-        assert_eq!(*log.borrow(), ["device created", "mic on", "mic off"]);
-
-        // It ended: the mic path starts on the same device.
-        stopped.set(true);
-        audio.release_retired();
-        assert!(audio.waiting_for_device().is_none());
-        assert!(audio.has_device());
-        assert!(!audio.has_retired_device());
-        assert_eq!(
-            *log.borrow(),
-            ["device created", "mic on", "mic off", "mic on"]
-        );
-    }
-
-    #[test]
-    fn a_mic_turned_on_after_the_old_stream_ended_reuses_the_retired_device_at_once() {
-        let log = Log::default();
-        let stopped = Rc::new(Cell::new(false));
-        let mut audio = with_slow_stop(&log, &stopped);
-        audio.set_mic(on()).unwrap();
-        audio.set_mic(None).unwrap();
-        stopped.set(true);
-        audio.set_mic(on()).unwrap();
-        assert!(audio.has_device());
-        assert!(!audio.has_retired_device());
-        assert_eq!(
-            *log.borrow(),
-            ["device created", "mic on", "mic off", "mic on"]
-        );
-    }
-
-    #[test]
-    fn a_failed_start_after_a_timed_out_stop_retires_the_device() {
-        let log = Log::default();
-        let stopped = Rc::new(Cell::new(true));
-        let mut audio = with_slow_stop(&log, &stopped);
-        audio.set_mic(on()).unwrap();
-        // A restart whose old path did not stop in time, then failed.
-        stopped.set(false);
-        audio.control.inner.fail_mic = true;
-        let mut changed = on();
-        if let Some(settings) = &mut changed {
-            settings.capture = false;
-        }
-        assert!(audio.set_mic(changed).is_err());
-        assert!(audio.has_retired_device());
-        assert!(!log.borrow().contains(&"device dropped"));
-    }
-
-    #[test]
-    fn shutdown_leaves_the_device_loaded_when_a_stream_is_left_running() {
-        let log = Log::default();
-        let stopped = Rc::new(Cell::new(true));
-        let mut audio = with_slow_stop(&log, &stopped);
-        audio.set_mic(on()).unwrap();
-        audio.shutdown(|_control| false);
-        assert_eq!(*log.borrow(), ["device created", "mic on"]);
-
-        // A retired device is left loaded too.
-        let log = Log::default();
-        let stopped = Rc::new(Cell::new(false));
-        let mut audio = with_slow_stop(&log, &stopped);
-        audio.set_mic(on()).unwrap();
-        audio.set_mic(None).unwrap();
-        audio.shutdown(|_control| false);
-        assert!(!log.borrow().contains(&"device dropped"));
-
-        // Once everything stopped, the retired device is dropped.
-        let log = Log::default();
-        let stopped = Rc::new(Cell::new(false));
-        let mut audio = with_slow_stop(&log, &stopped);
-        audio.set_mic(on()).unwrap();
-        audio.set_mic(None).unwrap();
-        audio.shutdown(|_control| true);
-        assert_eq!(log.borrow().last(), Some(&"device dropped"));
     }
 }

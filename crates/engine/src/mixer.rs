@@ -324,7 +324,8 @@ impl Mixer {
     ///
     /// Voices and their source positions are kept, so playback continues
     /// where it was after a stream rebuild. The passthrough reader, if any,
-    /// gets the new rate (a change re-primes it).
+    /// gets the new rate (a change re-primes it) and forgets the sink block it
+    /// recorded, since the new stream may have another buffer size.
     pub fn configure(&mut self, sample_rate: u32, channels: u16) {
         self.sample_rate = sample_rate;
         self.channels = usize::from(channels);
@@ -373,6 +374,16 @@ impl Mixer {
             .flatten()
             .filter(|v| !v.finished)
             .map(|v| v.position)
+    }
+
+    /// Announce a device callback of `frames` frames before it is rendered in
+    /// scratch-sized chunks, so the passthrough reader sizes its target to the
+    /// whole device block (it cannot tell a long callback from back-to-back
+    /// chunks otherwise). A no-op without a reader. Realtime-safe.
+    pub fn begin_callback(&mut self, frames: usize) {
+        if let Some(reader) = self.passthrough.as_mut() {
+            reader.note_block(frames);
+        }
     }
 
     /// Render up to `max_frames` frames into the preallocated scratch buffer
@@ -770,7 +781,9 @@ mod tests {
         let mut m = Mixer::with_passthrough(Arc::new(MixerShared::new()), passthrough.reader());
         m.configure(48_000, 2);
         passthrough.begin_capture(48_000);
-        passthrough.write(&[0.25f32; 4800], 1);
+        for block in [0.25f32; 4800].chunks(480) {
+            passthrough.write(block, 1);
+        }
         let s = constant(0.5, 4800, 48_000, 1);
         play(&m, &s, 1.0);
         assert!(render(&mut m, 64).iter().any(|&x| x != 0.0));
@@ -1287,7 +1300,11 @@ mod tests {
     fn mic_mixer(channels: u16, samples: usize, value: f32) -> (Mixer, Arc<PassthroughShared>) {
         let passthrough = Arc::new(PassthroughShared::new());
         passthrough.begin_capture(48_000);
-        passthrough.write(&vec![value; samples], 1);
+        // In 10 ms blocks, as a capture writes (one huge block would raise
+        // the target).
+        for block in vec![value; samples].chunks(480) {
+            passthrough.write(block, 1);
+        }
         let mut m = Mixer::with_passthrough(Arc::new(MixerShared::new()), passthrough.reader());
         m.configure(48_000, channels);
         (m, passthrough)
@@ -1413,7 +1430,9 @@ mod tests {
         // Unconfigured, the reader has no sink rate and the mix is silent.
         let passthrough = Arc::new(PassthroughShared::new());
         passthrough.begin_capture(48_000);
-        passthrough.write(&vec![0.5f32; PRIMED], 1);
+        for block in vec![0.5f32; PRIMED].chunks(480) {
+            passthrough.write(block, 1);
+        }
         let mut m = Mixer::with_passthrough(Arc::new(MixerShared::new()), passthrough.reader());
         let mut out = vec![1.0f32; 16];
         m.render(&mut out);
@@ -1458,7 +1477,9 @@ mod tests {
             let passthrough = Arc::new(PassthroughShared::new());
             passthrough.begin_capture(48_000);
             let input: Vec<f32> = (0..3_800).map(|i| 0.5 * (i as f32 * 0.03).sin()).collect();
-            passthrough.write(&input, 1);
+            for block in input.chunks(480) {
+                passthrough.write(block, 1);
+            }
             let mut m = Mixer::with_passthrough(Arc::new(MixerShared::new()), passthrough.reader());
             m.configure(48_000, 2);
             (m, passthrough)
@@ -1499,6 +1520,51 @@ mod tests {
             input
         );
         assert_eq!(b.input_scratch.len(), SCRATCH_FRAMES);
+    }
+
+    #[test]
+    fn begin_callback_reaches_the_reader_and_allocates_nothing() {
+        /// One 2048-frame callback, rendered in scratch-sized chunks.
+        /// Returns whether the passthrough was heard.
+        fn callback(m: &mut Mixer) -> bool {
+            m.begin_callback(2_048);
+            let mut rendered = 0;
+            let mut audible = false;
+            while rendered < 2_048 {
+                let mix = m.render_scratch(2_048 - rendered);
+                audible |= mix.iter().any(|&x| (x - 0.5).abs() < 1e-6);
+                rendered += mix.len() / 2;
+            }
+            audible
+        }
+        let (mut m, passthrough) = mic_mixer(2, 0, 0.0);
+        let scratch = (m.scratch.as_ptr(), m.scratch.capacity());
+        let input = (m.input_scratch.as_ptr(), m.input_scratch.capacity());
+
+        passthrough.write(&[0.5f32; 2_048], 1);
+        assert!(!callback(&mut m), "priming");
+        assert_eq!(reader(&m).sink_block(), 2_048);
+        passthrough.write(&[0.5f32; 2_048], 1);
+        passthrough.write(&[0.5f32; 2_048], 1);
+        assert!(callback(&mut m));
+        assert!(reader(&m).is_primed());
+        assert_eq!(passthrough.published_target(), 4_336);
+        assert_eq!(passthrough.underruns(), 0);
+        // The buffers were neither reallocated nor grown.
+        assert_eq!((m.scratch.as_ptr(), m.scratch.capacity()), scratch);
+        assert_eq!(
+            (m.input_scratch.as_ptr(), m.input_scratch.capacity()),
+            input
+        );
+
+        // A configure forgets the recorded sink block.
+        m.configure(48_000, 2);
+        assert_eq!(reader(&m).sink_block(), 0);
+
+        // Without a reader, it is a no-op.
+        let mut monitor = mixer(48_000, 2);
+        monitor.begin_callback(2_048);
+        assert!(render(&mut monitor, 16).iter().all(|&x| x == 0.0));
     }
 
     #[test]

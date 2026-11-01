@@ -44,8 +44,9 @@ pub(crate) trait Backends: fmt::Debug + Send + Sync + 'static {
     /// The monitor: the default output device.
     fn monitor(&self) -> OutputFactory;
 
-    /// The mic sink: the first output device matching `pattern`.
-    fn mic_sink(&self, pattern: &str) -> OutputFactory;
+    /// The mic sink: the output device matching `pattern`, preferring one
+    /// that `prefer` names too.
+    fn mic_sink(&self, pattern: &str, prefer: Option<&str>) -> OutputFactory;
 
     /// The capture: the default input, never one `exclusions` names.
     fn capture(&self, exclusions: &[String]) -> CaptureFactory;
@@ -63,8 +64,11 @@ impl Backends for CpalBackends {
         Box::new(CpalOutputFactory::monitor())
     }
 
-    fn mic_sink(&self, pattern: &str) -> OutputFactory {
-        Box::new(CpalOutputFactory::mic_sink(pattern))
+    fn mic_sink(&self, pattern: &str, prefer: Option<&str>) -> OutputFactory {
+        Box::new(CpalOutputFactory::mic_sink(
+            pattern,
+            prefer.map(str::to_owned),
+        ))
     }
 
     fn capture(&self, exclusions: &[String]) -> CaptureFactory {
@@ -79,9 +83,13 @@ impl Backends for CpalBackends {
 /// How the mic path runs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MicSettings {
-    /// The mic sink device: the first output whose display name or id
-    /// contains this, ignoring case. A blank pattern matches nothing.
+    /// The mic sink device: an output whose display name or id contains
+    /// this, ignoring case. A blank pattern matches nothing.
     pub device_match: String,
+    /// Which of the outputs `device_match` names to use: the first, in
+    /// enumeration order, whose name or id also contains this (ignoring
+    /// case); the first match when none does or this is `None`.
+    pub device_prefer: Option<String>,
     /// Inputs the capture must never open (the virtual device's own input
     /// side or monitor), matched like `device_match`. `device_match` itself
     /// is always excluded too.
@@ -101,6 +109,7 @@ impl MicSettings {
     /// running mic path can be kept.
     fn same_streams(&self, other: &MicSettings) -> bool {
         self.device_match == other.device_match
+            && self.device_prefer == other.device_prefer
             && self.excluded_inputs == other.excluded_inputs
             && self.capture == other.capture
     }
@@ -158,8 +167,13 @@ pub enum CaptureStatus {
     /// Capture is off in the settings (for example, no microphone
     /// permission); the mic sink carries only the sounds.
     Disabled,
-    /// The capture cannot run now, for this reason; it keeps retrying.
-    Unavailable(String),
+    /// The capture cannot run now; it keeps retrying.
+    Unavailable {
+        /// What kind of build failure stops it.
+        kind: BuildErrorKind,
+        /// The build error's text.
+        error: String,
+    },
 }
 
 /// The mic status for these supervisor statuses. Pure. `capture` is `None`
@@ -182,7 +196,9 @@ fn mic_status_of(
                 None => CaptureStatus::Disabled,
                 Some(StreamStatus::Starting) => CaptureStatus::Starting,
                 Some(StreamStatus::Running(info)) => CaptureStatus::Running(info.device_name),
-                Some(StreamStatus::Failed { error, .. }) => CaptureStatus::Unavailable(error),
+                Some(StreamStatus::Failed { error, kind }) => {
+                    CaptureStatus::Unavailable { kind, error }
+                }
             },
         },
     }
@@ -215,7 +231,11 @@ pub fn probe_mic(settings: &MicSettings) -> MicProbe {
         None => (None, None),
     };
     MicProbe {
-        sink: CpalOutputFactory::mic_sink(settings.device_match.clone()).probe(),
+        sink: CpalOutputFactory::mic_sink(
+            settings.device_match.clone(),
+            settings.device_prefer.clone(),
+        )
+        .probe(),
         capture,
         excluded_default,
     }
@@ -500,7 +520,8 @@ impl Engine {
             (MixerEndpoint::new(Arc::clone(&shared)), None)
         };
         let sink = spawn_supervisor(
-            self.backends.mic_sink(&settings.device_match),
+            self.backends
+                .mic_sink(&settings.device_match, settings.device_prefer.as_deref()),
             endpoint,
             self.backends.watcher(StreamRole::MicSink),
             self.timings,
@@ -990,6 +1011,7 @@ mod tests {
     fn mic_settings() -> MicSettings {
         MicSettings {
             device_match: "cable".into(),
+            device_prefer: None,
             excluded_inputs: vec!["cable monitor".into()],
             sound_gain: 1.0,
             mic_gain: 1.0,
@@ -1172,7 +1194,9 @@ mod tests {
         let passthrough = backends.capture.passthrough().unwrap();
 
         // The microphone reaches the mic sink, and so does a sound.
-        passthrough.write(&[0.25f32; 4800], 1);
+        for block in [0.25f32; 4800].chunks(480) {
+            passthrough.write(block, 1);
+        }
         assert!(!is_silent(&render(&mixer)));
         assert!(engine.play(&tone(), 1.0));
         assert!(!is_silent(&render(&mixer)));
@@ -1417,6 +1441,26 @@ mod tests {
     }
 
     #[test]
+    fn a_preference_change_restarts_the_mic_path_with_it() {
+        let (mut engine, backends) = mic_rig();
+        mic_on(&mut engine, &backends, mic_settings());
+
+        let preferring = MicSettings {
+            device_prefer: Some("2ch".into()),
+            ..mic_settings()
+        };
+        engine.set_mic(Some(preferring)).unwrap();
+        assert!(wait_until(TIMEOUT, || backends.mic_sink.builds().len() == 2));
+        assert_eq!(backends.mic_sink_requests(), ["cable", "cable"]);
+        assert_eq!(
+            backends.mic_sink_preferences(),
+            [None, Some("2ch".to_string())]
+        );
+        assert_eq!(backends.mic_sink.live_sinks(), 1);
+        engine.shutdown();
+    }
+
+    #[test]
     fn device_change_restarts_only_the_mic_path() {
         let (mut engine, backends) = mic_rig();
         mic_on(&mut engine, &backends, mic_settings());
@@ -1526,7 +1570,10 @@ mod tests {
         assert!(wait_until(TIMEOUT, || matches!(
             engine.mic_status(),
             MicStatus::Active {
-                capture: CaptureStatus::Unavailable(_),
+                capture: CaptureStatus::Unavailable {
+                    kind: BuildErrorKind::NoDevice,
+                    ..
+                },
                 ..
             }
         )));
@@ -1562,8 +1609,10 @@ mod tests {
         let passthrough = backends.capture.passthrough().unwrap();
         assert_eq!(passthrough.capture_rate(), 48_000);
 
-        // 100 ms of capture, past the 30 ms priming target.
-        passthrough.write(&[0.25f32; 4_800], 1);
+        // 100 ms of capture in 10 ms blocks, past the 30 ms priming target.
+        for block in [0.25f32; 4_800].chunks(480) {
+            passthrough.write(block, 1);
+        }
         let mic_block = render(&mic);
         assert!(mic_block.iter().any(|s| (s - 0.25).abs() < 1e-3));
         assert!(is_silent(&render(&monitor)));
@@ -1696,10 +1745,23 @@ mod tests {
                 running(),
                 Some(failed(BuildError::FeedbackExcluded("cable".into())))
             ),
-            active(CaptureStatus::Unavailable(
-                BuildError::FeedbackExcluded("cable".into()).to_string()
-            ))
+            active(CaptureStatus::Unavailable {
+                kind: BuildErrorKind::FeedbackExcluded,
+                error: BuildError::FeedbackExcluded("cable".into()).to_string(),
+            })
         );
+        for err in [
+            BuildError::NoDevice,
+            BuildError::DeviceNotFound("mic".into()),
+            BuildError::UnsupportedFormat("i8".into()),
+            BuildError::Backend("boom".into()),
+        ] {
+            let (kind, error) = (err.kind(), err.to_string());
+            assert_eq!(
+                mic_status_of(&settings, running(), Some(failed(err))),
+                active(CaptureStatus::Unavailable { kind, error })
+            );
+        }
     }
 
     #[test]
@@ -1731,6 +1793,10 @@ mod tests {
         for changed in [
             MicSettings {
                 device_match: "other".into(),
+                ..mic_settings()
+            },
+            MicSettings {
+                device_prefer: Some("2ch".into()),
                 ..mic_settings()
             },
             MicSettings {

@@ -6,11 +6,15 @@ mod config;
 mod hotkeys;
 mod icon;
 mod logging;
+mod mic_report;
 mod paths;
 mod platform;
+mod settings;
+mod settings_process;
 #[cfg(test)]
 mod test_support;
 mod tray_app;
+mod virtual_mic;
 
 use std::process::ExitCode;
 
@@ -32,5 +36,6 @@ fn main() -> anyhow::Result<ExitCode> {
         None => tray_app::run().map(|()| ExitCode::SUCCESS),
         Some(Command::Play { file }) => cli::run_play(file).map(|()| ExitCode::SUCCESS),
         Some(Command::MicCheck) => cli::run_mic_check(),
+        Some(Command::Settings) => Ok(settings::run()),
     }
 }

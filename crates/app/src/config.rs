@@ -1,12 +1,14 @@
 //! TOML configuration: raw serde model, default template, path resolution,
 //! the validated [`ResolvedConfig`] produced by [`crate::hotkeys::resolve`],
-//! and the comment-preserving [`set_mic_enabled`] writer.
+//! and the comment-preserving [`update_config`] editor with its
+//! [`set_mic_enabled`] writer.
 
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use babound_engine::{LoadError, Sound};
@@ -32,6 +34,8 @@ pub const DEMO_LABEL: &str = "builtin:demo";
 pub const DEFAULT_CONFIG: &str = r#"# Sound-Babound configuration.
 #
 # Edit this file, then choose "Reload config" in the tray menu.
+# "Settings…" in the tray menu adds, removes and renames sounds and sets
+# their hotkeys; it keeps the comments and every other key in this file.
 #
 # Hotkey syntax: modifiers and one key joined with "+", for example
 #   "CmdOrCtrl+Shift+1", "Ctrl+Alt+F5", "Cmd+Shift+A", "Alt+Space".
@@ -57,9 +61,11 @@ stop_all_hotkey = "CmdOrCtrl+Shift+0"
 #   enabled        - true or false (default false)
 #   virtual_device - the cable's playback device: the first output whose
 #                    name or id contains this text, ignoring case. The default is
-#                    "BlackHole" on macOS, "CABLE Input" (VB-CABLE) on
-#                    Windows and "sound_babound_sink" on Linux, where the app
-#                    creates the device itself.
+#                    "BlackHole" on macOS (preferring "BlackHole 2ch" when
+#                    several BlackHole devices are installed), "CABLE Input"
+#                    (VB-CABLE) on Windows and "sound_babound_sink" on Linux,
+#                    where the app creates the device itself. A pattern set
+#                    here has no preference: the first matching output is used.
 #   sound_gain     - volume of the sounds in the call, 0.0 to 4.0 (default 1.0)
 #   mic_gain       - volume of your microphone in the call, 0.0 to 4.0
 #                    (default 1.0)
@@ -239,6 +245,11 @@ pub struct MicConfig {
     pub enabled: bool,
     /// The mic sink's device pattern, trimmed and never blank.
     pub virtual_device: String,
+    /// Which of the devices `virtual_device` names to prefer: the
+    /// platform's preference when `virtual_device` is the platform default
+    /// (missing or blank in the file), `None` for a pattern the user set,
+    /// which keeps first-match semantics.
+    pub device_prefer: Option<String>,
     /// Clamped to [`crate::hotkeys::MIN_GAIN`, `crate::hotkeys::MAX_GAIN`].
     pub sound_gain: f32,
     /// Clamped to [`crate::hotkeys::MIN_GAIN`, `crate::hotkeys::MAX_GAIN`].
@@ -251,32 +262,100 @@ impl Default for MicConfig {
         MicConfig {
             enabled: false,
             virtual_device: platform::default_virtual_device().to_string(),
+            device_prefer: platform::default_virtual_device_preference().map(str::to_owned),
             sound_gain: default_gain(),
             mic_gain: default_gain(),
         }
     }
 }
 
-/// Sets `[mic] enabled` in the config file at `path`, creating the table if
-/// it is missing. Every other key, comment and blank line is kept. The file
-/// is replaced atomically (a temp file in the same folder, then a rename), so
-/// a crash leaves either the old or the new file. A file that is not valid
-/// TOML is left untouched and reported as an error.
-pub fn set_mic_enabled(path: &Path, enabled: bool) -> Result<()> {
+/// Edits the config file at `path` in place: reads it, parses it into a
+/// [`DocumentMut`], runs `edit` on the document and replaces the file with
+/// the result atomically (a temp file in the same folder, then a rename), so
+/// a crash leaves either the old or the new file. A symlink is written
+/// through to the file it points at. Every key, comment and blank line that
+/// `edit` leaves alone is kept. A file that is not valid TOML, or an `edit`
+/// that fails, leaves the file untouched and is reported as an error naming
+/// the path.
+///
+/// The whole read, edit and write runs under an exclusive lock on a lock
+/// file next to the config (see [`lock_config`]), so two editors (the tray
+/// toggling `[mic] enabled` and the settings window saving its sounds) never
+/// both edit the same version and lose one change: the second one reads the
+/// file the first one wrote.
+pub fn update_config(path: &Path, edit: impl FnOnce(&mut DocumentMut) -> Result<()>) -> Result<()> {
     // Write through a symlink to the file it points at.
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let _lock =
+        lock_config(&path).with_context(|| format!("failed to lock config {}", path.display()))?;
     let text = fs::read_to_string(&path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
-    let updated = with_mic_enabled(&text, enabled)
-        .with_context(|| format!("failed to update config {}", path.display()))?;
-    write_atomically(&path, &updated)
-}
-
-/// `text` with `[mic] enabled` set to `enabled`.
-fn with_mic_enabled(text: &str, enabled: bool) -> Result<String> {
     let mut doc: DocumentMut = text
         .parse()
-        .map_err(|err| anyhow!("invalid config: {err}"))?;
+        .map_err(|err| anyhow!("invalid config: {err}"))
+        .with_context(|| format!("failed to update config {}", path.display()))?;
+    edit(&mut doc).with_context(|| format!("failed to update config {}", path.display()))?;
+    write_atomically(&path, &doc.to_string())
+}
+
+/// How long [`update_config`] waits for another editor's lock. An edit holds
+/// it only for a read and a write of a small local file, so this is reached
+/// only if that editor hangs; the edit then fails rather than block the
+/// tray's event loop.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often a lock held by another editor is tried again.
+const LOCK_RETRY: Duration = Duration::from_millis(10);
+
+/// Takes the exclusive edit lock of the config file at `path` (already
+/// canonical): an OS file lock on the hidden `.<name>.lock` in the same
+/// directory, created if missing and never removed (removing it would let
+/// two editors lock different files). A separate file, because the config
+/// itself is replaced by a rename on every save. Released when the returned
+/// file is dropped, also when the process dies.
+fn lock_config(path: &Path) -> std::io::Result<File> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(ErrorKind::InvalidInput, "no file name"))?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_file_name(lock_name(name)))?;
+    let deadline = Instant::now() + LOCK_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(LOCK_RETRY);
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "another editor holds the config lock",
+                ));
+            }
+            Err(TryLockError::Error(err)) => return Err(err),
+        }
+    }
+}
+
+/// The lock file name for config file `name`: hidden, in the same directory.
+fn lock_name(name: &OsStr) -> OsString {
+    let mut lock = OsString::from(".");
+    lock.push(name);
+    lock.push(".lock");
+    lock
+}
+
+/// Sets `[mic] enabled` in the config file at `path`, creating the table if
+/// it is missing, through [`update_config`].
+pub fn set_mic_enabled(path: &Path, enabled: bool) -> Result<()> {
+    update_config(path, |doc| set_enabled(doc, enabled))
+}
+
+/// Sets `[mic] enabled` to `enabled` in `doc`.
+fn set_enabled(doc: &mut DocumentMut, enabled: bool) -> Result<()> {
     let mic = doc.entry("mic").or_insert_with(toml_edit::table);
     if let Some(table) = mic.as_table_mut() {
         // A table only implied by `[mic.x]` headers would not print its keys.
@@ -286,24 +365,27 @@ fn with_mic_enabled(text: &str, enabled: bool) -> Result<String> {
         bail!("`mic` is not a table");
     };
     match mic.get_mut("enabled").and_then(Item::as_value_mut) {
-        Some(value) => {
-            // Keep the spacing and any trailing comment on the line.
-            let decor = value.decor().clone();
-            *value = Value::from(enabled);
-            *value.decor_mut() = decor;
-        }
+        Some(value) => replace_value(value, Value::from(enabled)),
         None => {
             mic.insert("enabled", toml_edit::value(enabled));
         }
     }
-    Ok(doc.to_string())
+    Ok(())
+}
+
+/// Replaces `value` with `new`, keeping its spacing and any trailing comment
+/// on the line.
+pub fn replace_value(value: &mut Value, new: Value) {
+    let decor = value.decor().clone();
+    *value = new;
+    *value.decor_mut() = decor;
 }
 
 /// Replaces `path` with `text` through a temp file and a rename.
 ///
 /// The temp file has a name no other writer uses (see [`create_temp`]), so
-/// two processes saving at once each rename a complete file of their own:
-/// the last rename wins and the config is never a mix of both.
+/// even writers that do not share [`update_config`]'s lock each rename a
+/// complete file of their own and the config is never a mix of two.
 fn write_atomically(path: &Path, text: &str) -> Result<()> {
     let name = path
         .file_name()
@@ -448,8 +530,8 @@ mod tests {
 
         set_mic_enabled(&path, false).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT_CONFIG);
-        // No temp file is left behind.
-        assert_eq!(files_in(&dir), ["config.toml"]);
+        // No temp file is left behind, only the edit lock.
+        assert_eq!(files_in(&dir), [".config.toml.lock", "config.toml"]);
     }
 
     #[test]
@@ -513,7 +595,7 @@ mod tests {
             let msg = format!("{err:#}");
             assert!(msg.contains("config.toml"), "{msg}");
             assert_eq!(fs::read_to_string(&path).unwrap(), text);
-            assert_eq!(files_in(&dir), ["config.toml"]);
+            assert_eq!(files_in(&dir), [".config.toml.lock", "config.toml"]);
         }
     }
 
@@ -566,7 +648,55 @@ mod tests {
                 || text == DEFAULT_CONFIG.replace("enabled = false", "enabled = true"),
             "{text}"
         );
-        assert_eq!(files_in(&dir), ["config.toml"]);
+        assert_eq!(files_in(&dir), [".config.toml.lock", "config.toml"]);
+    }
+
+    #[test]
+    fn concurrent_edits_never_lose_an_update() {
+        let dir = TempDir::new("config-concurrent-edits");
+        let path = write_config(&dir, "count = 0\n");
+        let editors: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        update_config(&path, |doc| {
+                            let count = doc["count"].as_integer().unwrap_or(0);
+                            // Widen the window between the read and the write.
+                            std::thread::sleep(Duration::from_millis(2));
+                            doc["count"] = toml_edit::value(count + 1);
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for editor in editors {
+            editor.join().unwrap();
+        }
+        let doc: DocumentMut = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(doc["count"].as_integer(), Some(80));
+    }
+
+    #[test]
+    fn an_edit_waits_for_the_lock_and_fails_after_the_timeout() {
+        let dir = TempDir::new("config-lock-held");
+        let path = write_config(&dir, DEFAULT_CONFIG);
+        let held = lock_config(&path).unwrap();
+        let started = Instant::now();
+        let err = set_mic_enabled(&path, true).unwrap_err();
+        assert!(started.elapsed() >= LOCK_TIMEOUT);
+        assert!(format!("{err:#}").contains("lock"), "{err:#}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT_CONFIG);
+        drop(held);
+        set_mic_enabled(&path, true).unwrap();
+        assert!(
+            parse(&fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .mic
+                .enabled
+        );
     }
 
     #[test]
@@ -595,7 +725,10 @@ mod tests {
                 .enabled
         );
         assert_eq!(fs::read_to_string(&other).unwrap(), "in flight");
-        assert_eq!(files_in(&dir), [".config.toml.tmp", "config.toml"]);
+        assert_eq!(
+            files_in(&dir),
+            [".config.toml.lock", ".config.toml.tmp", "config.toml"]
+        );
     }
 
     #[cfg(unix)]

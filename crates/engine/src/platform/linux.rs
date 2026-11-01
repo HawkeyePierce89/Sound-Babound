@@ -6,7 +6,8 @@
 //! The mic paths need PulseAudio, because only it lists the app's null sink
 //! and remapped source by name. PipeWire answers it through pipewire-pulse.
 
-use std::io::BufReader;
+use std::io::{self, BufReader};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -15,16 +16,18 @@ use std::time::{Duration, Instant};
 use cpal::HostId;
 use cpal::traits::HostTrait;
 use pulseaudio::protocol;
-use tracing::{error, warn};
+use socket2::{Domain, SockAddr, Socket, Type};
+use tracing::{debug, error, warn};
 
-use super::shared_host::{Backoff, MAX_STALLED_CONNECTS, SharedHost};
+use super::shared_host::{Backoff, ConnectOutcome, MAX_STALLED_CONNECTS, SharedHost, try_connect};
 
 /// The PulseAudio host every mic path shares. A dropped PulseAudio host
 /// leaks its reactor thread and connection, so there is only this one.
 static MIC_HOST: SharedHost<cpal::Host> = SharedHost::new();
 
-/// Holds PulseAudio connects off after one that failed although the server
-/// answered the probe (see [`connect_pulse`]).
+/// Holds PulseAudio probes and connects off after a failed probe, or a
+/// connect that failed although the server answered the probe (see
+/// [`connect_pulse`]).
 static CONNECT_BACKOFF: Mutex<Backoff> = Mutex::new(Backoff::new());
 
 /// The monitor's host: ALSA, or the shared PulseAudio host if ALSA cannot
@@ -57,7 +60,7 @@ fn shared_pulse_host() -> Option<Arc<cpal::Host>> {
 
 /// Connects a PulseAudio host, but only after [`pulse_server_answers`] saw
 /// the server answer both messages of the handshake, and not while
-/// [`CONNECT_BACKOFF`] holds connects off.
+/// [`CONNECT_BACKOFF`] holds probes and connects off.
 ///
 /// cpal's PulseAudio host gives up on a handshake after 2 s but leaves its
 /// connecting thread blocked on the socket, so connecting to a server that
@@ -65,40 +68,47 @@ fn shared_pulse_host() -> Option<Arc<cpal::Host>> {
 /// failed builds retry every second. The probe uses a socket of its own
 /// with a timeout and leaves nothing behind. It runs inside
 /// [`SharedHost::get`]'s connect, under its lock, so probes and connects
-/// never overlap. A server can still answer the probe and stall the connect
-/// right after it; each such failure holds connects off for longer (up to a
-/// minute), and after [`MAX_STALLED_CONNECTS`] stalled connects no
-/// PulseAudio connect is tried again in this process (the mic paths fall
-/// back to ALSA), so at most that many threads ever leak.
+/// never overlap. A failed probe holds further probes off (doubling up to a
+/// minute), since a timed-out one blocks every mic caller behind that lock
+/// for its whole timeout and the pollers ask every second. A server can
+/// still answer the probe and stall the connect right after it; each such
+/// failure holds connects off for longer too, and after
+/// [`MAX_STALLED_CONNECTS`] stalled connects no PulseAudio connect is tried
+/// again in this process (the mic paths fall back to ALSA), so at most that
+/// many threads ever leak.
 fn connect_pulse() -> Option<cpal::Host> {
     let mut backoff = CONNECT_BACKOFF
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    if !backoff.allows(Instant::now()) || !pulse_server_answers() {
-        return None;
-    }
-    let started = Instant::now();
-    match cpal::host_from_id(HostId::PulseAudio) {
-        Ok(host) => {
-            backoff.succeeded();
-            Some(host)
+    match try_connect(&mut backoff, Instant::now, pulse_server_answers, || {
+        cpal::host_from_id(HostId::PulseAudio)
+    }) {
+        ConnectOutcome::Connected(host) => Some(host),
+        ConnectOutcome::HeldOff => None,
+        // At debug: the 1 Hz pollers would flood the log while no server runs.
+        ConnectOutcome::ProbeFailed { delay } => {
+            debug!("no PulseAudio server answered the probe; not probing again for {delay:?}");
+            None
         }
-        Err(err) => {
-            let delay = backoff.failed(Instant::now(), started.elapsed());
-            if backoff.exhausted() {
-                error!(
-                    error = %err,
-                    "the PulseAudio server answered the probe but the connect stalled \
-                     {MAX_STALLED_CONNECTS} times; not connecting to it again until the app \
-                     restarts"
-                );
-            } else {
-                warn!(
-                    error = %err,
-                    "the PulseAudio server answered the probe but the connect failed; \
-                     not connecting again for {delay:?}"
-                );
-            }
+        ConnectOutcome::Failed {
+            error,
+            exhausted: true,
+            ..
+        } => {
+            error!(
+                error = %error,
+                "the PulseAudio server answered the probe but the connect stalled \
+                 {MAX_STALLED_CONNECTS} times; not connecting to it again until the app \
+                 restarts"
+            );
+            None
+        }
+        ConnectOutcome::Failed { error, delay, .. } => {
+            warn!(
+                error = %error,
+                "the PulseAudio server answered the probe but the connect failed; \
+                 not connecting again for {delay:?}"
+            );
             None
         }
     }
@@ -151,20 +161,61 @@ fn roundtrip<T: protocol::CommandReply>(
     }
 }
 
+/// How often [`connect_within`] checks a connect still in progress.
+const CONNECT_POLL: Duration = Duration::from_millis(5);
+
+/// Connects a stream socket to `path` without ever blocking for longer than
+/// `timeout`, and returns it in blocking mode with `timeout` on every read
+/// and write. A plain blocking connect waits, without a timeout, while the
+/// listener's backlog is full (a server that stopped accepting).
+///
+/// The connect is non-blocking: an immediate `EAGAIN` (the backlog is full)
+/// fails at once, and an `EINPROGRESS` is waited out for at most `timeout`,
+/// checking the socket every [`CONNECT_POLL`] (a Unix socket connect does
+/// not normally report it, so this is a fallback, kept free of `unsafe`).
+fn connect_within(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    match socket.connect(&SockAddr::unix(path)?) {
+        Ok(()) => {}
+        Err(err) if err.raw_os_error() == Some(libc::EINPROGRESS) => {
+            wait_connected(&socket, timeout)?;
+        }
+        // `WouldBlock` (`EAGAIN`) included: the server accepts no one.
+        Err(err) => return Err(err),
+    }
+    socket.set_nonblocking(false)?;
+    socket.set_read_timeout(Some(timeout))?;
+    socket.set_write_timeout(Some(timeout))?;
+    Ok(UnixStream::from(OwnedFd::from(socket)))
+}
+
+/// Waits at most `timeout` for a connect in progress on `socket` to finish.
+fn wait_connected(socket: &Socket, timeout: Duration) -> io::Result<()> {
+    let started = Instant::now();
+    loop {
+        if let Some(err) = socket.take_error()? {
+            return Err(err);
+        }
+        if socket.peer_addr().is_ok() {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        std::thread::sleep(CONNECT_POLL);
+    }
+}
+
 /// Runs the handshake of `pulseaudio::Client::new_unix` (the `Auth`
 /// message, then `SetClientName` at the negotiated version) against the
-/// server at `path` over a new socket with `timeout` on every read and
-/// write. The socket is closed on return, so a server that never answers
-/// keeps nothing of this process.
+/// server at `path` over a new socket with `timeout` on the connect
+/// ([`connect_within`]) and on every read and write. The socket is closed
+/// on return, so a server that never answers keeps nothing of this process.
 fn server_answers(path: &Path, cookie: Vec<u8>, timeout: Duration) -> bool {
-    let Ok(socket) = UnixStream::connect(path) else {
+    let Ok(socket) = connect_within(path, timeout) else {
         return false;
     };
-    if socket.set_read_timeout(Some(timeout)).is_err()
-        || socket.set_write_timeout(Some(timeout)).is_err()
-    {
-        return false;
-    }
     let mut reader = BufReader::new(&socket);
     let auth = protocol::Command::Auth(protocol::AuthParams {
         version: protocol::MAX_VERSION,
@@ -322,6 +373,61 @@ mod tests {
         });
         assert!(server_answers(&path, Vec::new(), Duration::from_secs(2)));
         server.join().expect("server");
+    }
+
+    #[test]
+    fn a_server_whose_backlog_is_full_fails_the_probe_in_time() {
+        let path = socket_path("backlog");
+        // A listener that never accepts, with the smallest backlog.
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).expect("socket");
+        listener
+            .bind(&SockAddr::unix(&path).expect("address"))
+            .expect("bind");
+        listener.listen(0).expect("listen");
+        // Fill the backlog with non-blocking connects until one would block.
+        let mut queued = Vec::new();
+        loop {
+            assert!(queued.len() < 1024, "the backlog never filled");
+            let client = Socket::new(Domain::UNIX, Type::STREAM, None).expect("socket");
+            client.set_nonblocking(true).expect("non-blocking");
+            match client.connect(&SockAddr::unix(&path).expect("address")) {
+                Ok(()) => queued.push(client),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("unexpected connect error: {err}"),
+            }
+        }
+
+        // On a thread, so a connect that blocks fails the test instead of
+        // hanging it.
+        let timeout = Duration::from_millis(500);
+        let (done, result) = std::sync::mpsc::channel();
+        let probe_path = path.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let answered = server_answers(&probe_path, Vec::new(), timeout);
+            let _ = done.send((answered, started.elapsed()));
+        });
+        let (answered, took) = result
+            .recv_timeout(timeout + Duration::from_secs(2))
+            .expect("the probe blocked on a full backlog");
+        assert!(!answered);
+        assert!(took < timeout + Duration::from_secs(1), "took {took:?}");
+        drop(queued);
+        drop(listener);
+    }
+
+    #[test]
+    fn waiting_on_a_connect_that_never_completes_times_out() {
+        // A socket that was never connected has no peer and no error, as a
+        // connect still in progress has.
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).expect("socket");
+        let timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        let err = wait_connected(&socket, timeout).expect_err("never connected");
+        let took = started.elapsed();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(took >= timeout, "took {took:?}");
+        assert!(took < timeout + Duration::from_secs(1), "took {took:?}");
     }
 
     #[test]

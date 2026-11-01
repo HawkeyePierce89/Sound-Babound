@@ -13,20 +13,27 @@ mod windows;
 #[cfg(target_os = "linux")]
 pub use linux::{
     VirtualMic, attach_parent_console, create_virtual_mic, default_virtual_device,
-    global_hotkeys_supported, virtual_device_missing_hint, virtual_input_exclusions,
-    virtual_mic_hint, virtual_mic_not_found,
+    default_virtual_device_preference, global_hotkeys_supported, hotkey_keys,
+    virtual_device_missing_hint, virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
-    attach_parent_console, default_virtual_device, microphone_access, prepare_event_loop,
-    virtual_device_missing_hint, virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found,
-    with_tray_icon,
+    attach_parent_console, default_virtual_device, default_virtual_device_preference, hotkey_keys,
+    microphone_access, prepare_event_loop, virtual_device_missing_hint, virtual_input_exclusions,
+    virtual_mic_hint, virtual_mic_not_found, with_tray_icon,
 };
 #[cfg(target_os = "windows")]
 pub use windows::{
-    attach_parent_console, default_virtual_device, virtual_device_missing_hint,
-    virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found,
+    attach_parent_console, default_virtual_device, default_virtual_device_preference, hotkey_keys,
+    virtual_device_missing_hint, virtual_input_exclusions, virtual_mic_hint, virtual_mic_not_found,
 };
+
+/// Fallback for every other OS: global-hotkey has no backend there, so the
+/// choice only shapes what the window records.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn hotkey_keys() -> HotkeyKeys {
+    HotkeyKeys::Layout
+}
 
 /// Fallback for every other OS: nothing to attach.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -37,6 +44,12 @@ pub fn attach_parent_console() {}
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn default_virtual_device() -> &'static str {
     ""
+}
+
+/// Fallback for every other OS: no preference.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn default_virtual_device_preference() -> Option<&'static str> {
+    None
 }
 
 /// Fallback for every other OS: only the configured pattern is excluded.
@@ -82,6 +95,22 @@ impl VirtualMic {
 #[cfg(not(target_os = "linux"))]
 pub fn create_virtual_mic() -> anyhow::Result<Option<VirtualMic>> {
     Ok(None)
+}
+
+/// Which key a global hotkey matches, which decides which of egui's two
+/// key names the settings window records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyKeys {
+    /// The hotkey is a key position, named as on a US layout (macOS: a
+    /// virtual key code): record the physical key.
+    #[allow(dead_code)] // Only macOS returns it.
+    Position,
+    /// The hotkey follows the keyboard layout (Windows virtual keys, X11
+    /// keysyms): record the key the layout produces, and the physical key
+    /// only when that one is not a supported key (a symbol such as `&` on
+    /// AZERTY's digit row, or an AltGr character).
+    #[allow(dead_code)] // macOS never returns it.
+    Layout,
 }
 
 /// Whether the app may record from the microphone, as the OS reports it.

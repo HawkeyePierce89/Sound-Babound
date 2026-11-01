@@ -5,7 +5,7 @@ use tao::event_loop::EventLoop;
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::TrayIconBuilder;
 
-use super::MicrophoneAccess;
+use super::{HotkeyKeys, MicrophoneAccess};
 
 /// No-op: a macOS binary always keeps the console it was launched from.
 pub fn attach_parent_console() {}
@@ -23,9 +23,17 @@ pub fn with_tray_icon(builder: TrayIconBuilder) -> anyhow::Result<TrayIconBuilde
 }
 
 /// The mic sink's device when the config names none: BlackHole, matched by
-/// name, so "BlackHole 2ch" and "BlackHole 16ch" both qualify.
+/// name, so "BlackHole 2ch" and "BlackHole 16ch" both qualify. When several
+/// are installed, [`default_virtual_device_preference`] picks the 2ch one.
 pub fn default_virtual_device() -> &'static str {
     "BlackHole"
+}
+
+/// Which of the devices [`default_virtual_device`] names the mic sink
+/// prefers: "BlackHole 2ch", the one the setup hint tells the user to
+/// install and pick in the call app, over "BlackHole 16ch" or "64ch".
+pub fn default_virtual_device_preference() -> Option<&'static str> {
+    Some("2ch")
 }
 
 /// The inputs the capture must never open. BlackHole's input carries the
@@ -73,6 +81,12 @@ fn access_of(permission: AVAudioApplicationRecordPermission) -> MicrophoneAccess
     }
 }
 
+/// Which key a hotkey names: global-hotkey registers a macOS hotkey by virtual key code, which is a
+/// key position (`KeyA` is the key where a US layout has A).
+pub fn hotkey_keys() -> HotkeyKeys {
+    HotkeyKeys::Position
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +94,7 @@ mod tests {
     #[test]
     fn mic_defaults_target_blackhole() {
         assert_eq!(default_virtual_device(), "BlackHole");
+        assert_eq!(default_virtual_device_preference(), Some("2ch"));
         assert_eq!(virtual_input_exclusions("BlackHole"), ["BlackHole"]);
         assert!(virtual_mic_hint().contains("BlackHole"));
         assert!(virtual_mic_not_found().contains("install BlackHole"));
