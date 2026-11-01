@@ -990,6 +990,10 @@ mod tests {
         assert!(SoundSource::resolve("  ", dir).is_err());
         let err = SoundSource::resolve("builtin:nope", dir).unwrap_err();
         assert!(err.contains("builtin:nope"), "{err}");
+        for text in ["builtin:", "builtin: airhorn"] {
+            let err = SoundSource::resolve(text, dir).unwrap_err();
+            assert!(err.contains("available:"), "{text}: {err}");
+        }
     }
 
     #[test]
@@ -1096,20 +1100,23 @@ mod tests {
     #[test]
     fn sources_md_lists_exactly_the_registry_without_the_demo() {
         let text = fs::read_to_string(sounds_dir().join("SOURCES.md")).unwrap();
-        let mut listed: Vec<String> = text
+        let rows: Vec<&str> = text
             .lines()
-            .filter_map(|line| {
-                let cell = line.strip_prefix("| `builtin:")?;
-                Some(cell.split('`').next()?.to_string())
-            })
+            .filter(|line| line.starts_with("| `builtin:"))
             .collect();
-        let mut expected: Vec<String> = BUILTIN_SOUNDS
+        for row in &rows {
+            assert!(row.ends_with("| CC0 1.0 |"), "not CC0: {row}");
+        }
+        // Both follow `sources.txt` order.
+        let listed: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| row.strip_prefix("| `builtin:")?.split('`').next())
+            .collect();
+        let expected: Vec<&str> = BUILTIN_SOUNDS
             .iter()
             .filter(|entry| entry.name != "demo")
-            .map(|entry| entry.name.to_string())
+            .map(|entry| entry.name)
             .collect();
-        listed.sort();
-        expected.sort();
         assert_eq!(listed, expected);
     }
 

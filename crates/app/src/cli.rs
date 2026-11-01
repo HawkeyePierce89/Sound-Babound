@@ -227,18 +227,24 @@ fn output_drain(latency: Duration) -> Duration {
 /// file path relative to the working directory. This is the same decode path
 /// the tray uses.
 pub fn load_play_sound(file: Option<&Path>) -> Result<Sound> {
-    let source = match file {
-        Some(path) => match path.to_str() {
-            Some(text) => SoundSource::resolve(text, Path::new(""))
-                .map_err(|err| anyhow::anyhow!("cannot play {}: {err}", path.display()))?,
-            None => SoundSource::File(path.to_path_buf()),
-        },
-        None => SoundSource::Builtin(crate::config::DEMO),
-    };
-    source.load().with_context(|| match file {
+    play_source(file)?.load().with_context(|| match file {
         Some(path) => format!("cannot play {}", path.display()),
         None => "cannot decode the embedded demo".to_string(),
     })
+}
+
+/// The sound `play` names: the demo without an argument, a UTF-8 argument
+/// through the config's resolver (relative to the working directory), and a
+/// non-UTF-8 one always as a file.
+fn play_source(file: Option<&Path>) -> Result<SoundSource> {
+    match file {
+        Some(path) => match path.to_str() {
+            Some(text) => SoundSource::resolve(text, Path::new(""))
+                .map_err(|err| anyhow::anyhow!("cannot play {}: {err}", path.display())),
+            None => Ok(SoundSource::File(path.to_path_buf())),
+        },
+        None => Ok(SoundSource::Builtin(crate::config::DEMO)),
+    }
 }
 
 /// How long `sound` plays at its own sample rate.
@@ -448,6 +454,34 @@ mod tests {
         assert!(message.contains("builtin:nope"), "{message}");
         assert!(message.contains("available:"), "{message}");
         assert!(message.contains("builtin:airhorn"), "{message}");
+    }
+
+    #[test]
+    fn a_relative_argument_stays_relative_to_the_working_directory() {
+        assert_eq!(
+            play_source(Some(Path::new("sounds/a.wav"))).unwrap(),
+            SoundSource::File(PathBuf::from("sounds/a.wav"))
+        );
+    }
+
+    #[test]
+    fn no_argument_is_the_demo() {
+        assert_eq!(
+            play_source(None).unwrap(),
+            SoundSource::Builtin(crate::config::DEMO)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_argument_is_always_a_file() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(OsStr::from_bytes(b"builtin:\xff"));
+        assert_eq!(
+            play_source(Some(path)).unwrap(),
+            SoundSource::File(path.to_path_buf())
+        );
     }
 
     #[test]

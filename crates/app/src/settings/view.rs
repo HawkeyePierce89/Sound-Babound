@@ -13,7 +13,7 @@ use crate::config;
 use crate::hotkeys;
 use crate::platform;
 use crate::settings::StatusText;
-use crate::settings::audition::{Auditions, ExitReport, ProcessAudition, audition_target};
+use crate::settings::audition::{Auditions, ExitReport, ProcessAudition};
 use crate::settings::form::{AUDIO_EXTENSIONS, SettingsForm};
 use crate::settings::keys::{self, KeyCapture, Mods};
 use crate::settings::save;
@@ -75,23 +75,18 @@ impl SettingsApp {
 
     /// Stops the playing row, or plays row `index` (stopping another one).
     fn toggle_audition(&mut self, index: usize) {
-        if self.auditions.playing() == Some(index) {
-            self.auditions.stop();
-            return;
-        }
         let Some(row) = self.form.rows().get(index) else {
             return;
         };
         let config_dir = self.path.parent().unwrap_or(Path::new(""));
-        let result = audition_target(&row.path, config_dir)
-            .map_err(|err| format!("cannot play {:?}: {err}", row.name))
-            .and_then(|target| {
-                self.auditions
-                    .play(index, &target)
-                    .map_err(|err| format!("{err:#}"))
-            });
-        if let Err(message) = result {
-            self.message = Some(message);
+        match self
+            .auditions
+            .toggle(index, &row.name, &row.path, config_dir)
+        {
+            // A sound that plays makes an earlier message stale.
+            Ok(()) if self.auditions.playing().is_some() => self.message = None,
+            Ok(()) => {}
+            Err(message) => self.message = Some(message),
         }
     }
 

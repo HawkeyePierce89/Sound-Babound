@@ -48,12 +48,13 @@ pub struct ExitReport {
 
 /// The text to show for a failed audition: from the last `Error:` line to
 /// the end, joined into one line; otherwise the last non-empty line;
-/// otherwise the exit status.
+/// otherwise the exit status. The backtrace hint a Rust panic ends with is
+/// skipped, so a panic shows its message.
 pub fn failure_message(stderr: &str, status: &str) -> String {
     let lines: Vec<&str> = stderr
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && !line.starts_with("note: run with `RUST_BACKTRACE"))
         .collect();
     if let Some(start) = lines.iter().rposition(|line| line.starts_with("Error:")) {
         return lines[start..].join(" ");
@@ -101,11 +102,6 @@ impl<S: AuditionSpawner> Auditions<S> {
         }
     }
 
-    #[cfg(test)]
-    pub fn spawner(&self) -> &S {
-        &self.spawner
-    }
-
     /// The row whose button reads "Stop".
     pub fn playing(&self) -> Option<usize> {
         self.current.as_ref().map(|current| current.row)
@@ -120,6 +116,27 @@ impl<S: AuditionSpawner> Auditions<S> {
         let child = self.spawner.spawn(id, target)?;
         self.current = Some(Current { id, row, child });
         Ok(())
+    }
+
+    /// The row's Play/Stop button: stops row `row` if it is playing,
+    /// otherwise plays its sound (stopping another row), with a relative
+    /// `path` resolved against `config_dir`. Returns the message to show
+    /// when the sound cannot be played; nothing is spawned for a path that
+    /// does not resolve.
+    pub fn toggle(
+        &mut self,
+        row: usize,
+        name: &str,
+        path: &str,
+        config_dir: &Path,
+    ) -> Result<(), String> {
+        if self.playing() == Some(row) {
+            self.stop();
+            return Ok(());
+        }
+        let target = audition_target(path, config_dir)
+            .map_err(|err| format!("cannot play {name:?}: {err}"))?;
+        self.play(row, &target).map_err(|err| format!("{err:#}"))
     }
 
     /// Kills the current audition, if any.
@@ -469,7 +486,64 @@ mod tests {
         auditions.close();
         assert_eq!(auditions.playing(), None);
         assert_eq!(spawner.events.borrow().last(), Some(&Event::Kill(0)));
-        assert_eq!(auditions.spawner().events.borrow().len(), 2);
+        assert_eq!(spawner.events.borrow().len(), 2);
+    }
+
+    #[test]
+    fn toggle_plays_a_row_and_stops_it_on_the_second_click() {
+        let (mut auditions, spawner) = auditions();
+        let dir = std::env::temp_dir().join("cfg");
+        auditions.toggle(1, "Mine", "sounds/a.wav", &dir).unwrap();
+        assert_eq!(auditions.playing(), Some(1));
+        auditions.toggle(1, "Mine", "sounds/a.wav", &dir).unwrap();
+        assert_eq!(auditions.playing(), None);
+        assert_eq!(
+            *spawner.events.borrow(),
+            [
+                Event::Spawn(0, dir.join("sounds/a.wav").into_os_string()),
+                Event::Kill(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn toggle_on_another_row_switches_to_it() {
+        let (mut auditions, spawner) = auditions();
+        let dir = Path::new("/cfg");
+        auditions.toggle(0, "A", "builtin:airhorn", dir).unwrap();
+        auditions.toggle(2, "B", "builtin:ding", dir).unwrap();
+        assert_eq!(auditions.playing(), Some(2));
+        assert_eq!(
+            *spawner.events.borrow(),
+            [
+                Event::Spawn(0, "builtin:airhorn".into()),
+                Event::Kill(0),
+                Event::Spawn(1, "builtin:ding".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn toggle_names_the_row_when_its_path_does_not_resolve() {
+        let (mut auditions, spawner) = auditions();
+        let err = auditions
+            .toggle(0, "Horn", "builtin:nope", Path::new("/cfg"))
+            .unwrap_err();
+        assert!(err.starts_with("cannot play \"Horn\": "), "{err}");
+        assert!(err.contains("builtin:nope"), "{err}");
+        assert_eq!(auditions.playing(), None);
+        assert!(spawner.events.borrow().is_empty());
+    }
+
+    #[test]
+    fn toggle_reports_a_failed_spawn() {
+        let (mut auditions, spawner) = auditions();
+        *spawner.fail.borrow_mut() = true;
+        let err = auditions
+            .toggle(0, "A", "builtin:airhorn", Path::new("/cfg"))
+            .unwrap_err();
+        assert!(err.contains("no such program"), "{err}");
+        assert_eq!(auditions.playing(), None);
     }
 
     #[test]
@@ -526,6 +600,16 @@ mod tests {
         );
         let message = failure_message("  \n", "exit status: 101");
         assert!(message.contains("exit status: 101"), "{message}");
+    }
+
+    #[test]
+    fn failure_message_of_a_panic_is_its_message_not_the_backtrace_hint() {
+        let stderr = "thread 'main' panicked at src/cli.rs:1:2:\nindex out of bounds\n\
+                      note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+        assert_eq!(
+            failure_message(stderr, "exit status: 101"),
+            "index out of bounds"
+        );
     }
 
     #[test]
@@ -602,6 +686,46 @@ mod tests {
         // The sender is gone with the spawner: nothing was ever sent.
         assert!(reports.recv_timeout(Duration::from_secs(5)).is_err());
         assert_eq!(repaints.load(Ordering::SeqCst), 0);
+    }
+
+    /// A harmless child that keeps running until it is killed.
+    #[cfg(unix)]
+    fn long_child(_target: &OsStr) -> Result<Command> {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        Ok(command)
+    }
+
+    /// Asserts that the killed child's exit arrives soon, as a failure.
+    #[cfg(unix)]
+    fn assert_killed_report(reports: &Reports, id: u64) {
+        let (reported, report) = reports
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the killed child's exit was never reported");
+        assert_eq!(reported, id);
+        assert!(!report.success, "{report:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_ends_a_running_child_at_once() {
+        let (mut spawner, reports, _) = process_audition(long_child);
+        let mut child = spawner.spawn(3, OsStr::new("ignored")).unwrap();
+        // Still running: nothing reported yet.
+        assert!(reports.recv_timeout(Duration::from_millis(100)).is_err());
+        let started = Instant::now();
+        child.kill();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_killed_report(&reports, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_handle_kills_a_running_child() {
+        let (mut spawner, reports, _) = process_audition(long_child);
+        let child = spawner.spawn(4, OsStr::new("ignored")).unwrap();
+        drop(child);
+        assert_killed_report(&reports, 4);
     }
 
     #[test]
