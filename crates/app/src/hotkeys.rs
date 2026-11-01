@@ -38,6 +38,12 @@ fn normalize(spec: &str) -> String {
         .join("+")
 }
 
+/// The hotkey text of a config entry, trimmed; `None` for a missing or
+/// blank one, which means "no hotkey".
+pub fn hotkey_spec(spec: Option<&str>) -> Option<&str> {
+    spec.map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// Parses a hotkey such as `CmdOrCtrl+Shift+1`.
 pub fn parse_hotkey(spec: &str) -> Result<HotKey, String> {
     let normalized = normalize(spec);
@@ -74,7 +80,7 @@ impl HotkeyRegistry {
         owner: &str,
         warnings: &mut Vec<String>,
     ) -> Option<HotKey> {
-        let spec = spec.map(str::trim).filter(|s| !s.is_empty())?;
+        let spec = hotkey_spec(spec)?;
         let hotkey = match parse_hotkey(spec) {
             Ok(hotkey) => hotkey,
             Err(err) => {

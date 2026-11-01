@@ -92,18 +92,47 @@ pub fn apply_sounds(doc: &mut DocumentMut, loaded: &[RawSound], rows: &[SoundRow
         set_positions(&mut table, position);
         tables.push(table);
     }
-    if let (Some(section), Some(first)) = (section, tables.get_mut(0)) {
+    if let (Some(section), Some(first)) = (&section, tables.get_mut(0)) {
         let own = without_leading_blank_lines(prefix_of(first)).to_owned();
-        first.decor_mut().set_prefix(section + &own);
+        first.decor_mut().set_prefix(section.to_owned() + &own);
     }
 
     if tables.is_empty() {
         doc.remove(SOUND_KEY);
+        if let Some(section) = section.filter(|text| !text.trim().is_empty()) {
+            keep_list_comment(doc, position, &section);
+        }
     } else {
         let item = doc.entry(SOUND_KEY).or_insert(Item::None);
         *item = Item::ArrayOfTables(tables);
     }
     Ok(())
+}
+
+/// Keeps the list's comment `section` once every entry is gone: in front
+/// of the first table printed after `position`, or at the end of the file
+/// if none is.
+fn keep_list_comment(doc: &mut DocumentMut, position: isize, section: &str) {
+    let next = doc
+        .as_table_mut()
+        .iter_mut()
+        .filter_map(|(_, item)| match item {
+            Item::Table(table) => Some(table),
+            Item::ArrayOfTables(tables) => tables.iter_mut().next(),
+            _ => None,
+        })
+        .filter(|table| table.position().is_some_and(|p| p > position))
+        .min_by_key(|table| table.position());
+    match next {
+        Some(table) => {
+            let own = without_leading_blank_lines(prefix_of(table)).to_owned();
+            table.decor_mut().set_prefix(section.to_owned() + &own);
+        }
+        None => {
+            let trailing = doc.trailing().as_str().unwrap_or("").to_owned();
+            doc.set_trailing(section.to_owned() + &trailing);
+        }
+    }
 }
 
 /// Takes the `[[sound]]` tables out of `doc`, leaving `Item::None` behind
@@ -438,6 +467,29 @@ mod tests {
         let out = applied(text, &loaded, &[]);
         assert_eq!(out, "master_gain = 0.5\n");
         assert!(sounds_in(&out).is_empty());
+    }
+
+    #[test]
+    fn removing_every_sound_keeps_the_list_comment() {
+        let (loaded, _) = rows_of(DEFAULT_CONFIG);
+        let out = applied(DEFAULT_CONFIG, &loaded, &[]);
+        let comment_start = DEFAULT_CONFIG.find("# One [[sound]] block").unwrap();
+        let comment_end = DEFAULT_CONFIG.find(DEMO_ENTRY).unwrap();
+        let comment = &DEFAULT_CONFIG[comment_start..comment_end];
+        assert!(out.contains(comment), "{out}");
+        assert!(!out.contains(DEMO_ENTRY));
+        assert!(sounds_in(&out).is_empty());
+        // Everything before the list is untouched.
+        assert!(out.starts_with(&DEFAULT_CONFIG[..comment_start]));
+    }
+
+    #[test]
+    fn removing_every_sound_moves_the_list_comment_before_the_next_table() {
+        let text = "# the sounds\n[[sound]]\nname = \"a\"\npath = \"a.wav\"\n\n\
+                    # mic\n[mic]\nenabled = true\n";
+        let (loaded, _) = rows_of(text);
+        let out = applied(text, &loaded, &[]);
+        assert_eq!(out, "# the sounds\n# mic\n[mic]\nenabled = true\n");
     }
 
     #[test]

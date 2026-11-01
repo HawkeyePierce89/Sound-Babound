@@ -1381,6 +1381,21 @@ mod tests {
         assert_eq!(*log.borrow(), ["device created", "device dropped"]);
     }
 
+    #[test]
+    fn shutdown_while_the_device_is_created_forgets_it_when_a_stream_is_left_running() {
+        let log = Log::default();
+        let (mut audio, mut host) = with_device(&log, false);
+        audio.set_mic(on()).unwrap();
+        let requests = audio.requests.clone();
+        audio.shutdown(|_control| false);
+        assert_eq!(
+            requests.queued(),
+            [DeviceRequest::Create { epoch: 1 }, DeviceRequest::Forget]
+        );
+        drain(&requests, &mut host);
+        assert_eq!(*log.borrow(), ["device created"]);
+    }
+
     /// A control whose mic stop can leave a stream running, as the engine's
     /// does when a supervisor is blocked in a device query.
     struct SlowStopAudio {

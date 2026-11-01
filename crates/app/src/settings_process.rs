@@ -314,7 +314,13 @@ mod tests {
         let (mut spawner, exits) = counting_spawner(missing_program);
         let err = spawner.spawn().unwrap_err();
         assert!(format!("{err:#}").contains("cannot launch the settings window"));
-        thread::sleep(Duration::from_millis(50));
+        // The waiter holds a clone of `on_exit` until it ends: wait for that,
+        // so a late call would be counted.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&spawner.on_exit) > 1 {
+            assert!(Instant::now() < deadline, "the waiter thread never ended");
+            thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(*exits.lock().unwrap(), 0);
     }
 

@@ -14,17 +14,17 @@ const LETTERS: [&str; 26] = [
 const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
 /// The function keys a hotkey may use, as both the UI and the config name
-/// them. These are the only keys accepted without a modifier.
+/// them. These are the only keys accepted without a modifier, or with Shift
+/// alone.
 const FUNCTION_KEYS: [&str; 24] = [
     "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14", "F15",
     "F16", "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24",
 ];
 
-/// UI key names that differ from, or only exist next to, the config's. The
-/// left side is egui's `Key::name()` vocabulary (arrows are `Up`, `Down`,
-/// `Left`, `Right`; punctuation is `Equals`, `Backtick`, `OpenBracket`,
-/// `CloseBracket`), plus the W3C code spellings (`ArrowUp`, `Equal`,
-/// `Backquote`, `BracketLeft`, `Numpad0`) in case a UI reports those.
+/// The other keys, with egui's `Key::name()` on the left and the config's
+/// name on the right (they differ for `Equals`, `Backtick`, `OpenBracket`
+/// and `CloseBracket`). egui has no numpad digit keys: it reports them as
+/// the digit row's.
 const NAMED_KEYS: &[(&str, &str)] = &[
     ("Space", "Space"),
     ("Enter", "Enter"),
@@ -37,37 +37,19 @@ const NAMED_KEYS: &[(&str, &str)] = &[
     ("PageUp", "PageUp"),
     ("PageDown", "PageDown"),
     ("Up", "Up"),
-    ("ArrowUp", "Up"),
     ("Down", "Down"),
-    ("ArrowDown", "Down"),
     ("Left", "Left"),
-    ("ArrowLeft", "Left"),
     ("Right", "Right"),
-    ("ArrowRight", "Right"),
-    ("Numpad0", "Num0"),
-    ("Numpad1", "Num1"),
-    ("Numpad2", "Num2"),
-    ("Numpad3", "Num3"),
-    ("Numpad4", "Num4"),
-    ("Numpad5", "Num5"),
-    ("Numpad6", "Num6"),
-    ("Numpad7", "Num7"),
-    ("Numpad8", "Num8"),
-    ("Numpad9", "Num9"),
     ("Minus", "Minus"),
     ("Equals", "Equal"),
-    ("Equal", "Equal"),
     ("Comma", "Comma"),
     ("Period", "Period"),
     ("Slash", "Slash"),
     ("Semicolon", "Semicolon"),
     ("Quote", "Quote"),
     ("Backtick", "Backquote"),
-    ("Backquote", "Backquote"),
     ("OpenBracket", "BracketLeft"),
-    ("BracketLeft", "BracketLeft"),
     ("CloseBracket", "BracketRight"),
-    ("BracketRight", "BracketRight"),
     ("Backslash", "Backslash"),
 ];
 
@@ -149,7 +131,7 @@ const CLEAR_KEY: &str = "Escape";
 /// Maps a UI key name (egui's `Key::name()` vocabulary) to the config's
 /// name for that key: letters, digits, F1–F24, Space, Enter, Tab,
 /// Backspace, Delete, Insert, Home, End, PageUp, PageDown, the arrows (as
-/// Up, Down, Left, Right), numpad digits (as Num0–Num9) and punctuation.
+/// Up, Down, Left, Right) and punctuation.
 /// `None` for any other key (see [`UNSUPPORTED_UI_KEYS`]).
 pub fn config_key_name(ui_key: &str) -> Option<&'static str> {
     LETTERS
@@ -195,7 +177,14 @@ impl Mods {
 
     /// Whether any modifier is held.
     pub fn any(self) -> bool {
-        self.cmd_or_ctrl || self.ctrl || self.alt || self.shift
+        self.shift || self.guards_typing()
+    }
+
+    /// Whether a modifier other than Shift is held: Shift with a typing key
+    /// is ordinary typing (a capital letter, a symbol), so a global hotkey
+    /// on it would take that character from every other app.
+    fn guards_typing(self) -> bool {
+        self.cmd_or_ctrl || self.ctrl || self.alt
     }
 }
 
@@ -212,11 +201,14 @@ pub enum KeyCapture {
 
 /// Turns a key press into a [`KeyCapture`]:
 /// - `Escape` alone clears the field;
-/// - a supported key with modifiers, or F1–F24 alone, sets it, as
+/// - a supported key with a modifier other than Shift, or F1–F24 alone or
+///   with Shift only, sets it, as
 ///   `CmdOrCtrl+Ctrl+Alt+Shift+Key` (only the held modifiers, always in
 ///   that order);
 /// - anything else is ignored: an unsupported key, a lone modifier, a
-///   non-function key without a modifier, or a combination
+///   non-function key without a modifier or with Shift alone (that is
+///   typing, which a global hotkey would take from every app), or a
+///   combination
 ///   [`hotkeys::parse_hotkey`] rejects, so the window never writes a
 ///   hotkey the tray would refuse.
 pub fn hotkey_text(mods: Mods, ui_key: &str) -> KeyCapture {
@@ -226,7 +218,7 @@ pub fn hotkey_text(mods: Mods, ui_key: &str) -> KeyCapture {
     let Some(key) = config_key_name(ui_key) else {
         return KeyCapture::Ignore;
     };
-    if !mods.any() && !FUNCTION_KEYS.contains(&key) {
+    if !mods.guards_typing() && !FUNCTION_KEYS.contains(&key) {
         return KeyCapture::Ignore;
     }
     let held = [
@@ -267,6 +259,13 @@ mod tests {
         }
     }
 
+    fn alt() -> Mods {
+        Mods {
+            alt: true,
+            ..Mods::default()
+        }
+    }
+
     /// Every UI name the mapping accepts, with its config name.
     fn supported() -> Vec<(&'static str, &'static str)> {
         LETTERS
@@ -302,12 +301,6 @@ mod tests {
             ("Down", "Down"),
             ("Left", "Left"),
             ("Right", "Right"),
-            ("ArrowUp", "Up"),
-            ("ArrowDown", "Down"),
-            ("ArrowLeft", "Left"),
-            ("ArrowRight", "Right"),
-            ("Numpad0", "Num0"),
-            ("Numpad9", "Num9"),
             ("Minus", "Minus"),
             ("Equals", "Equal"),
             ("Comma", "Comma"),
@@ -334,8 +327,8 @@ mod tests {
                 "{ui} -> {config}"
             );
             assert_eq!(
-                hotkey_text(shift(), ui),
-                KeyCapture::Set(format!("Shift+{config}")),
+                hotkey_text(alt(), ui),
+                KeyCapture::Set(format!("Alt+{config}")),
                 "{ui}"
             );
         }
@@ -434,9 +427,29 @@ mod tests {
             hotkey_text(Mods::default(), "F24"),
             KeyCapture::Set("F24".to_owned())
         );
-        for ui in ["A", "1", "Space", "Enter", "Up", "Numpad1", "Minus", "Tab"] {
+        for ui in ["A", "1", "Space", "Enter", "Up", "Minus", "Tab"] {
             assert_eq!(hotkey_text(Mods::default(), ui), KeyCapture::Ignore, "{ui}");
         }
+    }
+
+    #[test]
+    fn shift_alone_works_only_with_function_keys() {
+        assert_eq!(
+            hotkey_text(shift(), "F5"),
+            KeyCapture::Set("Shift+F5".to_owned())
+        );
+        for ui in ["A", "1", "Space", "Enter", "Up", "Minus", "Tab", "Slash"] {
+            assert_eq!(hotkey_text(shift(), ui), KeyCapture::Ignore, "{ui}");
+        }
+        let alt_shift = Mods {
+            alt: true,
+            shift: true,
+            ..Mods::default()
+        };
+        assert_eq!(
+            hotkey_text(alt_shift, "A"),
+            KeyCapture::Set("Alt+Shift+A".to_owned())
+        );
     }
 
     #[test]
@@ -468,7 +481,8 @@ mod tests {
                 }
             }
         }
-        // 15 modifier sets for every key, plus the function keys alone.
-        assert_eq!(set, 15 * supported().len() + FUNCTION_KEYS.len());
+        // The 14 modifier sets with more than Shift for every key, plus the
+        // function keys alone and with Shift alone.
+        assert_eq!(set, 14 * supported().len() + 2 * FUNCTION_KEYS.len());
     }
 }

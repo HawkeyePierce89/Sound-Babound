@@ -163,7 +163,8 @@ impl SettingsForm {
     }
 
     /// The problems of every row, indexed like [`rows`](Self::rows): a
-    /// blank name, a hotkey that does not parse, and a hotkey that another
+    /// blank name, a hotkey that does not parse (a blank one means none, as
+    /// in the tray), and a hotkey that another
     /// row or `stop_all_hotkey` also uses (compared by [`HotKey::id`], so
     /// two spellings of one combination count as the same). Every row that
     /// shares a hotkey is marked. A `stop_all_hotkey` that does not parse
@@ -173,7 +174,8 @@ impl SettingsForm {
     pub fn validate(&self) -> Vec<Vec<Problem>> {
         let mut problems: Vec<Vec<Problem>> = vec![Vec::new(); self.rows.len()];
         let mut owners: HashMap<u32, Vec<HotkeyOwner>> = HashMap::new();
-        if let Some(Ok(hotkey)) = self.stop_all_hotkey.as_deref().map(hotkeys::parse_hotkey) {
+        let stop_all = hotkeys::hotkey_spec(self.stop_all_hotkey.as_deref());
+        if let Some(Ok(hotkey)) = stop_all.map(hotkeys::parse_hotkey) {
             owners
                 .entry(hotkey.id())
                 .or_default()
@@ -183,7 +185,7 @@ impl SettingsForm {
             if row.name.trim().is_empty() {
                 problems[index].push(Problem::BlankName);
             }
-            match row.hotkey.as_deref().map(hotkeys::parse_hotkey) {
+            match hotkeys::hotkey_spec(row.hotkey.as_deref()).map(hotkeys::parse_hotkey) {
                 Some(Ok(hotkey)) => owners
                     .entry(hotkey.id())
                     .or_default()
@@ -474,6 +476,18 @@ hotkey = "Ctrl+Bogus"
     }
 
     #[test]
+    fn a_blank_hotkey_from_the_file_means_none() {
+        let form = SettingsForm::from_text(
+            "stop_all_hotkey = \"\"\n\
+             [[sound]]\nname = \"a\"\npath = \"a.wav\"\nhotkey = \"\"\n\
+             [[sound]]\nname = \"b\"\npath = \"b.wav\"\nhotkey = \"  \"\n\
+             [[sound]]\nname = \"c\"\npath = \"c.wav\"\nhotkey = \" F5 \"\n",
+        );
+        assert_eq!(form.validate(), vec![Vec::new(); 3]);
+        assert!(form.can_save());
+    }
+
+    #[test]
     fn an_invalid_stop_all_hotkey_is_left_out() {
         let form = SettingsForm::from_text("stop_all_hotkey = \"Nope+Q\"\n");
         assert!(form.validate().is_empty());
@@ -497,7 +511,22 @@ hotkey = "Ctrl+Bogus"
     }
 
     #[test]
-    fn the_picker_offers_the_decoded_formats() {
-        assert_eq!(AUDIO_EXTENSIONS, ["wav", "flac", "ogg", "mp3"]);
+    fn every_offered_extension_decodes() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let testdata = manifest.join("../engine/testdata");
+        let fixtures = [
+            manifest.join("assets/demo.wav"),
+            testdata.join("tone-22050-mono.flac"),
+            testdata.join("tone-22050-stereo.ogg"),
+            testdata.join("tone-22050-mono.mp3"),
+        ];
+        for extension in AUDIO_EXTENSIONS {
+            let fixture = fixtures
+                .iter()
+                .find(|path| path.extension().is_some_and(|e| e == *extension))
+                .unwrap_or_else(|| panic!("no fixture for {extension}"));
+            babound_engine::Sound::load_file(fixture)
+                .unwrap_or_else(|err| panic!("{extension} does not decode: {err}"));
+        }
     }
 }

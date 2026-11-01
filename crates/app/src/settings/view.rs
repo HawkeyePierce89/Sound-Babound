@@ -8,6 +8,7 @@ use std::sync::PoisonError;
 
 use eframe::egui;
 
+use crate::hotkeys;
 use crate::settings::StatusText;
 use crate::settings::form::{AUDIO_EXTENSIONS, SettingsForm};
 use crate::settings::keys::{self, KeyCapture, Mods};
@@ -79,7 +80,17 @@ impl SettingsApp {
                     }
                     false
                 }
-                egui::Event::Text(_) => false,
+                // egui-winit turns the clipboard shortcuts (CmdOrCtrl+C, X
+                // and V, and Shift+Delete, Ctrl+Insert and Shift+Insert on
+                // Windows) into these instead of key events. They stay out
+                // of the field on purpose, since a global hotkey on them
+                // would take copy and paste from every app, and out of the
+                // other widgets while the field waits.
+                egui::Event::Text(_)
+                | egui::Event::Copy
+                | egui::Event::Cut
+                | egui::Event::Paste(_)
+                | egui::Event::PasteImage(_) => false,
                 _ => true,
             });
         });
@@ -127,7 +138,7 @@ impl SettingsApp {
                     let label = if self.capturing == Some(index) {
                         "press a key…"
                     } else {
-                        row.hotkey.as_deref().unwrap_or("none")
+                        hotkeys::hotkey_spec(row.hotkey.as_deref()).unwrap_or("none")
                     };
                     if ui
                         .button(label)
@@ -162,7 +173,7 @@ impl SettingsApp {
         if ui.button("Add sound…").clicked() {
             self.add_sounds();
         }
-        if let Some(hotkey) = self.form.stop_all_hotkey() {
+        if let Some(hotkey) = hotkeys::hotkey_spec(self.form.stop_all_hotkey()) {
             ui.weak(format!(
                 "\"Stop all\" hotkey: {hotkey} (set in the config file)"
             ));
@@ -227,10 +238,9 @@ impl eframe::App for SettingsApp {
 
 #[cfg(test)]
 mod tests {
-    use crate::hotkeys;
     use crate::settings::keys::{UNSUPPORTED_UI_KEYS, config_key_name};
 
-    use super::egui;
+    use super::{egui, hotkeys};
 
     /// Every egui key either maps to a config key name that a hotkey can use
     /// or is listed as unsupported, so a key egui renames or adds shows up

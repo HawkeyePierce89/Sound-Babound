@@ -72,12 +72,12 @@ The tray menu has, from top to bottom:
 sound-babound settings
 ```
 
-The tray's "Settings…" item opens a small settings window; `sound-babound settings` opens the same window from a terminal. The tray opens one window at a time: choosing "Settings…" again while it is open does nothing.
+The tray's "Settings…" item opens a small settings window; `sound-babound settings` opens the same window from a terminal. Like the tray, it writes the default config file if there is none. The tray opens one window at a time: choosing "Settings…" again while it is open does nothing. On Linux the "Add sound…" file picker goes through the XDG desktop portal, so `xdg-desktop-portal` and a backend for your desktop (`-gtk`, `-gnome` or `-kde`) must be running, as they usually are; the window draws with OpenGL. Neither is needed to build.
 
 The window has two parts:
 
 - "Virtual mic": the same report as `mic-check` (see [Checking the virtual microphone](#checking-the-virtual-microphone)), refreshed about once a second. The window cannot see the tray's running microphone capture: when the default input is the virtual device, it says so and notes that the tray's capture stays on the last real microphone it used, if there was one.
-- "Sounds": every configured sound with its name, file and hotkey. You can rename a sound, remove it, add sounds with "Add sound…" (a file picker for WAV, FLAC, OGG and MP3 files; the name starts as the file name without its extension, and the path is stored as an absolute path), and set a hotkey: click the hotkey field, then press the combination. Escape clears the hotkey. A key without a modifier is accepted only for F1–F24, so a plain letter never becomes a global hotkey. The "Stop all" hotkey is shown, but it is set in the config file.
+- "Sounds": every configured sound with its name, file and hotkey. You can rename a sound, remove it, add sounds with "Add sound…" (a file picker for WAV, FLAC, OGG and MP3 files; the name starts as the file name without its extension, and the path is stored as an absolute path), and set a hotkey: click the hotkey field, then press the combination. The field records where the key sits, named as on a US layout (see [Hotkey syntax](#hotkey-syntax)): on AZERTY, the key labelled A shows as `Q`. Escape clears the hotkey. A key without a modifier, or with Shift alone, is accepted only for F1–F24, so a plain or capital letter never becomes a global hotkey. The copy, cut and paste shortcuts cannot be set either. The "Stop all" hotkey is shown, but it is set in the config file.
 
 Problems are shown next to their sound: a blank name, a hotkey from the file that does not parse, or a hotkey used twice (by two sounds, or by a sound and "Stop all"). Save stays disabled while there is any problem. If the config file does not parse, the window shows the error and cannot edit the sounds; fix the file first.
 
@@ -232,7 +232,7 @@ Keep your real microphone as the Windows default input. If "CABLE Output" become
 
 ### Linux
 
-The app creates the virtual microphone itself while "Mic to call" is on: a "Sound-Babound Mic" input (`sound_babound_mic`), fed by an output named "Sound-Babound Sink" (`sound_babound_sink`) that the app writes the call mix to. Do not choose either one as your default device. The app removes both when you turn "Mic to call" off or quit, and removes any that a crashed run left behind before it creates them again. If the sound server restarts while "Mic to call" is on, the app creates them again within a few seconds. It creates them whenever "Mic to call" is on, even if `virtual_device` names another output. There is nothing to install apart from `pactl`, which it uses to create the devices: install `pulseaudio-utils` on Debian or Ubuntu, or `libpulse` on Arch. This works with both PulseAudio and PipeWire (through `pipewire-pulse`). On Linux the virtual microphone and the microphone passthrough use the PulseAudio API; the sounds you hear still play through ALSA's `default` device. If the sound server stops answering, turning "Mic to call" off or quitting can take a few seconds; the log then warns that a device query or a `pactl` call did not finish, and the app goes on without waiting for it.
+The app creates the virtual microphone itself while "Mic to call" is on: a "Sound-Babound Mic" input (`sound_babound_mic`), fed by an output named "Sound-Babound Sink" (`sound_babound_sink`) that the app writes the call mix to. Do not choose either one as your default device. The app removes both when you turn "Mic to call" off or quit, and removes any that a crashed run left behind before it creates them again. If the sound server restarts while "Mic to call" is on, the app creates them again within a few seconds. It creates them whenever "Mic to call" is on, even if `virtual_device` names another output. There is nothing to install apart from `pactl`, which it uses to create the devices: install `pulseaudio-utils` on Debian or Ubuntu, or `libpulse` on Arch. This works with both PulseAudio and PipeWire (through `pipewire-pulse`). On Linux the virtual microphone and the microphone passthrough use the PulseAudio API; the sounds you hear still play through ALSA's `default` device. The `pactl` calls run in the background, so the tray stays responsive while the devices are created or removed; the status line shows "starting" meanwhile. If the sound server stops answering, turning "Mic to call" off can take a few seconds and quitting up to about 13 seconds; the log then warns that a device query, a `pactl` call or the virtual mic worker did not finish, and the app goes on without waiting for it.
 
 In the call app, choose "Sound-Babound Mic" as the microphone. `mic-check` does not create the device, so it reports it as not found unless the tray app is running with "Mic to call" on.
 
@@ -243,7 +243,7 @@ The greyed-out status line in the tray menu shows the state of the virtual micro
 | Status | Meaning |
 |--------|---------|
 | Virtual mic: off | "Mic to call" is off. |
-| Virtual mic: starting | The virtual device is being opened. |
+| Virtual mic: starting | The virtual device is being opened (on Linux, also while the app creates it, or while it waits for the previous mic stream to stop). |
 | Virtual mic: BlackHole 2ch (active) | The call mix is going to that device. |
 | Virtual mic: … (active, microphone access denied) | The call hears the sounds only. On macOS, allow the microphone as described above. |
 | Virtual mic: … (active, microphone unavailable: *reason*) | The microphone cannot be opened, and the call hears the sounds only. The reason is "default input is the virtual mic device" (choose a real microphone as the default input), "no input device", "input device not found", or "error, see log" (the log has the full error). |
@@ -273,6 +273,8 @@ Keys:
 - arrows `Up`, `Down`, `Left`, `Right`
 - numpad `Num0`–`Num9`
 - punctuation: `Minus`, `Equal`, `Comma`, `Period`, `Slash`, `Semicolon`, `Quote`, `Backquote`, `BracketLeft`, `BracketRight`, `Backslash`
+
+Key names are key positions, named as on a US layout: on another layout a name means the key in that place (on AZERTY, `Q` is the key labelled A).
 
 A hotkey that does not parse, or that is already used by an earlier entry, is skipped with a warning in the log. The sound stays playable from the tray menu. If another application already holds a hotkey, registering it fails. That failure is logged too, and the rest still work.
 

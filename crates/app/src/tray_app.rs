@@ -583,7 +583,7 @@ impl TrayApp {
     /// virtual device waits for a mic stream that did not stop in time.
     /// Leaves an exit alone.
     fn schedule_mic_poll(&mut self, control_flow: &mut ControlFlow) {
-        if self.audio.is_none() || matches!(control_flow, ControlFlow::ExitWithCode(_)) {
+        if matches!(control_flow, ControlFlow::ExitWithCode(_)) {
             return;
         }
         let Some(audio) = &self.audio else {

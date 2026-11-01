@@ -417,6 +417,20 @@ mod tests {
     }
 
     #[test]
+    fn waiting_on_a_connect_that_never_completes_times_out() {
+        // A socket that was never connected has no peer and no error, as a
+        // connect still in progress has.
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).expect("socket");
+        let timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        let err = wait_connected(&socket, timeout).expect_err("never connected");
+        let took = started.elapsed();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(took >= timeout, "took {took:?}");
+        assert!(took < timeout + Duration::from_secs(1), "took {took:?}");
+    }
+
+    #[test]
     fn a_missing_socket_fails_the_probe() {
         let path = socket_path("missing");
         assert!(!server_answers(&path, Vec::new(), Duration::from_secs(2)));
