@@ -429,6 +429,17 @@ impl TrayApp {
         }
     }
 
+    /// Creates the app's own virtual device again if the mic sink cannot
+    /// find it because it is gone (a sound server restart drops it).
+    fn restore_virtual_mic(&mut self) {
+        if !matches!(self.mic_status(), MicStatus::NotFound(_)) {
+            return;
+        }
+        if let Some(audio) = &mut self.audio {
+            audio.restore_device(Instant::now());
+        }
+    }
+
     /// The engine's current mic status.
     fn mic_status(&self) -> MicStatus {
         self.audio
@@ -472,6 +483,7 @@ impl TrayApp {
         );
         if refresh {
             self.recheck_capture();
+            self.restore_virtual_mic();
             self.refresh_mic_status();
         }
         self.next_mic_poll = next;

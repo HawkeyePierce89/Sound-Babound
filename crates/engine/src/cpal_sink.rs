@@ -170,7 +170,7 @@ pub(crate) fn stream_info(
 ) -> StreamInfo {
     StreamInfo {
         identity: identity_of(device),
-        device_name: device.to_string(),
+        device_name: device_name(device),
         sample_rate: supported.sample_rate(),
         channels: supported.channels(),
         sample_format: supported.sample_format().to_string(),
@@ -181,15 +181,31 @@ pub(crate) fn stream_info(
 pub(crate) fn identity_of(device: &cpal::Device) -> DeviceIdentity {
     match device.id() {
         Ok(id) => DeviceIdentity::new(id.to_string()),
-        Err(_) => DeviceIdentity::new(device.to_string()),
+        Err(_) => DeviceIdentity::new(device_name(device)),
     }
 }
+
+/// The display name of `device`: its description's name, else its id, else
+/// a placeholder. Never through cpal's `Display`, which fails for a device
+/// the backend can no longer describe (one that just went away), and
+/// `to_string` would then panic on the supervisor thread.
+pub(crate) fn device_name(device: &cpal::Device) -> String {
+    match device.description() {
+        Ok(description) => description.name().to_string(),
+        Err(_) => device
+            .id()
+            .map_or_else(|_| UNKNOWN_DEVICE.to_string(), |id| id.to_string()),
+    }
+}
+
+/// The name of a device that has neither a description nor an id.
+const UNKNOWN_DEVICE: &str = "<unknown device>";
 
 /// The display name and, when the backend has one, the id of `device`: the
 /// strings a device pattern is matched against.
 pub(crate) fn device_labels(device: &cpal::Device) -> (String, Option<String>) {
     (
-        device.to_string(),
+        device_name(device),
         device.id().ok().map(|id| id.to_string()),
     )
 }

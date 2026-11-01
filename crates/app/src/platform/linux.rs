@@ -87,9 +87,10 @@ type PactlRunner = fn(&[String]) -> anyhow::Result<String>;
 /// plays into and a source remapped from its monitor, created through
 /// `pactl` (so it works on PulseAudio and pipewire-pulse alike).
 ///
-/// Dropping it unloads both modules, the source first.
+/// Dropping it unloads both modules, the source first, if they are still
+/// loaded.
 pub struct VirtualMic {
-    _device: super::PactlDevice<PactlRunner>,
+    device: super::PactlDevice<PactlRunner>,
 }
 
 impl VirtualMic {
@@ -98,8 +99,14 @@ impl VirtualMic {
     pub fn create() -> anyhow::Result<Self> {
         let run: PactlRunner = run_pactl;
         super::PactlDevice::create(run)
-            .map(|device| Self { _device: device })
+            .map(|device| Self { device })
             .context("could not create the virtual mic through pactl")
+    }
+
+    /// Whether both modules are still loaded (a sound server restart drops
+    /// them). True when `pactl` cannot tell.
+    pub fn is_present(&mut self) -> bool {
+        self.device.is_loaded()
     }
 }
 

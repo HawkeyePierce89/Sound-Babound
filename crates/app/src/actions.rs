@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use babound_engine::{CaptureStatus, Engine, MicSettings, MicStatus, Sound};
@@ -340,6 +341,25 @@ pub struct WithVirtualMic<C, G, F> {
     control: C,
     device: Option<G>,
     create: F,
+    /// When [`WithVirtualMic::restore_device`] may next check the device.
+    next_check: Option<Instant>,
+}
+
+/// How often [`WithVirtualMic::restore_device`] asks whether the virtual
+/// device still exists. Each check runs `pactl` on the caller's thread.
+pub const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A virtual device the app created itself, which can vanish behind its
+/// back: a sound server restart drops the modules behind the Linux one.
+pub trait VirtualDevice {
+    /// Whether the device still exists; true when that cannot be told.
+    fn is_present(&mut self) -> bool;
+}
+
+impl VirtualDevice for platform::VirtualMic {
+    fn is_present(&mut self) -> bool {
+        platform::VirtualMic::is_present(self)
+    }
 }
 
 impl<C, G, F> WithVirtualMic<C, G, F>
@@ -351,6 +371,7 @@ where
             control,
             device: None,
             create,
+            next_check: None,
         }
     }
 
@@ -373,6 +394,38 @@ where
         } = self;
         stop(control);
         drop(device);
+    }
+}
+
+impl<C, G, F> WithVirtualMic<C, G, F>
+where
+    G: VirtualDevice,
+    F: FnMut() -> Result<Option<G>>,
+{
+    /// Creates the virtual device again if it is gone (for example, the
+    /// sound server restarted and dropped its modules), so the mic sink
+    /// finds it on its next retry. Does nothing with no device, and checks
+    /// at most every [`DEVICE_CHECK_INTERVAL`]. The tray calls it while the
+    /// mic sink reports its device not found.
+    pub fn restore_device(&mut self, now: Instant) {
+        let Some(device) = &mut self.device else {
+            return;
+        };
+        if self.next_check.is_some_and(|next| now < next) {
+            return;
+        }
+        self.next_check = Some(now + DEVICE_CHECK_INTERVAL);
+        if device.is_present() {
+            return;
+        }
+        tracing::warn!(
+            "the virtual mic is gone (did the sound server restart?); creating it again"
+        );
+        self.device = None;
+        match (self.create)() {
+            Ok(device) => self.device = device,
+            Err(err) => tracing::error!("{err:#}; the virtual mic is unavailable"),
+        }
     }
 }
 
@@ -547,8 +600,9 @@ pub fn reload(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
+    use std::rc::Rc;
 
     use global_hotkey::hotkey::{Code, Modifiers};
 
@@ -1384,6 +1438,98 @@ mod tests {
         assert!(!audio.has_device());
         assert_eq!(*attempts.borrow(), 2);
         assert_eq!(*log.borrow(), ["mic on", "mic on"]);
+    }
+
+    /// A device whose presence the test controls; logs its checks and drop.
+    struct VanishingDevice {
+        log: Log,
+        present: Rc<Cell<bool>>,
+    }
+
+    impl VirtualDevice for VanishingDevice {
+        fn is_present(&mut self) -> bool {
+            self.log.borrow_mut().push("device checked");
+            self.present.get()
+        }
+    }
+
+    impl Drop for VanishingDevice {
+        fn drop(&mut self) {
+            self.log.borrow_mut().push("device dropped");
+        }
+    }
+
+    #[test]
+    fn a_vanished_device_is_created_again_at_most_every_check_interval() {
+        let log = Log::default();
+        let present = Rc::new(Cell::new(true));
+        let (device_log, device_present) = (log.clone(), present.clone());
+        let mut audio = WithVirtualMic::new(
+            LoggingAudio {
+                log: log.clone(),
+                fail_mic: false,
+            },
+            move || -> Result<Option<VanishingDevice>> {
+                device_log.borrow_mut().push("device created");
+                device_present.set(true);
+                Ok(Some(VanishingDevice {
+                    log: device_log.clone(),
+                    present: device_present.clone(),
+                }))
+            },
+        );
+        let start = Instant::now();
+        // With no device there is nothing to check.
+        audio.restore_device(start);
+        audio.set_mic(on()).unwrap();
+        audio.restore_device(start);
+        present.set(false);
+        // Too early for another check.
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL / 2);
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL);
+        assert!(audio.has_device());
+        assert_eq!(
+            *log.borrow(),
+            [
+                "device created",
+                "mic on",
+                "device checked",
+                "device checked",
+                "device dropped",
+                "device created"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_device_that_cannot_be_created_again_is_logged_and_dropped() {
+        let log = Log::default();
+        let present = Rc::new(Cell::new(true));
+        let created = Rc::new(Cell::new(false));
+        let (device_log, device_present, done) = (log.clone(), present.clone(), created.clone());
+        let mut audio = WithVirtualMic::new(
+            LoggingAudio {
+                log: log.clone(),
+                fail_mic: false,
+            },
+            move || -> Result<Option<VanishingDevice>> {
+                if done.replace(true) {
+                    anyhow::bail!("pactl did not finish within 3s");
+                }
+                Ok(Some(VanishingDevice {
+                    log: device_log.clone(),
+                    present: device_present.clone(),
+                }))
+            },
+        );
+        audio.set_mic(on()).unwrap();
+        present.set(false);
+        audio.restore_device(Instant::now());
+        assert!(!audio.has_device());
+        assert_eq!(
+            *log.borrow(),
+            ["mic on", "device checked", "device dropped"]
+        );
     }
 
     #[test]

@@ -310,7 +310,7 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 - [x] Resolve it into `MicConfig`: gains clamped like the existing gains (with a warning); an empty `virtual_device` falls back to the default with a warning.
 - [x] Per-OS defaults in `platform`:
   - `default_virtual_device()`: "BlackHole" on macOS, "CABLE Input" on Windows, "sound_babound_sink" on Linux;
-  - `virtual_input_exclusions(pattern)`: the pattern itself plus "CABLE Output" on Windows, and the pattern plus "sound_babound_mic" on Linux;
+  - `virtual_input_exclusions(pattern)`: the pattern itself plus "CABLE Output" on Windows (and, for a custom cable, the pattern with its last "input" changed to "Output"), and the pattern plus "sound_babound_mic" on Linux;
   - `virtual_mic_hint()`.
 - [x] Add a commented `[mic]` block to `DEFAULT_CONFIG`.
 - [x] `config::set_mic_enabled(path, bool)` uses `toml_edit`. It keeps comments, creates `[mic]` if missing and writes atomically (temp file and rename).

@@ -70,6 +70,14 @@ pub fn virtual_device_missing_hint() -> &'static str {
 #[cfg(not(target_os = "linux"))]
 pub enum VirtualMic {}
 
+#[cfg(not(target_os = "linux"))]
+impl VirtualMic {
+    /// Never called: there is no value to call it on.
+    pub fn is_present(&mut self) -> bool {
+        match *self {}
+    }
+}
+
 /// Everywhere but Linux there is no virtual device to create.
 #[cfg(not(target_os = "linux"))]
 pub fn create_virtual_mic() -> anyhow::Result<Option<VirtualMic>> {
@@ -205,14 +213,14 @@ fn unload_module_args(id: u32) -> Vec<String> {
 /// How long one `pactl` call may take. `pactl` waits on the sound server with
 /// no timeout of its own, so a server that stops answering would otherwise
 /// freeze the tray's event loop on mic on, mic off or quit.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 const PACTL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Runs `command` with its stdout and stderr captured, and kills it if it
 /// has not finished after `timeout`. `Ok(None)` means it was killed. The
 /// pipes are read on their own threads, so a large output cannot block the
 /// child.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn output_within(
     mut command: std::process::Command,
     timeout: std::time::Duration,
@@ -261,7 +269,7 @@ fn output_within(
 }
 
 /// Reads `pipe` to its end on a new thread.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn read_to_end_in_background(
     mut pipe: impl std::io::Read + Send + 'static,
 ) -> std::io::Result<std::thread::JoinHandle<Vec<u8>>> {
@@ -372,9 +380,46 @@ impl<R: FnMut(&[String]) -> anyhow::Result<String>> PactlDevice<R> {
 }
 
 #[cfg(any(target_os = "linux", test))]
+impl<R: FnMut(&[String]) -> anyhow::Result<String>> PactlDevice<R> {
+    /// The ids of this app's modules that are loaded now, or `None` when
+    /// `pactl` cannot list them.
+    fn loaded_modules(&mut self) -> Option<Vec<u32>> {
+        match (self.run)(&list_modules_args()) {
+            Ok(list) => Some(stale_modules(&list)),
+            Err(err) => {
+                tracing::warn!("could not list the sound server's modules: {err:#}");
+                None
+            }
+        }
+    }
+
+    /// Whether both modules are still loaded. A sound server restart drops
+    /// them (and reuses their indices). True when `pactl` cannot tell, so a
+    /// server that stopped answering does not cause a re-creation.
+    fn is_loaded(&mut self) -> bool {
+        let (sink, source) = (self.sink, self.source);
+        self.loaded_modules()
+            .is_none_or(|ours| ours.contains(&sink) && ours.contains(&source))
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
 impl<R: FnMut(&[String]) -> anyhow::Result<String>> Drop for PactlDevice<R> {
+    /// Unloads the two modules, the source first, but only while they are
+    /// still this app's: after a sound server restart their indices may
+    /// belong to someone else's modules. If `pactl` cannot list them, both
+    /// are left loaded, and the next [`PactlDevice::create`] unloads them as
+    /// stale.
     fn drop(&mut self) {
+        let Some(ours) = self.loaded_modules() else {
+            tracing::warn!("the virtual mic modules were left loaded");
+            return;
+        };
         for id in [self.source, self.sink] {
+            if !ours.contains(&id) {
+                tracing::debug!(module = id, "the virtual mic module is already gone");
+                continue;
+            }
             if let Err(err) = (self.run)(&unload_module_args(id)) {
                 tracing::warn!(
                     module = id,
@@ -615,15 +660,57 @@ x\tmodule-null-sink\tsink_name=sound_babound_sink
         }
     }
 
+    /// The fake sound server's `list short modules` lines.
+    type Modules = Rc<RefCell<Vec<String>>>;
+
+    /// A fake sound server behind `pactl`, starting with the `initial`
+    /// `list short modules` lines: `load-module` adds a module with the next
+    /// index (31, 32, ...), `unload-module` removes one and `list` prints the
+    /// loaded ones. Clearing the returned lines simulates a server restart.
+    fn live_pactl(initial: &[&str]) -> (Modules, impl Fn(&[String]) -> anyhow::Result<String>) {
+        let modules = Rc::new(RefCell::new(
+            initial
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>(),
+        ));
+        let next = RefCell::new(31u32);
+        let server = Rc::clone(&modules);
+        let respond = move |args: &[String]| -> anyhow::Result<String> {
+            let mut modules = server.borrow_mut();
+            match args[0].as_str() {
+                "list" => Ok(modules.iter().map(|line| format!("{line}\n")).collect()),
+                "load-module" => {
+                    let id = *next.borrow();
+                    *next.borrow_mut() += 1;
+                    let line = if args[1] == "module-null-sink" {
+                        format!("{id}\tmodule-null-sink\tsink_name={PACTL_SINK_NAME}")
+                    } else {
+                        format!("{id}\tmodule-remap-source\tsource_name={PACTL_SOURCE_NAME}")
+                    };
+                    modules.push(line);
+                    Ok(format!("{id}\n"))
+                }
+                "unload-module" => {
+                    let prefix = format!("{}\t", args[1]);
+                    modules.retain(|line| !line.starts_with(&prefix));
+                    Ok(String::new())
+                }
+                _ => Ok(String::new()),
+            }
+        };
+        (modules, respond)
+    }
+
     #[test]
     fn create_unloads_stale_modules_then_loads_sink_then_source() {
         let calls = Rc::new(RefCell::new(Vec::new()));
-        let list = "\
-4\tmodule-null-sink\tsink_name=sound_babound_sink
-5\tmodule-remap-source\tsource_name=sound_babound_mic
-";
-        let device = PactlDevice::create(fake_pactl(&calls, healthy_pactl(list)));
-        let device = device.ok();
+        let (modules, server) = live_pactl(&[
+            "4\tmodule-null-sink\tsink_name=sound_babound_sink",
+            "5\tmodule-remap-source\tsource_name=sound_babound_mic",
+        ]);
+        let device = PactlDevice::create(fake_pactl(&calls, server));
+        let mut device = device.ok();
         assert_eq!(device.as_ref().map(|d| (d.sink, d.source)), Some((31, 32)));
         assert_eq!(
             *calls.borrow(),
@@ -635,32 +722,98 @@ x\tmodule-null-sink\tsink_name=sound_babound_sink
                 remap_source_args(),
             ]
         );
+        assert_eq!(device.as_mut().map(PactlDevice::is_loaded), Some(true));
         calls.borrow_mut().clear();
         drop(device);
         assert_eq!(
             *calls.borrow(),
-            [unload_module_args(32), unload_module_args(31)],
+            [
+                list_modules_args(),
+                unload_module_args(32),
+                unload_module_args(31)
+            ],
             "the source unloads before the sink it reads from"
         );
+        assert!(modules.borrow().is_empty());
     }
 
     #[test]
     fn drop_tries_the_sink_even_when_the_source_unload_fails() {
         let calls = Rc::new(RefCell::new(Vec::new()));
-        let healthy = healthy_pactl("");
+        let (_modules, server) = live_pactl(&[]);
         let device = PactlDevice::create(fake_pactl(&calls, move |args| {
             if args == unload_module_args(32).as_slice() {
                 anyhow::bail!("no such module");
             }
-            healthy(args)
+            server(args)
         }));
         assert!(device.is_ok());
         calls.borrow_mut().clear();
         drop(device);
         assert_eq!(
             *calls.borrow(),
-            [unload_module_args(32), unload_module_args(31)]
+            [
+                list_modules_args(),
+                unload_module_args(32),
+                unload_module_args(31)
+            ]
         );
+    }
+
+    #[test]
+    fn after_a_server_restart_the_device_is_gone_and_drop_unloads_nothing() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (modules, server) = live_pactl(&[]);
+        let device = PactlDevice::create(fake_pactl(&calls, server));
+        let mut device = device.ok();
+        // The restarted server reuses the indices for its own modules.
+        *modules.borrow_mut() = vec![
+            "31\tmodule-device-restore\t".to_string(),
+            "32\tmodule-null-sink\tsink_name=someone_else".to_string(),
+        ];
+        assert_eq!(device.as_mut().map(PactlDevice::is_loaded), Some(false));
+        calls.borrow_mut().clear();
+        drop(device);
+        assert_eq!(*calls.borrow(), [list_modules_args()]);
+        assert_eq!(modules.borrow().len(), 2, "foreign modules stay loaded");
+    }
+
+    #[test]
+    fn a_missing_module_counts_as_gone() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (modules, server) = live_pactl(&[]);
+        let device = PactlDevice::create(fake_pactl(&calls, server));
+        let mut device = device.ok();
+        modules
+            .borrow_mut()
+            .retain(|line| !line.starts_with("32\t"));
+        assert_eq!(device.as_mut().map(PactlDevice::is_loaded), Some(false));
+        calls.borrow_mut().clear();
+        drop(device);
+        assert_eq!(
+            *calls.borrow(),
+            [list_modules_args(), unload_module_args(31)]
+        );
+    }
+
+    #[test]
+    fn an_unanswered_list_keeps_the_device_and_unloads_nothing() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (_modules, server) = live_pactl(&[]);
+        let answering = Rc::new(RefCell::new(true));
+        let up = Rc::clone(&answering);
+        let device = PactlDevice::create(fake_pactl(&calls, move |args| {
+            if !*up.borrow() {
+                anyhow::bail!("pactl list did not finish within 3s");
+            }
+            server(args)
+        }));
+        let mut device = device.ok();
+        *answering.borrow_mut() = false;
+        assert_eq!(device.as_mut().map(PactlDevice::is_loaded), Some(true));
+        calls.borrow_mut().clear();
+        drop(device);
+        assert_eq!(*calls.borrow(), [list_modules_args()]);
     }
 
     #[test]
