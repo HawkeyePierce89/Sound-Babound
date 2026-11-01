@@ -323,15 +323,16 @@ Part B fixes the five findings from the stage 2 acceptance review:
 - Create: `crates/app/src/mic_report.rs`
 - Modify: `crates/app/src/cli.rs`
 
-- [ ] Move `MicCheck`, `MicReport`, `format_mic_check`, `describe`, `access_text` and `mic_config_at` from `cli.rs` into `mic_report.rs` with their tests. `run_mic_check` uses them unchanged.
-- [ ] The excluded-default line says the tray's capture stays on the last physical input it used, if there was one. This is the B.5/Part A wording.
-- [ ] Add a `status_check(path) -> MicCheck` helper. It reads `[mic]` without creating the file, then reads `microphone_access` and `probe_mic`, for the window's background refresher.
-- [ ] Tests: `format_mic_check` for every probe variant:
+- [x] Move `MicCheck`, `MicReport`, `format_mic_check`, `describe`, `access_text` and `mic_config_at` from `cli.rs` into `mic_report.rs` with their tests. `run_mic_check` uses them unchanged.
+- [x] The excluded-default line says the tray's capture stays on the last physical input it used, if there was one. This is the B.5/Part A wording.
+- [x] Add a `status_check(path) -> MicCheck` helper. It reads `[mic]` without creating the file, then reads `microphone_access` and `probe_mic`, for the window's background refresher.
+- [x] Tests: `format_mic_check` for every probe variant:
   - sink found, sink not found, sink with another error;
   - capture `None` (permission denied), capture running, capture with an excluded default and a fallback, `FeedbackExcluded`, `NoDevice`, another capture error;
   - each `MicrophoneAccess` value;
   - the preference line from Task 2.
-- [ ] Run the verification gates. All must pass before Task 10.
+  - Note: `run_mic_check` and `status_check` share `check_with(config, mic, notes, access, probe)`, which takes the probe as a closure so the tests use a fake one. `status_check` itself is `expect(dead_code)` until Task 10 wires it in.
+- [x] Run the verification gates. All must pass before Task 10.
 
 ### Task 10: `sound-babound settings` window (eframe + rfd)
 

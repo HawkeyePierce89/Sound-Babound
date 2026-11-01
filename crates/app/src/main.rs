@@ -6,6 +6,7 @@ mod config;
 mod hotkeys;
 mod icon;
 mod logging;
+mod mic_report;
 mod paths;
 mod platform;
 #[cfg_attr(
