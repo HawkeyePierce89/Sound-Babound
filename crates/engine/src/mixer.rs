@@ -324,8 +324,10 @@ impl Mixer {
     ///
     /// Voices and their source positions are kept, so playback continues
     /// where it was after a stream rebuild. The passthrough reader, if any,
-    /// gets the new rate (a change re-primes it) and forgets the sink block it
-    /// recorded, since the new stream may have another buffer size.
+    /// gets the new rate and re-primes at every call (a changed rate also
+    /// resets its resampler and controller; the same rate keeps the learned
+    /// correction), and forgets the sink block it recorded, since the new
+    /// stream may have another buffer size.
     pub fn configure(&mut self, sample_rate: u32, channels: u16) {
         self.sample_rate = sample_rate;
         self.channels = usize::from(channels);
@@ -1423,7 +1425,7 @@ mod tests {
         render(&mut m, 16);
         assert!(reader(&m).is_primed());
         m.configure(48_000, 1);
-        assert!(reader(&m).is_primed(), "the same rate keeps the reader");
+        assert!(!reader(&m).is_primed(), "the same rate re-primes");
         m.configure(44_100, 2);
         assert!(!reader(&m).is_primed(), "a new rate re-primes");
 

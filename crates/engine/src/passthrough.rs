@@ -24,11 +24,14 @@
 //!
 //! - The writer side ([`PassthroughShared::write`]) runs in the capture
 //!   callback. It downmixes to mono, pushes, and trims the oldest audio if
-//!   the fill passes the high mark: the published target plus
-//!   `max(HIGH_MARK_MARGIN, capture block + BLOCK_MARGIN)`.
+//!   the fill passes the high mark: the published target (at least the
+//!   fallback target, `max(TARGET_FILL, capture block + BLOCK_MARGIN)`,
+//!   which also covers a target published before the first capture block)
+//!   plus `max(HIGH_MARK_MARGIN, capture block + BLOCK_MARGIN)`.
 //! - The reader side ([`PassthroughReader::read`]) runs in the mic sink
 //!   callback. It outputs silence until the ring holds the effective target
-//!   (priming), and re-primes after an underrun or when a new capture starts.
+//!   (priming), and re-primes after an underrun, when a new capture starts,
+//!   or when the mic sink is reconfigured ([`PassthroughReader::set_sink_rate`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -75,6 +78,17 @@ fn samples_for(rate: u32, duration: Duration) -> usize {
 /// The target fill at `rate`, in mono samples.
 fn target_samples(rate: u32) -> usize {
     samples_for(rate, TARGET_FILL)
+}
+
+/// The writer's target before the reader published one, in mono samples:
+/// [`TARGET_FILL`], or one capture block plus [`BLOCK_MARGIN`] if that is
+/// more, at most [`MAX_TARGET`]. With it the high mark is at least two
+/// blocks plus two margins, so the first two capture blocks never trim.
+/// Integer math only, realtime-safe.
+fn fallback_target(rate: u32, capture_block: usize) -> usize {
+    target_samples(rate)
+        .max(capture_block.saturating_add(samples_for(rate, BLOCK_MARGIN)))
+        .min(MAX_TARGET)
 }
 
 /// The fill above which the writer trims, in mono samples, for a `target`
@@ -181,9 +195,11 @@ impl PassthroughShared {
     /// capture block. One overrun is counted per block that displaced the
     /// oldest samples from a full ring or pushed the fill past the high mark;
     /// in the latter case the oldest samples are popped until the fill is
-    /// back at the target (the published one, or [`TARGET_FILL`] before the
-    /// reader published any). Once the passthrough is closed, the block is
-    /// dropped (the heartbeat still moves).
+    /// back at the target: the published one, but at least the fallback
+    /// target `max(TARGET_FILL, capture block + BLOCK_MARGIN)`, so the first
+    /// two capture blocks never trim, even when the reader published a
+    /// target before the first capture block. Once the passthrough is
+    /// closed, the block is dropped (the heartbeat still moves).
     pub fn write<T: InputSample>(&self, data: &[T], channels: usize) {
         if channels > 0 && !self.is_closed() {
             let scale = 1.0 / channels as f32;
@@ -197,10 +213,13 @@ impl PassthroughShared {
                 .fetch_max(data.len() / channels, Ordering::AcqRel)
                 .max(data.len() / channels);
             let rate = self.capture_rate.load(Ordering::Acquire);
-            let target = match self.target.load(Ordering::Acquire) {
-                0 => target_samples(rate),
-                published => published,
-            };
+            // The published target, but never below the fallback: a reader
+            // that read before the first capture block published a target
+            // without it.
+            let target = self
+                .target
+                .load(Ordering::Acquire)
+                .max(fallback_target(rate, capture_block));
             if rate > 0 && self.ring.len() > high_mark_samples(rate, target, capture_block) {
                 while self.ring.len() > target && self.ring.pop().is_some() {}
                 overrun = true;
@@ -335,14 +354,20 @@ impl PassthroughReader {
 
     /// Set the mic sink's rate. Called from `Mixer::configure`, before a new
     /// stream starts: it forgets the recorded sink block (the new stream may
-    /// have another buffer size), and a rate change resets the resampler and
-    /// the controller.
+    /// have another buffer size) and re-primes at every call, since the new
+    /// stream's target may be higher. A rate change also resets the resampler
+    /// and the controller; with the same rate the learned correction, integral
+    /// and fill error are kept (the clock ratio is the same), and the EMA is
+    /// only re-seeded.
     pub fn set_sink_rate(&mut self, rate: u32) {
         self.sink_block = 0;
         self.callback_left = 0;
         if rate != self.sink_rate {
             self.sink_rate = rate;
             self.reset();
+        } else {
+            self.primed = false;
+            self.fresh = true;
         }
     }
 
@@ -626,7 +651,7 @@ mod tests {
         let shared = shared_at(48_000);
         let mut reader = shared.reader();
         reader.set_sink_rate(48_000);
-        // Before any target is published: 30 ms + max(50 ms, block + 5 ms).
+        // The high mark for a target: target + max(50 ms, block + 5 ms).
         assert_eq!(high_mark_samples(48_000, 1_440, 2_048), 3_840);
         assert_eq!(high_mark_samples(48_000, 1_440, 4_096), 1_440 + 4_336);
 
@@ -855,9 +880,94 @@ mod tests {
         reader.read(&mut out);
         assert!(reader.is_primed());
         reader.set_sink_rate(48_000);
-        assert!(reader.is_primed(), "the same rate keeps the state");
+        assert!(!reader.is_primed(), "the same rate re-primes");
         reader.set_sink_rate(44_100);
         assert!(!reader.is_primed());
+    }
+
+    #[test]
+    fn the_same_sink_rate_re_primes_and_keeps_the_correction() {
+        let shared = shared_at(48_000);
+        let mut reader = shared.reader();
+        reader.set_sink_rate(48_000);
+        // A fill well above the target: the first controller step moves the
+        // correction (to its clamp).
+        for _ in 0..4 {
+            shared.write(&[0.5f32; 480], 1);
+        }
+        let mut out = vec![0.0f32; 512];
+        reader.note_block(512);
+        reader.read(&mut out);
+        assert!(reader.is_primed());
+        let correction = reader.correction();
+        let integral = reader.integral;
+        assert!(correction > 0.0, "the controller learned something");
+        assert!(integral > 0.0);
+
+        reader.set_sink_rate(48_000);
+        assert!(!reader.is_primed(), "the same rate re-primes");
+        assert_eq!(reader.correction(), correction, "and keeps the correction");
+        assert_eq!(reader.integral, integral, "and the integral");
+
+        // A 2048-frame sink callback raises the target above the fill.
+        reader.note_block(2_048);
+        let mut long = vec![1.0f32; 2_048];
+        reader.read(&mut long);
+        let target = shared.published_target();
+        assert!(target > shared.fill());
+        assert!(!reader.is_primed(), "below the new target");
+        assert!(long.iter().all(|&s| s == 0.0));
+        assert_eq!(shared.underruns(), 0);
+        assert_eq!(reader.correction(), correction, "priming does not step");
+
+        while shared.fill() < target {
+            shared.write(&[0.5f32; 480], 1);
+        }
+        reader.note_block(2_048);
+        reader.read(&mut long);
+        assert!(reader.is_primed());
+        assert_eq!(shared.underruns(), 0);
+        assert!(
+            reader.integral >= integral,
+            "the first step after priming builds on the learned integral"
+        );
+    }
+
+    #[test]
+    fn the_first_capture_blocks_never_trim_before_a_target_is_published() {
+        assert_eq!(fallback_target(48_000, 480), 1_440);
+        assert_eq!(fallback_target(48_000, 2_048), 2_288);
+        assert_eq!(fallback_target(48_000, 4_096), 4_336);
+        assert_eq!(fallback_target(MAX_CAPTURE_RATE, 60_000), MAX_TARGET);
+
+        for (block, fill) in [(2_048usize, 4_096usize), (4_096, 8_192)] {
+            let shared = shared_at(48_000);
+            let data = vec![0.0f32; block];
+            shared.write(&data, 1);
+            shared.write(&data, 1);
+            assert_eq!(shared.published_target(), 0, "no reader yet");
+            assert_eq!(shared.overruns(), 0, "{block}-frame blocks");
+            assert_eq!(shared.fill(), fill, "{block}-frame blocks");
+        }
+    }
+
+    #[test]
+    fn a_target_published_before_the_first_capture_block_does_not_trim() {
+        // The mic sink is already running when the capture starts: its read
+        // publishes a target without the capture block, which is still 0.
+        let shared = shared_at(48_000);
+        let mut reader = shared.reader();
+        reader.set_sink_rate(48_000);
+        let mut out = vec![0.0f32; 480];
+        reader.read(&mut out);
+        assert_eq!(shared.published_target(), 1_440);
+
+        // Two 4096-frame capture blocks arrive back to back.
+        let data = vec![0.0f32; 4_096];
+        shared.write(&data, 1);
+        shared.write(&data, 1);
+        assert_eq!(shared.overruns(), 0);
+        assert_eq!(shared.fill(), 8_192);
     }
 
     #[test]
@@ -1011,6 +1121,18 @@ mod tests {
         /// 3.5 minutes at 200 ppm), so the controller corrects in a burst at
         /// each slip and a one-minute mean says nothing. No controller can
         /// spread it out from the order of the callbacks alone.
+        ///
+        /// For a 2048-frame capture block at 48 kHz the tolerance is 20 ppm
+        /// plus one capture block over the 540 s span, about 99 ppm; for a
+        /// 4096-frame block about 178 ppm, so there the deviation and
+        /// overrun/underrun asserts do most of the checking. The
+        /// ±200 ppm sink clocks prove the controller alive: without a
+        /// correction the fill would drift 9.6 samples/s, past one block in
+        /// about 3.5 minutes, and the deviation and overrun/underrun asserts
+        /// would fail. The 48000.5 Hz variant (about 10 ppm, about 300
+        /// samples in 10 minutes) passes even with a dead controller; it only
+        /// proves the controller harmless: no runaway, no underrun or
+        /// overrun, the fill inside the bound.
         Settled,
     }
 
@@ -1189,6 +1311,46 @@ mod tests {
                     capture_clock: 44_100.0,
                     sink_rate: 48_000,
                     sink_clock,
+                },
+                Blocks {
+                    capture: 480,
+                    sink: 2_048,
+                },
+                CorrectionCheck::Late,
+            );
+        }
+    }
+
+    #[test]
+    fn drift_with_4096_frame_blocks_holds_the_target() {
+        // Here capture block + BLOCK_MARGIN (90.3 ms) is more than
+        // HIGH_MARK_MARGIN (50 ms): the high mark's capture-block branch.
+        for sink_clock in SINK_CLOCKS {
+            assert_holds_with_long_blocks(
+                Clocks {
+                    capture_rate: 48_000,
+                    capture_clock: 48_000.0,
+                    sink_rate: 48_000,
+                    sink_clock,
+                },
+                Blocks {
+                    capture: 4_096,
+                    sink: 4_096,
+                },
+                CorrectionCheck::Settled,
+            );
+        }
+    }
+
+    #[test]
+    fn drift_48k_to_44k1_with_a_2048_frame_sink_block_holds_the_target() {
+        for sink_clock in SINK_CLOCKS {
+            assert_holds_with_long_blocks(
+                Clocks {
+                    capture_rate: 48_000,
+                    capture_clock: 48_000.0,
+                    sink_rate: 44_100,
+                    sink_clock: sink_clock * 44_100.0 / 48_000.0,
                 },
                 Blocks {
                     capture: 480,

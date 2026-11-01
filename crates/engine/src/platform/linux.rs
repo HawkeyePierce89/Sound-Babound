@@ -6,7 +6,7 @@
 //! The mic paths need PulseAudio, because only it lists the app's null sink
 //! and remapped source by name. PipeWire answers it through pipewire-pulse.
 
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -68,11 +68,13 @@ fn shared_pulse_host() -> Option<Arc<cpal::Host>> {
 /// failed builds retry every second. The probe uses a socket of its own
 /// with a timeout and leaves nothing behind. It runs inside
 /// [`SharedHost::get`]'s connect, under its lock, so probes and connects
-/// never overlap. A failed probe holds further probes off (doubling up to a
-/// minute), since a timed-out one blocks every mic caller behind that lock
-/// for its whole timeout and the pollers ask every second. A server can
-/// still answer the probe and stall the connect right after it; each such
-/// failure holds connects off for longer too, and after
+/// never overlap. A failed probe holds further probes off (doubling up to
+/// [`PROBE_HOLD_OFF_MAX`](super::shared_host::PROBE_HOLD_OFF_MAX), 10 s),
+/// since a timed-out one blocks every mic caller behind that lock for at
+/// most the probe's deadline ([`PROBE_TIMEOUT`]) and the pollers ask every
+/// second. A server can still answer the probe and stall the connect right
+/// after it; each such failure holds connects off for longer (doubling up to
+/// a minute, and a probe failure after one keeps that hold-off), and after
 /// [`MAX_STALLED_CONNECTS`] stalled connects no PulseAudio connect is tried
 /// again in this process (the mic paths fall back to ALSA), so at most that
 /// many threads ever leak.
@@ -114,8 +116,8 @@ fn connect_pulse() -> Option<cpal::Host> {
     }
 }
 
-/// How long [`pulse_server_answers`] waits for each read and write: cpal's
-/// own handshake timeout.
+/// The deadline of the whole probe in [`pulse_server_answers`], the connect
+/// and both handshake messages together: cpal's own handshake timeout.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Whether the PulseAudio server the environment names answers both
@@ -142,15 +144,54 @@ enum Answer<T> {
     Silent,
 }
 
+/// A stream that fails with `TimedOut` once its deadline has passed, and
+/// before every call limits the socket's read or write timeout to the time
+/// left. One deadline then holds over a whole exchange, even against a
+/// server that answers a byte at a time (a fixed timeout restarts on every
+/// byte).
+#[derive(Clone, Copy)]
+struct Deadlined<'a> {
+    socket: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl Deadlined<'_> {
+    /// The time left, or `TimedOut` if there is none (a zero socket timeout
+    /// is not allowed, and means no timeout elsewhere).
+    fn left(&self) -> io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::ErrorKind::TimedOut.into())
+    }
+}
+
+impl Read for Deadlined<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.socket.set_read_timeout(Some(self.left()?))?;
+        self.socket.read(buf)
+    }
+}
+
+impl Write for Deadlined<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.socket.set_write_timeout(Some(self.left()?))?;
+        self.socket.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Sends `command` with sequence number `seq` and reads the reply.
 fn roundtrip<T: protocol::CommandReply>(
-    socket: &UnixStream,
-    reader: &mut BufReader<&UnixStream>,
+    reader: &mut BufReader<Deadlined<'_>>,
     seq: u32,
     command: &protocol::Command,
     version: u16,
 ) -> Answer<T> {
-    let mut writer = socket;
+    let mut writer = *reader.get_ref();
     if protocol::write_command_message(&mut writer, seq, command, version).is_err() {
         return Answer::Silent;
     }
@@ -164,35 +205,32 @@ fn roundtrip<T: protocol::CommandReply>(
 /// How often [`connect_within`] checks a connect still in progress.
 const CONNECT_POLL: Duration = Duration::from_millis(5);
 
-/// Connects a stream socket to `path` without ever blocking for longer than
-/// `timeout`, and returns it in blocking mode with `timeout` on every read
-/// and write. A plain blocking connect waits, without a timeout, while the
-/// listener's backlog is full (a server that stopped accepting).
+/// Connects a stream socket to `path` without ever blocking past `deadline`,
+/// and returns it in blocking mode (the caller sets read and write timeouts).
+/// A plain blocking connect waits, without a timeout, while the listener's
+/// backlog is full (a server that stopped accepting).
 ///
 /// The connect is non-blocking: an immediate `EAGAIN` (the backlog is full)
-/// fails at once, and an `EINPROGRESS` is waited out for at most `timeout`,
+/// fails at once, and an `EINPROGRESS` is waited out until `deadline`,
 /// checking the socket every [`CONNECT_POLL`] (a Unix socket connect does
 /// not normally report it, so this is a fallback, kept free of `unsafe`).
-fn connect_within(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+fn connect_within(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
     socket.set_nonblocking(true)?;
     match socket.connect(&SockAddr::unix(path)?) {
         Ok(()) => {}
         Err(err) if err.raw_os_error() == Some(libc::EINPROGRESS) => {
-            wait_connected(&socket, timeout)?;
+            wait_connected(&socket, deadline)?;
         }
         // `WouldBlock` (`EAGAIN`) included: the server accepts no one.
         Err(err) => return Err(err),
     }
     socket.set_nonblocking(false)?;
-    socket.set_read_timeout(Some(timeout))?;
-    socket.set_write_timeout(Some(timeout))?;
     Ok(UnixStream::from(OwnedFd::from(socket)))
 }
 
-/// Waits at most `timeout` for a connect in progress on `socket` to finish.
-fn wait_connected(socket: &Socket, timeout: Duration) -> io::Result<()> {
-    let started = Instant::now();
+/// Waits until `deadline` for a connect in progress on `socket` to finish.
+fn wait_connected(socket: &Socket, deadline: Instant) -> io::Result<()> {
     loop {
         if let Some(err) = socket.take_error()? {
             return Err(err);
@@ -200,7 +238,7 @@ fn wait_connected(socket: &Socket, timeout: Duration) -> io::Result<()> {
         if socket.peer_addr().is_ok() {
             return Ok(());
         }
-        if started.elapsed() >= timeout {
+        if Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
         std::thread::sleep(CONNECT_POLL);
@@ -209,37 +247,38 @@ fn wait_connected(socket: &Socket, timeout: Duration) -> io::Result<()> {
 
 /// Runs the handshake of `pulseaudio::Client::new_unix` (the `Auth`
 /// message, then `SetClientName` at the negotiated version) against the
-/// server at `path` over a new socket with `timeout` on the connect
-/// ([`connect_within`]) and on every read and write. The socket is closed
-/// on return, so a server that never answers keeps nothing of this process.
+/// server at `path` over a new socket. One deadline, `timeout` from now,
+/// covers the connect ([`connect_within`]) and both messages, so the probe
+/// takes at most `timeout` plus one [`CONNECT_POLL`], however slowly the
+/// server answers. The socket is closed on return, so a server that never
+/// answers keeps nothing of this process.
 fn server_answers(path: &Path, cookie: Vec<u8>, timeout: Duration) -> bool {
-    let Ok(socket) = connect_within(path, timeout) else {
+    let deadline = Instant::now() + timeout;
+    let Ok(socket) = connect_within(path, deadline) else {
         return false;
     };
-    let mut reader = BufReader::new(&socket);
+    let mut reader = BufReader::new(Deadlined {
+        socket: &socket,
+        deadline,
+    });
     let auth = protocol::Command::Auth(protocol::AuthParams {
         version: protocol::MAX_VERSION,
         supports_shm: false,
         supports_memfd: false,
         cookie,
     });
-    let version = match roundtrip::<protocol::AuthReply>(
-        &socket,
-        &mut reader,
-        0,
-        &auth,
-        protocol::MAX_VERSION,
-    ) {
-        Answer::Reply(reply) => protocol::MAX_VERSION.min(reply.version),
-        // A refused handshake fails cpal's connect at once, too.
-        Answer::Error => return true,
-        Answer::Silent => return false,
-    };
+    let version =
+        match roundtrip::<protocol::AuthReply>(&mut reader, 0, &auth, protocol::MAX_VERSION) {
+            Answer::Reply(reply) => protocol::MAX_VERSION.min(reply.version),
+            // A refused handshake fails cpal's connect at once, too.
+            Answer::Error => return true,
+            Answer::Silent => return false,
+        };
     let mut props = protocol::Props::new();
     props.set(protocol::Prop::ApplicationName, c"sound-babound probe");
     let name = protocol::Command::SetClientName(props);
     !matches!(
-        roundtrip::<protocol::SetClientNameReply>(&socket, &mut reader, 1, &name, version),
+        roundtrip::<protocol::SetClientNameReply>(&mut reader, 1, &name, version),
         Answer::Silent
     )
 }
@@ -258,7 +297,6 @@ pub const SMOKE_MIC_PATTERN: &str = "sound_babound_sink";
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -376,6 +414,71 @@ mod tests {
     }
 
     #[test]
+    fn a_server_that_answers_slowly_fails_the_probe_within_one_deadline() {
+        let path = socket_path("slow");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let timeout = Duration::from_millis(500);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let (seq, _) =
+                protocol::read_command_message(&mut reader, protocol::MAX_VERSION).expect("auth");
+            // Slow, but inside the timeout: a fixed timeout per message
+            // would give the next message a fresh one.
+            std::thread::sleep(timeout * 7 / 10);
+            let reply = protocol::AuthReply {
+                version: protocol::MAX_VERSION,
+                ..Default::default()
+            };
+            let mut writer = &stream;
+            protocol::write_reply_message(&mut writer, seq, &reply, protocol::MAX_VERSION)
+                .expect("reply");
+            // Read SetClientName and the rest, but never reply.
+            let mut buf = [0u8; 256];
+            while matches!(reader.read(&mut buf), Ok(n) if n > 0) {}
+        });
+        let started = Instant::now();
+        assert!(!server_answers(&path, Vec::new(), timeout));
+        let took = started.elapsed();
+        assert!(took < timeout + Duration::from_millis(300), "took {took:?}");
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn a_server_that_trickles_its_reply_fails_the_probe_within_one_deadline() {
+        let path = socket_path("trickle");
+        let listener = UnixListener::bind(&path).expect("bind");
+        let timeout = Duration::from_millis(500);
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let (seq, _) =
+                protocol::read_command_message(&mut reader, protocol::MAX_VERSION).expect("auth");
+            let reply = protocol::AuthReply {
+                version: protocol::MAX_VERSION,
+                ..Default::default()
+            };
+            let mut bytes = Vec::new();
+            protocol::write_reply_message(&mut bytes, seq, &reply, protocol::MAX_VERSION)
+                .expect("serialize");
+            // One byte every 100 ms: each is well inside the timeout, but
+            // the whole reply takes several times as long.
+            let mut writer = &stream;
+            for byte in bytes {
+                if writer.write_all(&[byte]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let started = Instant::now();
+        assert!(!server_answers(&path, Vec::new(), timeout));
+        let took = started.elapsed();
+        assert!(took < timeout + Duration::from_millis(300), "took {took:?}");
+        server.join().expect("server");
+    }
+
+    #[test]
     fn a_server_whose_backlog_is_full_fails_the_probe_in_time() {
         let path = socket_path("backlog");
         // A listener that never accepts, with the smallest backlog.
@@ -423,7 +526,7 @@ mod tests {
         let socket = Socket::new(Domain::UNIX, Type::STREAM, None).expect("socket");
         let timeout = Duration::from_millis(100);
         let started = Instant::now();
-        let err = wait_connected(&socket, timeout).expect_err("never connected");
+        let err = wait_connected(&socket, started + timeout).expect_err("never connected");
         let took = started.elapsed();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(took >= timeout, "took {took:?}");
