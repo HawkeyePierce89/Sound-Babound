@@ -140,8 +140,8 @@ Replace the single embedded demo chime with a registry of built-in sounds, and e
 - Create: `crates/app/src/settings/audition.rs`
 - Modify: `crates/app/src/settings/mod.rs`, `crates/app/src/settings/view.rs`
 
-- [ ] Add a pure `audition_target(row_path, config_dir) -> Result<OsString, String>`. It uses `SoundSource::resolve`: `Builtin` gives `entry.path` and `File` gives the absolute path. A relative row path is resolved against the config's folder, the way the tray resolves it. A resolve error (empty path, unknown built-in) is shown and nothing is spawned.
-- [ ] Add the spawning trait and the controller:
+- [x] Add a pure `audition_target(row_path, config_dir) -> Result<OsString, String>`. It uses `SoundSource::resolve`: `Builtin` gives `entry.path` and `File` gives the absolute path. A relative row path is resolved against the config's folder, the way the tray resolves it. A resolve error (empty path, unknown built-in) is shown and nothing is spawned.
+- [x] Add the spawning trait and the controller:
   - The trait is `AuditionSpawner { fn spawn(&mut self, id: u64, target: &OsStr) -> Result<Box<dyn RunningAudition>> }`, where `RunningAudition::kill(&mut self)` kills and reaps the child synchronously.
   - The pure controller is `Auditions<S>`:
     - `play(row, target)` stops the current audition first, then spawns with a new id.
@@ -150,20 +150,20 @@ Replace the single embedded demo chime with a registry of built-in sounds, and e
     - `exited(id, ExitReport)` clears the current audition when the id matches and returns the failure message for a non-zero exit. It ignores a stale id, such as one already killed.
     - `row_removed(index)` stops the audition if that row plays, and shifts the index if a row above it was removed.
     - `close()` kills any running child.
-- [ ] Add the real spawner, `ProcessAudition`:
+- [x] Add the real spawner, `ProcessAudition`:
   - The command `fn` is injected, like `ProcessSpawner`. In production it is `current_exe() play --output-only -- <target>`, with stdin and stdout null and stderr piped.
   - The `Child` is shared as `Arc<Mutex<Child>>`, after taking its stderr out.
   - A waiter thread reads stderr to EOF (keeping at most the last 8 KB), then locks and `wait()`s, sends `(id, ExitReport)` on an `mpsc` channel and calls the repaint callback. The UI never polls.
   - `kill` locks, kills (an already-exited child is fine) and waits. Dropping the handle kills, as a backstop.
   - If the waiter thread cannot be started, the child is killed and the spawn fails.
   - A pure `failure_message(stderr, status)` gives the text from the last `Error:` line to the end joined into one line, or the last non-empty line, or the exit status.
-- [ ] Wire it into the window:
+- [x] Wire it into the window:
   - `mod.rs` builds `Auditions<ProcessAudition>` in the eframe creator closure, with `cc.egui_ctx` for the repaint, and passes it and the receiver to `SettingsApp`.
   - Each frame, `view.rs` drains the receiver into `exited` and puts any message on the message line.
   - Each row gets a "Play"/"Stop" button next to its hotkey field, through a new `Edit::Audition(index)`. Play resolves the row's current path and calls `play`; Stop calls `stop`. `Edit::Remove` calls `row_removed`.
   - A spawn or resolve failure goes to the message line.
   - `eframe::App::on_exit` (check the glow-feature signature in eframe 0.37) calls `close()`, so Save, Cancel and the close button all kill a running child.
-- [ ] Controller tests with a fake spawner that records spawns and kills:
+- [x] Controller tests with a fake spawner that records spawns and kills:
   - start: the row reads as playing, and the target is passed through;
   - stop: the child is killed;
   - switching rows: the first is killed before the second is spawned;
@@ -172,12 +172,12 @@ Replace the single embedded demo chime with a registry of built-in sounds, and e
   - a failed spawn leaves nothing playing and returns the error;
   - `row_removed` stops the playing row or shifts it;
   - `close` kills.
-- [ ] Other tests:
+- [x] Other tests:
   - `audition_target`: built-in, relative and absolute file paths, unknown built-in, and empty path;
   - `failure_message` cases;
   - `ProcessAudition` with the test binary and `--list`: the exit is reported once with success, a missing program fails to spawn and reports nothing, and kill after exit is harmless;
   - the production command's args are `["play", "--output-only", "--", target]`.
-- [ ] Run the test suite; it must pass before Task 7.
+- [x] Run the test suite; it must pass before Task 7.
 
 ### Task 7: Verify acceptance criteria
 
