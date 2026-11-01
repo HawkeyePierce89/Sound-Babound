@@ -441,7 +441,7 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 
 ### Task 16: Update documentation
 
-- [ ] README:
+- [x] README:
   - a "Virtual microphone" setup guide per OS:
     - macOS: install BlackHole, noting that it is GPL and installed separately; build the bundle with `scripts/bundle-macos.sh`; the permission prompt and how to re-enable it in System Settings;
     - Windows: install VB-CABLE, select "CABLE Output" as the microphone;
@@ -451,7 +451,7 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
   - the tray items;
   - `mic-check`;
   - the startup fallback (if Task 4 did not already cover it).
-- [ ] CLAUDE.md:
+- [x] CLAUDE.md:
   - the new modules (passthrough, capture, engine `platform/`);
   - the three-role supervisor and the per-role policy table;
   - the play grace window (this replaces the strict "rejected while false" wording);
@@ -460,6 +460,7 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
   - the updated platform-code locations;
   - the bundle script;
   - the no-real-audio rule for agents.
+  (README: features, the tray menu, `play` with the mic, a "Checking the virtual microphone" section for `mic-check`, the `[mic]` reference table, a "Virtual microphone" section with macOS, Windows and Linux setup, the call-app choice and a tray status table, logging of device-changed errors and build-failure throttling, and the project layout; the startup fallback was already covered by Task 4. CLAUDE.md: the realtime rules now name every callback and the passthrough, with a "Passthrough rules" list for the ring, priming and the drift controller; the play grace window replaces the "rejected while false" wording; the rebuild policy has the three roles, the per-role table, the startup grace, `StreamErrorKind`, `FailureLog`, `StreamStatus` and the `Timings` defaults; the platform section lists the app's Linux helper gate and the Linux-only `pulseaudio` feature; a new "No real audio from agents" section. The module list and the bundle script were already documented by earlier tasks.)
 
 ## Post-Completion
 

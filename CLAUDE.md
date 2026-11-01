@@ -34,12 +34,20 @@ A Rust tray soundboard. Plans live in `docs/plans/`.
 
 ## Realtime rules
 
-These apply to the cpal data callback and everything `Mixer::render` reaches:
+These apply to every cpal data callback (the monitor and mic sink outputs and the capture input) and to everything `Mixer::render`, `PassthroughShared::write` and `PassthroughReader::read` reach:
 
 - No allocation and no freeing. Never drop the last `Arc` of a `Sound` there.
 - No blocking lock. Use only `try_lock`, and output silence when it fails.
 - No I/O and no `tracing` macros.
 - The only `push` calls allowed are on the lock-free `ArrayQueue`s.
+
+Passthrough rules:
+
+- The ring is the preallocated `ArrayQueue<f32>` in `PassthroughShared`, mono, 0.5 s at 192 kHz. The capture callback downmixes by averaging, then `force_push`es; a displaced sample counts as an overrun. Past the high mark (target + 50 ms) the writer pops the oldest samples and counts an overrun too. Every write bumps the capture heartbeat.
+- `begin_capture(rate)` empties the ring, stores the rate and bumps the generation. Only a capture build calls it, before its stream starts. The reader resets and re-primes on a generation or rate change.
+- `PassthroughReader` lives in the mic `Mixer` and runs inside `render`. It outputs silence until the fill reaches the 30 ms target (priming). An underrun mid-block counts, outputs silence for the rest of the block and re-primes.
+- Drift controller: linear interpolation at `capture_rate / sink_rate * (1 + correction)`. The correction is a PI controller (`KP`, `KI`) on an EMA-smoothed fill error, clamped to `MAX_CORRECTION` (±0.2 %). Changing it must keep the simulated-clock drift tests passing (10 simulated minutes, 480- vs 512-frame blocks, 48k/48k, 44.1k to 48k, ±200 ppm: fill within target ± 20 ms after 5 s, no underruns, no overruns).
+- The monitor's mixer has no reader, so it can never carry the microphone.
 
 Pending-release rule: every `Sound` that leaves a voice (finished, evicted or stopped) is pushed onto the garbage queue. `drain_garbage()` frees those sounds on the supervisor thread. If the garbage queue is full, the `Sound` goes into a preallocated pending-release slot (`2 * MAX_VOICES` slots). Those slots are retried at the start of every render. Commands are popped only while at least `MAX_VOICES` slots are free, so every release always has somewhere to go. A finished voice with no free slot stays parked, silent and uncounted, until a slot frees up.
 
@@ -47,19 +55,37 @@ Pending-release rule: every `Sound` that leaves a voice (finished, evicted or st
 
 The mixer lives in `Arc<Mutex<Mixer>>`. To rebuild, the supervisor drops the old sink and then calls `StreamFactory::build`, so `build` only ever runs while no stream exists. `build` may lock the mixer freely, and it must call `configure(rate, channels)` before it starts the stream. Once the stream runs, only its callback touches the mixer, through `try_lock`, so that lock never contends. `configure` keeps the voices and their source positions, which is how playback continues across a rebuild.
 
-Only a running stream drains the command queue. `MixerShared::output_active` (`Engine::has_output`) reports whether a stream runs; the supervisor sets it only after `build` returns. `Engine::play` rejects a play (returns false) while it is false, so presses made with no device, or during a build started with no stream, never start late when a stream comes up. A rebuild from a live stream keeps the command queue: plays accepted while the old stream ran, including one whose push races the teardown (the check and the push are not atomic), are applied by the new stream, like the voices it continues. While no stream exists (failed build, retry backoff), each supervisor loop, and every build started with no stream, locks the mixer, which cannot contend then, and calls `Mixer::apply_offline`. It drops any play that passed the check just before the stream went away, and it still applies `StopAll` and `SetMasterGain`. The headless `play` waits for `has_output` before queuing its play, and once the mixer reports no voices it keeps the stream up for the measured output latency (`Engine::output_latency`: the cpal callback timestamps' `playback - callback` plus the duration of the callback's buffer, so it reaches the last written frame; capped at 5 s) plus a 200 ms margin, so the device buffer is heard.
+Only a running stream drains the command queue. `MixerShared::output_active` (`Engine::has_output`) reports whether a stream runs; the supervisor sets it only after `build` returns.
+
+Play grace window: `Engine::play` checks `MixerShared::accepts_plays(now)` per path, which is `output_active || now < grace_until`. When the supervisor drops a live stream for a rebuild, it opens the window for `Timings::play_grace` (1 s); a teardown with no live stream never opens it. So a press made while the output switches devices is accepted and played by the replacement stream, but presses made with no device, or during the initial build or a build after a failed one, are rejected (return false) and never start late when a stream comes up. `grace_until` is an atomic count of nanoseconds since an epoch `Instant` the `MixerShared` owns (0 means closed). A rebuild from a live stream keeps the command queue: plays accepted while the old stream ran or inside the window, including one whose push races the teardown (the check and the push are not atomic), are applied in order by the new stream, like the voices it continues.
+
+While no stream exists and the window is closed (failed build, retry backoff, initial start), each supervisor loop, and every build started with no stream, locks the mixer, which cannot contend then, and calls `Mixer::apply_offline`. It drops any play that passed the check just before the stream went away, or inside a window that expired without a new stream, and it still applies `StopAll`, `SetMasterGain` and `SetPathGains`. While the window is open, that offline purge is skipped. The headless `play` waits for `has_output` before queuing its play, and once the mixer reports no voices it keeps the stream up for the measured output latency (`Engine::output_latency`: the cpal callback timestamps' `playback - callback` plus the duration of the callback's buffer, so it reaches the last written frame; capped at 5 s) plus a 200 ms margin, so the device buffer is heard.
 
 ## Rebuild policy
 
 A rebuild is an audible gap, so not every event triggers one. Events are debounced on the trailing edge, 200 ms after the last event.
 
-- Always rebuild: `DefaultOutputChanged`, a forwarded stream error, and a stalled callback heartbeat (no progress for 2 s). The cpal error callback filters stream errors first (`cpal_sink::needs_rebuild`). `Xrun` and `RealtimeDenied` are dropped, because the stream keeps running and a rebuild would only add a gap.
-- Identity-checked (`IfIdentityChanged`): `DeviceListChanged`, `DeviceStateChanged` and `DeviceRemoved`. The supervisor re-queries the live default output identity (`StreamFactory::current_identity`) and rebuilds only if it differs from the identity the stream was built on (`None` vs `Some` counts as different). Otherwise it logs the event at debug and drops it.
-- Ignored: `DefaultInputChanged`.
-- With no active stream (initial start, or the 1 s retry backoff after a failed build), every non-ignored event rebuilds.
-- Never cache the output device. Every build and every identity check re-queries the default device.
+Three streams, three roles (`StreamRole`): `Monitor` (the default output, always running), `MicSink` (the virtual device's playback side, matched by name) and `Capture` (the default input, feeding the passthrough). Each runs under its own instance of the one generic supervisor (`spawn_supervisor`), with its own factory, endpoint and watcher; only the factory and the policy differ. A rebuild of one role never touches another.
 
-The classification is `DeviceEvent::rebuild_policy(role)`; the rules above are the monitor's (the mic sink ignores both default changes, the capture rebuilds on `DefaultInputChanged` and ignores `DefaultOutputChanged`; all roles identity-check list, state and removed events). The timing logic is the pure `SupervisorCore`, tested with a fake clock.
+The classification is `DeviceEvent::rebuild_policy(role)`:
+
+| Event                  | Monitor           | MicSink           | Capture           |
+|------------------------|-------------------|-------------------|-------------------|
+| `DefaultOutputChanged` | Always            | Ignore            | Ignore            |
+| `DefaultInputChanged`  | Ignore            | Ignore            | Always            |
+| `DeviceListChanged`    | IfIdentityChanged | IfIdentityChanged | IfIdentityChanged |
+| `DeviceStateChanged`   | IfIdentityChanged | IfIdentityChanged | IfIdentityChanged |
+| `DeviceRemoved`        | IfIdentityChanged | IfIdentityChanged | IfIdentityChanged |
+
+- Always rebuild, for every role: a forwarded stream error and a stalled callback heartbeat. The cpal error callback filters stream errors first (`cpal_sink::needs_rebuild`). `Xrun` and `RealtimeDenied` are dropped, because the stream keeps running and a rebuild would only add a gap. A forwarded error carries a `StreamErrorKind`: `DeviceChanged` (cpal's `ErrorKind::DeviceChanged`, routine on a default switch) is logged at debug, `Other` at warn (`stream_error_level`); both rebuild.
+- Startup grace: a new stream has `Timings::startup_grace` (10 s) to deliver its first callback, measured from the end of `build`. The heartbeat is read just before `build` as the baseline, so a callback that lands between `build` and the first check counts as started. Once the heartbeat has moved past the baseline, the stall deadline is `last beat + stall` (2 s). `next_deadline` returns the same deadlines.
+- `IfIdentityChanged`: the supervisor re-queries the identity a build would pick now (`StreamFactory::current_identity`: the default output, the matched mic sink or the chosen input) and rebuilds only if it differs from the identity the stream was built on (`None` vs `Some` counts as different). Otherwise it logs the event at debug and drops it.
+- With no active stream (initial start, or the 1 s retry backoff after a failed build), every non-ignored event rebuilds.
+- Build failures are logged through the pure `FailureLog`: warn on the first failure of a streak and when the error changes, debug for repeats, info when a build succeeds after failures.
+- Each supervisor publishes a `StreamStatus` (Starting, Running, Failed) in a control-thread-only mutex that no callback touches; `Engine::mic_status` is built from those.
+- Never cache a device. Every build and every identity check re-queries the devices.
+
+The timing logic is the pure `SupervisorCore`, tested with a fake clock (`Timings`: debounce 200 ms, retry 1 s, stall 2 s, startup grace 10 s, play grace 1 s).
 
 ## Platform code
 
@@ -69,9 +95,18 @@ Platform code lives only in:
 - `crates/engine/src/platform/{macos,windows,linux}.rs`
 - `crates/app/src/platform/{macos,windows,linux}.rs`
 
-Each set is selected by `#[cfg(target_os = ...)]` in its `mod.rs`. Shared code contains no `cfg(target_os)`. The only `target_os` cfgs outside the per-OS files are in those `mod.rs` files: the watcher selection, `NoopWatcher` (built only outside macOS and Windows), the engine host selection (with a default-host fallback for other OSes), and a dead-code allow on `EventSender::send`, which only the macOS and Windows watchers call.
+Each set is selected by `#[cfg(target_os = ...)]` in its `mod.rs`. Shared code contains no `cfg(target_os)`. The only `target_os` cfgs outside the per-OS files are in those `mod.rs` files: the watcher selection, `NoopWatcher` (built only outside macOS and Windows), the engine host selection (with a default-host fallback for other OSes), the app's pure Linux helpers (`cfg(any(target_os = "linux", test))`, so they are tested on every OS) and `Ok(None)` virtual-mic fallback, dead-code allows on variants only one OS constructs (`MicrophoneAccess::Undetermined`/`Unknown`), and a dead-code allow on `EventSender::send`, which only the macOS and Windows watchers call. cpal's `pulseaudio` feature is enabled for the Linux target only.
 
 The macOS watcher uses `objc2-core-audio` rather than `coreaudio-sys`, which would need libclang. The Linux watcher is a no-op, because ALSA `default` follows PipeWire/PulseAudio.
+
+## No real audio from agents
+
+Agents (automated runs, ralphex, CI) must never play audio through a real device, change the system default input or output, change the system volume, or open the microphone. Concretely:
+
+- Do not run `sound-babound play`, the tray app or `mic-check` against real devices, and do not create the Linux virtual device (`pactl load-module`).
+- Real-device checks are `#[ignore]` tests (`cargo test -p babound-engine -- --ignored`) that only a human runs.
+- `scripts/bundle-macos.sh` only builds and signs; running it is fine. Launching the bundle is not.
+- Everything else is tested with fakes.
 
 ## Conventions
 
