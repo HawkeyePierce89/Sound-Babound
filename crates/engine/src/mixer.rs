@@ -74,8 +74,6 @@ pub enum Command {
     SetMasterGain(f32),
     /// Set this path's gains: `sound` multiplies every voice (on top of the
     /// voice and master gains), `input` scales the mic passthrough.
-    // Sent by the engine's mic path once it exists.
-    #[cfg_attr(not(test), allow(dead_code))]
     SetPathGains { sound: f32, input: f32 },
 }
 
@@ -285,8 +283,6 @@ impl Mixer {
 
     /// Create an unconfigured mic mixer that adds `reader`'s passthrough to
     /// its mix. See [`new`](Mixer::new).
-    // Built by the engine's mic path once it exists.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_passthrough(shared: Arc<MixerShared>, reader: PassthroughReader) -> Mixer {
         Mixer {
             passthrough: Some(reader),

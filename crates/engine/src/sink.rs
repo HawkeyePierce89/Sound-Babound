@@ -24,7 +24,7 @@ use std::time::Instant;
 
 use crate::error::BuildError;
 use crate::mixer::{Mixer, MixerShared};
-use crate::passthrough::PassthroughShared;
+use crate::passthrough::{PassthroughReader, PassthroughShared};
 use crate::supervisor::SupervisorMsg;
 
 /// Which stream a supervisor runs. Each role has its own rebuild policy (see
@@ -141,6 +141,28 @@ pub trait StreamFactory: Send + 'static {
     fn current_identity(&mut self) -> Option<DeviceIdentity>;
 }
 
+/// A boxed factory is a factory, so the engine can pick its factories at
+/// run time (see `Backends`).
+impl<F: StreamFactory + ?Sized> StreamFactory for Box<F> {
+    type Target = F::Target;
+
+    fn role(&self) -> StreamRole {
+        (**self).role()
+    }
+
+    fn build(
+        &mut self,
+        target: Self::Target,
+        on_error: Sender<SupervisorMsg>,
+    ) -> Result<BuiltStream, BuildError> {
+        (**self).build(target, on_error)
+    }
+
+    fn current_identity(&mut self) -> Option<DeviceIdentity> {
+        (**self).current_identity()
+    }
+}
+
 /// The state a stream feeds, as the supervisor sees it.
 ///
 /// The supervisor thread owns the endpoint. Every method runs there.
@@ -186,6 +208,18 @@ impl MixerEndpoint {
     pub fn new(shared: Arc<MixerShared>) -> MixerEndpoint {
         MixerEndpoint {
             mixer: Arc::new(Mutex::new(Mixer::new(Arc::clone(&shared)))),
+            shared,
+        }
+    }
+
+    /// An endpoint with a new, unconfigured mic mixer on `shared` that adds
+    /// `reader`'s passthrough to its mix.
+    pub fn with_passthrough(shared: Arc<MixerShared>, reader: PassthroughReader) -> MixerEndpoint {
+        MixerEndpoint {
+            mixer: Arc::new(Mutex::new(Mixer::with_passthrough(
+                Arc::clone(&shared),
+                reader,
+            ))),
             shared,
         }
     }
@@ -246,13 +280,10 @@ impl Endpoint for MixerEndpoint {
 /// A capture queues no commands and releases no sounds, so there is no
 /// play grace, nothing to purge and no garbage to drain.
 #[derive(Debug)]
-// Used by the engine's mic path once it exists.
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct CaptureEndpoint {
     shared: Arc<PassthroughShared>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl CaptureEndpoint {
     /// An endpoint writing into `shared`.
     pub fn new(shared: Arc<PassthroughShared>) -> CaptureEndpoint {

@@ -4,7 +4,7 @@ A Rust tray soundboard. Plans live in `docs/plans/`.
 
 ## Crate layout
 
-- `crates/engine` (`babound-engine`): has no UI dependencies. Its modules are private. `lib.rs` re-exports only what the app needs: `Engine`, `Sound`, `StreamInfo`, `StreamRole`, `StreamStatus`, `DeviceEvent`, `RebuildPolicy`, the error types (with `BuildErrorKind`) and `VERSION`. Items that only tests use are `#[cfg(test)]`.
+- `crates/engine` (`babound-engine`): has no UI dependencies. Its modules are private. `lib.rs` re-exports only what the app needs: `Engine`, `MicSettings`, `MicStatus`, `CaptureStatus`, `MicProbe`, `probe_mic`, `Sound`, `StreamInfo`, `StreamRole`, `StreamStatus`, `DeviceEvent`, `RebuildPolicy`, the error types (with `BuildErrorKind`) and `VERSION`. Items that only tests use are `#[cfg(test)]`.
   - `error.rs`: `LoadError`, `BuildError` (including `DeviceNotFound` for an unmatched mic sink pattern and `FeedbackExcluded` for a refused capture), `StartError`, `WatcherError`.
   - `sound.rs`: symphonia decode into a cheap-clone `Sound` (`Arc<SoundData>`).
   - `mixer.rs`: the realtime mixer, the command queue and the garbage queue. The mic sink's mixer (`Mixer::with_passthrough`) owns a `PassthroughReader` and adds `input gain × passthrough` before the clamp, with the mono-sound mapping; the monitor's mixer (`Mixer::new`) has none. `Command::SetPathGains { sound, input }` sets the per-path gains (default 1.0).
@@ -16,8 +16,8 @@ A Rust tray soundboard. Plans live in `docs/plans/`.
   - `platform/`: the cpal host per role. The monitor uses the default host, except ALSA on Linux (as in stage 1, since the `pulseaudio` feature makes PulseAudio cpal's Linux default). The mic paths use the default host, except PulseAudio on Linux (falling back to the default host).
   - `supervisor.rs`: the pure `SupervisorCore` state machine, the pure `FailureLog` build-failure throttle, `StreamStatus`, and the one generic supervisor thread (`spawn_supervisor`), one instance per role, each starting its own watcher.
   - `watcher/`: OS device-change listeners.
-  - `engine.rs`: the public `Engine` API (non-blocking queue pushes and atomic reads).
-  - `test_support.rs` (`#[cfg(test)]`): `FakeSinkFactory`, `FakeWatcher` and `wait_until`.
+  - `engine.rs`: the public `Engine` API (non-blocking queue pushes and atomic reads). The monitor always runs. `set_mic(&mut self, Option<MicSettings>)` starts, stops or restarts the mic sink and capture supervisors (a gains-only change just sends `SetPathGains`); the monitor is never touched. `play` fans out to every path that accepts plays (true if any did); `stop_all` and `set_master_gain` go to every path. Factories and watchers come from the `Backends` trait: `CpalBackends` in production, `FakeBackends` in tests. `probe_mic` resolves the mic devices without building a stream.
+  - `test_support.rs` (`#[cfg(test)]`): `FakeSinkFactory`, `FakeCaptureFactory`, `FakeBackends`, `FakeWatcher` and `wait_until`.
   - `testdata/`: tiny FLAC, OGG Vorbis and MP3 fixtures for the decode tests. The ffmpeg commands that made them are in the `fixture` helper's doc comment in `sound.rs`.
 - `crates/app` (`sound-babound`): the binary.
   - `main.rs`: the Windows GUI subsystem, plus attaching to the parent console when any argument is given.

@@ -404,12 +404,22 @@ pub struct SupervisorHandle {
     sender: Sender<SupervisorMsg>,
     status: Arc<Mutex<StreamStatus>>,
     thread: Option<JoinHandle<()>>,
+    /// Build failures logged at warn, so tests can check the throttle.
+    #[cfg(test)]
+    failure_warnings: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SupervisorHandle {
     /// What the supervised stream is doing now.
     pub fn status(&self) -> StreamStatus {
         lock_status(&self.status).clone()
+    }
+
+    /// How many build failures were logged at warn (see [`FailureLog`]).
+    #[cfg(test)]
+    pub fn failure_warnings(&self) -> usize {
+        self.failure_warnings
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Stop the stream, unregister the watcher and join the thread.
@@ -457,16 +467,27 @@ where
     let status = Arc::new(Mutex::new(StreamStatus::Starting));
     let thread_sender = sender.clone();
     let thread_status = Arc::clone(&status);
+    #[cfg(test)]
+    let failure_warnings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    #[cfg(test)]
+    let thread_warnings = Arc::clone(&failure_warnings);
     let thread = thread::Builder::new()
         .name(format!("babound-{}", factory.role()))
         .spawn(move || {
-            Worker::new(factory, endpoint, timings, thread_sender, thread_status)
-                .run(watcher, receiver);
+            let worker = Worker::new(factory, endpoint, timings, thread_sender, thread_status);
+            #[cfg(test)]
+            let worker = Worker {
+                failure_warnings: thread_warnings,
+                ..worker
+            };
+            worker.run(watcher, receiver);
         })?;
     Ok(SupervisorHandle {
         sender,
         status,
         thread: Some(thread),
+        #[cfg(test)]
+        failure_warnings,
     })
 }
 
@@ -481,6 +502,9 @@ struct Worker<F, E> {
     failures: FailureLog,
     play_grace: Duration,
     stream: Option<Box<dyn ActiveStream>>,
+    /// Shared with [`SupervisorHandle::failure_warnings`].
+    #[cfg(test)]
+    failure_warnings: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<F, E> Worker<F, E>
@@ -505,6 +529,8 @@ where
             failures: FailureLog::default(),
             play_grace: timings.play_grace,
             stream: None,
+            #[cfg(test)]
+            failure_warnings: Arc::default(),
         }
     }
 
@@ -660,6 +686,9 @@ where
         let role = self.role;
         let message = err.to_string();
         if self.failures.on_failure(&message) == Level::WARN {
+            #[cfg(test)]
+            self.failure_warnings
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             warn!(%role, error = %message, "stream build failed; will retry");
         } else {
             debug!(%role, error = %message, "stream build failed again; will retry");

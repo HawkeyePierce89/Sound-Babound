@@ -268,35 +268,36 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 
 - Modify: `crates/engine/src/engine.rs`, `crates/engine/src/lib.rs`, `crates/engine/src/test_support.rs`
 
-- [ ] `MicSettings { device_match, excluded_inputs, sound_gain, mic_gain, capture: bool }`.
-- [ ] `Engine::set_mic(Option<MicSettings>)`:
+- [x] `MicSettings { device_match, excluded_inputs, sound_gain, mic_gain, capture: bool }`.
+- [x] `Engine::set_mic(Option<MicSettings>)`:
   - `None` stops and joins the mic sink and capture supervisors;
   - `Some` starts them;
   - a change to gains only sends `SetPathGains` with no restart;
   - any other change restarts only the mic path;
   - the monitor supervisor is never touched.
-- [ ] Fan-out:
+- [x] Fan-out:
   - `play` pushes to each path that `accepts_plays`, and returns true if any path accepted;
   - `stop_all` and `set_master_gain` go to both;
   - the mic path drops its own rejected commands on the caller's thread.
-- [ ] Accessors:
+- [x] Accessors:
   - `Engine::mic_status()` returns `MicStatus { Off | Starting | NotFound(pattern) | Active { device, capture: CaptureStatus } }`, with `CaptureStatus` one of Running(name), Disabled or Unavailable(reason);
+    (Implemented with two extra variants: `MicStatus::Failed(error)` for a mic sink build failure other than not-found, and `CaptureStatus::Starting` while the capture builds.)
   - `has_mic_output()`;
   - `active_voices()` and `output_latency()` cover both paths (sum and maximum).
-- [ ] Add `pub fn probe_mic(&MicSettings) -> MicProbe`.
-- [ ] Add a `Backends` abstraction that supplies the three factories and the watcher: `CpalBackends` for production, `FakeBackends` for tests.
-- [ ] Re-export only what the app needs.
-- [ ] Supervisor tests with fakes:
+- [x] Add `pub fn probe_mic(&MicSettings) -> MicProbe`.
+- [x] Add a `Backends` abstraction that supplies the three factories and the watcher: `CpalBackends` for production, `FakeBackends` for tests.
+- [x] Re-export only what the app needs.
+- [x] Supervisor tests with fakes:
   - switching the default input rebuilds only the capture;
   - switching the default output rebuilds only the monitor;
   - neither interrupts the other (build counts and live sinks per role);
   - a mic sink that is not found retries, with only the first failure at warn (through `FailureLog`), while the monitor plays.
-- [ ] Engine tests with fakes:
+- [x] Engine tests with fakes:
   - with mic off, no mic or capture factory is ever built and only one supervisor and watcher run;
   - set_mic on/off/gain-only/device-change;
   - a play reaches both mixers;
   - the passthrough reaches the mic mixer but not the monitor.
-- [ ] Run the verification gates. All must pass before Task 10.
+- [x] Run the verification gates. All must pass before Task 10.
 
 ### Task 10: `[mic]` config section and persistence
 

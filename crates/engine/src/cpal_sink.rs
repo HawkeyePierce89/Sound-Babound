@@ -59,8 +59,6 @@ impl CpalOutputFactory {
     }
 
     /// The mic sink: the first output device matching `pattern`.
-    // Used by the engine's mic path once it exists.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn mic_sink(pattern: impl Into<String>) -> CpalOutputFactory {
         CpalOutputFactory {
             target: OutputTarget::Named(pattern.into()),
@@ -89,8 +87,6 @@ impl CpalOutputFactory {
 
     /// Resolve the device and its default config without building a stream,
     /// for `mic-check`.
-    // Used by the engine's mic probe once it exists.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn probe(&self) -> Result<StreamInfo, BuildError> {
         let device = self.resolve()?;
         let supported = device.default_output_config().map_err(build_error)?;

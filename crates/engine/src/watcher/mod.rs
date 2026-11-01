@@ -127,6 +127,14 @@ pub trait DeviceWatcher: Send + 'static {
     fn start(&mut self, events: EventSender) -> Result<Box<dyn WatcherGuard>, WatcherError>;
 }
 
+/// A boxed watcher is a watcher, so the engine can pick its watcher at run
+/// time (see `Backends`).
+impl<W: DeviceWatcher + ?Sized> DeviceWatcher for Box<W> {
+    fn start(&mut self, events: EventSender) -> Result<Box<dyn WatcherGuard>, WatcherError> {
+        (**self).start(events)
+    }
+}
+
 /// A watcher that never reports anything. The platform watcher everywhere
 /// except macOS and Windows.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]

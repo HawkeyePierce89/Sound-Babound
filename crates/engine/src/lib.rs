@@ -4,16 +4,12 @@
 //! per-stream supervisors that rebuild a stream when its device changes. It
 //! has no UI dependencies.
 
-// Used by the engine's mic path once it exists.
-#[cfg_attr(not(test), allow(dead_code))]
 mod capture;
 mod convert;
 mod cpal_sink;
 mod engine;
 mod error;
 mod mixer;
-// Used by the mic mixer and the capture stream once they exist.
-#[cfg_attr(not(test), allow(dead_code))]
 mod passthrough;
 mod platform;
 mod sink;
@@ -24,7 +20,7 @@ mod watcher;
 #[cfg(test)]
 mod test_support;
 
-pub use engine::Engine;
+pub use engine::{CaptureStatus, Engine, MicProbe, MicSettings, MicStatus, probe_mic};
 pub use error::{BuildError, BuildErrorKind, LoadError, StartError, WatcherError};
 pub use sink::{StreamInfo, StreamRole};
 pub use sound::Sound;

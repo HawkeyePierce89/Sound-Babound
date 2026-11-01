@@ -154,8 +154,6 @@ pub struct CpalCaptureFactory {
     notices: NoticeLog,
 }
 
-// Used by the engine's mic path once it exists.
-#[cfg_attr(not(test), allow(dead_code))]
 impl CpalCaptureFactory {
     /// A capture that never opens a device any of `exclusions` names (a
     /// case-insensitive substring of the display name or id).

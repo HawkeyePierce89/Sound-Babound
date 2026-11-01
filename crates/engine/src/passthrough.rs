@@ -146,6 +146,7 @@ impl PassthroughShared {
         self.heartbeat.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     /// Whether a capture stream is running.
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
@@ -156,16 +157,19 @@ impl PassthroughShared {
         self.active.store(active, Ordering::Release);
     }
 
+    #[cfg(test)]
     /// Blocks in which the reader ran the ring empty.
     pub fn underruns(&self) -> u64 {
         self.underruns.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     /// Blocks in which the writer dropped the oldest audio.
     pub fn overruns(&self) -> u64 {
         self.overruns.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     /// Mono samples currently buffered.
     pub fn fill(&self) -> usize {
         self.ring.len()
@@ -230,11 +234,13 @@ impl PassthroughReader {
         }
     }
 
+    #[cfg(test)]
     /// Whether the reader is primed and producing audio.
     pub fn is_primed(&self) -> bool {
         self.primed
     }
 
+    #[cfg(test)]
     /// The current relative ratio correction.
     pub fn correction(&self) -> f64 {
         self.correction
