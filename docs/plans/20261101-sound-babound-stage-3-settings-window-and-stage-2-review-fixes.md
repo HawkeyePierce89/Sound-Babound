@@ -287,12 +287,12 @@ Part B fixes the five findings from the stage 2 acceptance review:
 **Files:**
 - Create: `crates/app/src/settings/form.rs`, `crates/app/src/settings/keys.rs`
 
-- [ ] `keys.rs`, pure:
+- [x] `keys.rs`, pure:
   - `config_key_name(ui_key: &str) -> Option<&'static str>` maps the UI library's key names (egui's `Key::name()` vocabulary, documented as such) to the config's key names: letters, digits, F1–F24, Space, Enter, Tab, Backspace, Delete, Insert, Home, End, PageUp, PageDown, arrows to Up/Down/Left/Right, numpad digits, and punctuation (Minus, Equal, Comma, Period, Slash, Semicolon, Quote, Backquote, BracketLeft, BracketRight, Backslash).
   - `Mods { cmd_or_ctrl, ctrl, alt, shift }`, where `ctrl` is a separate Control press on macOS only.
   - `hotkey_text(mods, key) -> KeyCapture` gives `Set(String)` in the config syntax (`CmdOrCtrl+Shift+1`, modifiers in a fixed order), `Clear` (Escape alone), or `Ignore` (unsupported key, a lone modifier, or a non-function key without a modifier).
   - Every `Set` result goes through `hotkeys::parse_hotkey`. A result it rejects becomes `Ignore`, so the window never writes a hotkey the tray rejects.
-- [ ] `form.rs`, pure:
+- [x] `form.rs`, pure:
   - `SettingsForm` is built from config text: the parsed `RawConfig` gives the `loaded` sounds and `stop_all_hotkey`. A file that does not parse yields a form error, with editing and Save disabled.
   - Each `SoundRow` has `name`, `path`, `hotkey: Option<String>` and the index of its original entry (`None` for new rows).
   - Operations: `add(path)` (name pre-filled from the file stem), `remove(i)`, `set_name(i, ..)`, `set_hotkey(i, KeyCapture)`.
@@ -302,7 +302,7 @@ Part B fixes the five findings from the stage 2 acceptance review:
     - a duplicate hotkey, compared by `HotKey::id()` between rows and against `stop_all_hotkey`, with every involved row marked.
   - `can_save()` is false while there is any problem or a form error.
   - `AUDIO_EXTENSIONS` (`wav`, `flac`, `ogg`, `mp3`) feeds the file picker filter.
-- [ ] Tests:
+- [x] Tests:
   - the key mapping table: every supported name, and unsupported names;
   - modifier order and the CmdOrCtrl/Ctrl split;
   - Escape clears;
@@ -314,7 +314,8 @@ Part B fixes the five findings from the stage 2 acceptance review:
   - a blank name blocks Save;
   - a hotkey from the file that does not parse is marked;
   - a malformed file gives a form error.
-- [ ] Run the verification gates. All must pass before Task 9.
+  - Note: `keys.rs` also accepts the W3C spellings (`ArrowUp`, `Equal`, `Backquote`, `BracketLeft`, `Numpad0`–`Numpad9` → `Num0`–`Num9`) next to egui's names, and lists the egui names it refuses in `UNSUPPORTED_UI_KEYS` (Escape, clipboard and browser keys, shifted symbols, F25–F35) for Task 10's `Key::ALL` test. `Mods::from_ui(command, ctrl, mac_cmd, alt, shift)` takes egui's flags and derives the macOS-only separate Ctrl without a cfg. `validate()` returns `Vec<Vec<Problem>>` indexed by row (`BlankName`, `InvalidHotkey`, `DuplicateHotkey(Vec<HotkeyOwner>)`), `describe` gives the text, a `stop_all_hotkey` that does not parse is left out, and `add` refuses a non-UTF-8 path.
+- [x] Run the verification gates. All must pass before Task 9.
 
 ### Task 9: Shared mic status report
 
