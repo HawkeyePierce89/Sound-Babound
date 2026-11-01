@@ -335,12 +335,15 @@ pub fn mic_status_label(status: &MicStatus, not_found: &str) -> String {
 /// yet; turning it off (or a mic path that fails to start) drops the device
 /// after the engine has stopped using it. A device that cannot be created is
 /// logged, and the mic path starts anyway: its status then reports the
-/// device as not found. `create` returns `Ok(None)` on the OSes where the
-/// user installs the device.
+/// device as not found, and [`WithVirtualMic::restore_device`] tries again.
+/// `create` returns `Ok(None)` on the OSes where the user installs the
+/// device.
 pub struct WithVirtualMic<C, G, F> {
     control: C,
     device: Option<G>,
     create: F,
+    /// The mic path runs, but the last attempt to create the device failed.
+    create_failed: bool,
     /// When [`WithVirtualMic::restore_device`] may next check the device.
     next_check: Option<Instant>,
 }
@@ -371,7 +374,30 @@ where
             control,
             device: None,
             create,
+            create_failed: false,
             next_check: None,
+        }
+    }
+
+    /// Creates the device. A failure is logged (at error for the first of a
+    /// streak, at debug for repeats) and remembered, so it is retried.
+    fn create_device(&mut self) {
+        match (self.create)() {
+            Ok(device) => {
+                if self.create_failed {
+                    tracing::info!("the virtual mic is created");
+                }
+                self.device = device;
+                self.create_failed = false;
+            }
+            Err(err) => {
+                if self.create_failed {
+                    tracing::debug!("{err:#}; the virtual mic is still unavailable");
+                } else {
+                    tracing::error!("{err:#}; the virtual mic is unavailable");
+                }
+                self.create_failed = true;
+            }
         }
     }
 
@@ -403,29 +429,31 @@ where
     F: FnMut() -> Result<Option<G>>,
 {
     /// Creates the virtual device again if it is gone (for example, the
-    /// sound server restarted and dropped its modules), so the mic sink
-    /// finds it on its next retry. Does nothing with no device, and checks
-    /// at most every [`DEVICE_CHECK_INTERVAL`]. The tray calls it while the
-    /// mic sink reports its device not found.
+    /// sound server restarted and dropped its modules) or if creating it
+    /// failed while the mic path runs (for example, the sound server was
+    /// not up yet), so the mic sink finds it on its next retry. Does nothing
+    /// with no device and no failed attempt (the mic is off, or the user
+    /// installs the device), and acts at most every
+    /// [`DEVICE_CHECK_INTERVAL`]. The tray calls it while the mic sink
+    /// reports its device not found.
     pub fn restore_device(&mut self, now: Instant) {
-        let Some(device) = &mut self.device else {
+        if self.device.is_none() && !self.create_failed {
             return;
-        };
+        }
         if self.next_check.is_some_and(|next| now < next) {
             return;
         }
         self.next_check = Some(now + DEVICE_CHECK_INTERVAL);
-        if device.is_present() {
-            return;
+        if let Some(device) = &mut self.device {
+            if device.is_present() {
+                return;
+            }
+            tracing::warn!(
+                "the virtual mic is gone (did the sound server restart?); creating it again"
+            );
+            self.device = None;
         }
-        tracing::warn!(
-            "the virtual mic is gone (did the sound server restart?); creating it again"
-        );
-        self.device = None;
-        match (self.create)() {
-            Ok(device) => self.device = device,
-            Err(err) => tracing::error!("{err:#}; the virtual mic is unavailable"),
-        }
+        self.create_device();
     }
 }
 
@@ -445,14 +473,12 @@ where
     fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<()> {
         let on = settings.is_some();
         if on && self.device.is_none() {
-            match (self.create)() {
-                Ok(device) => self.device = device,
-                Err(err) => tracing::error!("{err:#}; the virtual mic is unavailable"),
-            }
+            self.create_device();
         }
         let result = self.control.set_mic(settings);
         if !on || result.is_err() {
             self.device = None;
+            self.create_failed = false;
         }
         result
     }
@@ -1501,34 +1527,104 @@ mod tests {
         );
     }
 
+    /// A create function for [`VanishingDevice`] whose calls fail where
+    /// `fails` says so (by call index); logs every attempt.
+    fn flaky_create(
+        log: &Log,
+        present: &Rc<Cell<bool>>,
+        fails: &'static [usize],
+    ) -> impl FnMut() -> Result<Option<VanishingDevice>> + use<> {
+        let (log, present) = (log.clone(), present.clone());
+        let mut calls = 0;
+        move || {
+            let call = calls;
+            calls += 1;
+            if fails.contains(&call) {
+                log.borrow_mut().push("create failed");
+                anyhow::bail!("pactl did not finish within 3s");
+            }
+            log.borrow_mut().push("device created");
+            present.set(true);
+            Ok(Some(VanishingDevice {
+                log: log.clone(),
+                present: present.clone(),
+            }))
+        }
+    }
+
     #[test]
-    fn a_device_that_cannot_be_created_again_is_logged_and_dropped() {
+    fn a_device_that_cannot_be_created_again_is_retried_at_the_next_check() {
         let log = Log::default();
         let present = Rc::new(Cell::new(true));
-        let created = Rc::new(Cell::new(false));
-        let (device_log, device_present, done) = (log.clone(), present.clone(), created.clone());
         let mut audio = WithVirtualMic::new(
             LoggingAudio {
                 log: log.clone(),
                 fail_mic: false,
             },
-            move || -> Result<Option<VanishingDevice>> {
-                if done.replace(true) {
-                    anyhow::bail!("pactl did not finish within 3s");
-                }
-                Ok(Some(VanishingDevice {
-                    log: device_log.clone(),
-                    present: device_present.clone(),
-                }))
-            },
+            flaky_create(&log, &present, &[1]),
         );
+        let start = Instant::now();
         audio.set_mic(on()).unwrap();
         present.set(false);
-        audio.restore_device(Instant::now());
+        audio.restore_device(start);
+        assert!(!audio.has_device());
+        // Too early for another attempt.
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL / 2);
+        assert!(!audio.has_device());
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL);
+        assert!(audio.has_device());
+        assert_eq!(
+            *log.borrow(),
+            [
+                "device created",
+                "mic on",
+                "device checked",
+                "device dropped",
+                "create failed",
+                "device created"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_device_that_failed_to_create_at_mic_on_is_retried_until_the_mic_goes_off() {
+        let log = Log::default();
+        let present = Rc::new(Cell::new(true));
+        let mut audio = WithVirtualMic::new(
+            LoggingAudio {
+                log: log.clone(),
+                fail_mic: false,
+            },
+            flaky_create(&log, &present, &[0, 1, 3]),
+        );
+        let start = Instant::now();
+        // The sound server is not up yet: the mic path starts anyway.
+        audio.set_mic(on()).unwrap();
+        assert!(!audio.has_device());
+        audio.restore_device(start);
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL / 2);
+        assert!(!audio.has_device());
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL);
+        assert!(audio.has_device());
+        audio.set_mic(None).unwrap();
+        // A failure while the mic is on is forgotten once it goes off.
+        audio.set_mic(on()).unwrap();
+        audio.set_mic(None).unwrap();
+        audio.restore_device(start + DEVICE_CHECK_INTERVAL * 3);
         assert!(!audio.has_device());
         assert_eq!(
             *log.borrow(),
-            ["mic on", "device checked", "device dropped"]
+            [
+                "create failed",
+                "mic on",
+                "create failed",
+                "device created",
+                "mic off",
+                "device dropped",
+                "create failed",
+                "mic on",
+                "mic off"
+            ]
         );
     }
 
