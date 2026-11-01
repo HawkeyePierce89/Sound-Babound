@@ -350,23 +350,24 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 - Create: `crates/app/macos/Info.plist`, `scripts/bundle-macos.sh`
 - Modify: `crates/app/src/platform/{mod,macos}.rs`, `crates/app/Cargo.toml`
 
-- [ ] `platform::microphone_access()` returns `Granted`, `Denied`, `Undetermined` or `Unknown`:
+- [x] `platform::microphone_access()` returns `Granted`, `Denied`, `Undetermined` or `Unknown`:
   - macOS: `AVAudioApplication.recordPermission` on macOS 14 and later, `Unknown` before that;
   - other OSes: `Granted`.
-- [ ] `Denied` means `MicSettings.capture = false`. Log it once at warn; the mic sink still plays sounds.
-- [ ] `Undetermined` opens the capture, and macOS prompts.
-- [ ] `Info.plist`:
+- [x] `Denied` means `MicSettings.capture = false`. Log it once at warn; the mic sink still plays sounds.
+- [x] `Undetermined` opens the capture, and macOS prompts.
+- [x] `Info.plist`:
   - `CFBundleIdentifier`, `CFBundleExecutable sound-babound`, the version;
   - `LSUIElement true`;
   - `NSMicrophoneUsageDescription`.
-- [ ] `scripts/bundle-macos.sh`:
+- [x] `scripts/bundle-macos.sh`:
   - `cargo build --release -p sound-babound`;
   - assemble `target/release/Sound-Babound.app` (Contents/MacOS, Info.plist with the version substituted);
   - ad-hoc `codesign --sign -`, so TCC binds the plist. This is not Developer ID signing.
   - `plutil -lint`.
-- [ ] Test: an app unit test (`include_str!`) asserts the plist carries `NSMicrophoneUsageDescription`, `LSUIElement` and the executable name.
-- [ ] Run `scripts/bundle-macos.sh` and check the bundle layout. This builds only; it opens no audio.
-- [ ] Run the verification gates. All must pass before Task 13.
+- [x] Test: an app unit test (`include_str!`) asserts the plist carries `NSMicrophoneUsageDescription`, `LSUIElement` and the executable name.
+- [x] Run `scripts/bundle-macos.sh` and check the bundle layout. This builds only; it opens no audio.
+- [x] Run the verification gates. All must pass before Task 13.
+  (`actions::CaptureGate` turns the permission into the capture flag and warns once per change, only while the mic is enabled; `reload` takes the capture decision as a closure over the new `MicConfig`, so a reload that enables the mic is checked too. The bundle id is `io.github.hawkeyepierce89.sound-babound`. The `Undetermined` and `Unknown` variants carry a dead-code allow, because only macOS constructs them.)
 
 ### Task 13: Tray mic status, toggle and reload
 

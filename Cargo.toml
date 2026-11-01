@@ -46,6 +46,10 @@ anyhow = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opener = "0.9"
 
+# App, macOS
+objc2 = "0.6"
+objc2-avf-audio = { version = "0.3", default-features = false, features = ["std", "AVAudioApplication"] }
+
 [profile.release]
 lto = true
 codegen-units = 1

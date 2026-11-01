@@ -13,6 +13,7 @@ use babound_engine::{Engine, MicSettings, Sound};
 use global_hotkey::hotkey::HotKey;
 
 use crate::config::{self, DEFAULT_CONFIG, MicConfig, RawConfig, ResolvedConfig};
+use crate::platform::MicrophoneAccess;
 use crate::{hotkeys, platform};
 
 /// Something the tray can do.
@@ -174,6 +175,33 @@ pub fn mic_settings(mic: &MicConfig, capture: bool) -> Option<MicSettings> {
     })
 }
 
+/// Turns the OS microphone permission into the `capture` flag of
+/// [`mic_settings`], and warns once when a denial keeps the capture off.
+///
+/// The warning is logged only while the mic is enabled, and again only after
+/// the permission stopped being denied in between.
+#[derive(Debug, Default)]
+pub struct CaptureGate {
+    denial_logged: bool,
+}
+
+impl CaptureGate {
+    /// Whether the capture may be opened for `mic` under `access`.
+    pub fn capture(&mut self, access: MicrophoneAccess, mic: &MicConfig) -> bool {
+        let allowed = access.allows_capture();
+        if allowed {
+            self.denial_logged = false;
+        } else if mic.enabled && !self.denial_logged {
+            self.denial_logged = true;
+            tracing::warn!(
+                "microphone access is denied; the virtual mic carries the sounds only. \
+                 Allow Sound-Babound under System Settings > Privacy & Security > Microphone"
+            );
+        }
+        allowed
+    }
+}
+
 /// Applies the engine-wide parts of a config: the master gain and the mic
 /// path (see [`mic_settings`] for `capture`). Called at startup and after
 /// every successful reload. A mic path that fails to start is logged, and
@@ -314,16 +342,18 @@ pub fn startup_board(path: Option<&Path>) -> Result<Soundboard> {
 ///
 /// On success `install` receives the new board (to swap hotkeys and the
 /// menu), then [`apply_config`] sends the new master gain and mic settings to
-/// `control`, and the board is returned for the caller to keep. If loading or
+/// `control`, and the board is returned for the caller to keep. `capture`
+/// decides the capture flag from the new `[mic]` config. If loading or
 /// `install` fails, `control` is not touched and the error is returned.
 pub fn reload(
     control: &mut impl AudioControl,
     path: &Path,
-    capture: bool,
+    capture: impl FnOnce(&MicConfig) -> bool,
     install: impl FnOnce(&Soundboard) -> Result<()>,
 ) -> Result<Soundboard> {
     let board = load_board(path)?;
     install(&board)?;
+    let capture = capture(board.map().mic());
     apply_config(control, board.map(), capture);
     Ok(board)
 }
@@ -556,10 +586,15 @@ mod tests {
         )
         .unwrap();
         let mut installed = Vec::new();
-        let board = reload(&mut fake, &path, true, |board| {
-            installed.extend(board.map().sound_items().iter().map(|i| i.label.clone()));
-            Ok(())
-        })
+        let board = reload(
+            &mut fake,
+            &path,
+            |_| true,
+            |board| {
+                installed.extend(board.map().sound_items().iter().map(|i| i.label.clone()));
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(installed, ["fixed"]);
         assert_eq!(board.map().master_gain(), 0.5);
@@ -579,10 +614,15 @@ mod tests {
         )
         .unwrap();
         let mut installed = Vec::new();
-        let board = reload(&mut fake, &path, true, |board| {
-            installed.push(board.map().sound_items().len());
-            Ok(())
-        })
+        let board = reload(
+            &mut fake,
+            &path,
+            |_| true,
+            |board| {
+                installed.push(board.map().sound_items().len());
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(installed, [1]);
         assert_eq!(board.map().master_gain(), 2.5);
@@ -595,10 +635,15 @@ mod tests {
         let path = write_config(&dir, "master_gain = [\n");
         let mut fake = FakeAudio::new();
         let mut installed = false;
-        let err = reload(&mut fake, &path, true, |_| {
-            installed = true;
-            Ok(())
-        })
+        let err = reload(
+            &mut fake,
+            &path,
+            |_| true,
+            |_| {
+                installed = true;
+                Ok(())
+            },
+        )
         .unwrap_err();
         assert!(format!("{err:#}").contains("config"), "{err:#}");
         assert!(!installed);
@@ -608,10 +653,15 @@ mod tests {
         // A missing file is a failed reload too.
         fs::remove_file(&path).unwrap();
         assert!(
-            reload(&mut fake, &path, true, |_| {
-                installed = true;
-                Ok(())
-            })
+            reload(
+                &mut fake,
+                &path,
+                |_| true,
+                |_| {
+                    installed = true;
+                    Ok(())
+                }
+            )
             .is_err()
         );
         assert!(!installed);
@@ -624,7 +674,7 @@ mod tests {
         let dir = TempDir::new("actions-install-bad");
         let path = write_config(&dir, "master_gain = 0.25\n");
         let mut fake = FakeAudio::new();
-        let err = reload(&mut fake, &path, true, |_| anyhow::bail!("menu failed")).unwrap_err();
+        let err = reload(&mut fake, &path, |_| true, |_| anyhow::bail!("menu failed")).unwrap_err();
         assert!(err.to_string().contains("menu failed"));
         assert!(fake.gains.borrow().is_empty());
         assert!(fake.mics.is_empty());
@@ -732,7 +782,7 @@ mod tests {
             "[mic]\nenabled = true\nvirtual_device = \"Cable\"\nmic_gain = 0.25\n",
         )
         .unwrap();
-        let board = reload(&mut fake, &path, true, |_| Ok(())).unwrap();
+        let board = reload(&mut fake, &path, |_| true, |_| Ok(())).unwrap();
         assert!(board.map().mic().enabled);
         assert_eq!(fake.mics.len(), 2);
         assert_eq!(fake.mics[0], None);
@@ -744,7 +794,59 @@ mod tests {
 
         // Turning it off again in the file turns the mic path off.
         fs::write(&path, "[mic]\nenabled = false\n").unwrap();
-        reload(&mut fake, &path, true, |_| Ok(())).unwrap();
+        reload(&mut fake, &path, |_| true, |_| Ok(())).unwrap();
         assert_eq!(fake.mics.last(), Some(&None));
+    }
+
+    #[test]
+    fn only_a_denied_microphone_turns_the_capture_off() {
+        let mic = mic_on("Cable");
+        for access in [
+            MicrophoneAccess::Granted,
+            MicrophoneAccess::Undetermined,
+            MicrophoneAccess::Unknown,
+        ] {
+            assert!(CaptureGate::default().capture(access, &mic), "{access:?}");
+        }
+        assert!(!CaptureGate::default().capture(MicrophoneAccess::Denied, &mic));
+    }
+
+    #[test]
+    fn a_denial_is_logged_once_per_change_and_only_with_the_mic_on() {
+        let mut gate = CaptureGate::default();
+        let off = MicConfig::default();
+        assert!(!gate.capture(MicrophoneAccess::Denied, &off));
+        assert!(!gate.denial_logged, "no warning while the mic is off");
+
+        let on = mic_on("Cable");
+        assert!(!gate.capture(MicrophoneAccess::Denied, &on));
+        assert!(gate.denial_logged);
+        assert!(!gate.capture(MicrophoneAccess::Denied, &on));
+        assert!(gate.denial_logged, "still denied: no second warning");
+
+        assert!(gate.capture(MicrophoneAccess::Granted, &on));
+        assert!(!gate.denial_logged, "a grant re-arms the warning");
+    }
+
+    #[test]
+    fn reload_decides_the_capture_from_the_new_mic_config() {
+        let dir = TempDir::new("actions-reload-capture");
+        let path = write_config(&dir, "[mic]\nenabled = true\nvirtual_device = \"Cable\"\n");
+        let mut fake = FakeAudio::new();
+        let mut seen = None;
+        reload(
+            &mut fake,
+            &path,
+            |mic| {
+                seen = Some(mic.clone());
+                false
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        let seen = seen.unwrap();
+        assert!(seen.enabled);
+        assert_eq!(seen.virtual_device, "Cable");
+        assert!(!fake.mics[0].as_ref().unwrap().capture);
     }
 }

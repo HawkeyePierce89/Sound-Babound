@@ -2065,6 +2065,8 @@ dependencies = [
  "clap",
  "dirs",
  "global-hotkey",
+ "objc2",
+ "objc2-avf-audio",
  "opener",
  "serde",
  "tao",

@@ -1,8 +1,11 @@
 //! macOS glue.
 
+use objc2_avf_audio::{AVAudioApplication, AVAudioApplicationRecordPermission};
 use tao::event_loop::EventLoop;
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::TrayIconBuilder;
+
+use super::MicrophoneAccess;
 
 /// No-op: a macOS binary always keeps the console it was launched from.
 pub fn attach_parent_console() {}
@@ -37,6 +40,29 @@ pub fn virtual_mic_hint() -> &'static str {
     "install BlackHole 2ch, then choose \"BlackHole 2ch\" as the microphone in the call app"
 }
 
+/// The app's microphone permission. `AVAudioApplication` exists from
+/// macOS 14; before that the permission cannot be read and is `Unknown`.
+/// Reading it never prompts; opening the capture does.
+pub fn microphone_access() -> MicrophoneAccess {
+    if !objc2::available!(macos = 14.0) {
+        return MicrophoneAccess::Unknown;
+    }
+    // SAFETY: the class exists on macOS 14 and later (checked above), and
+    // `sharedInstance` and `recordPermission` have no preconditions.
+    let permission = unsafe { AVAudioApplication::sharedInstance().recordPermission() };
+    access_of(permission)
+}
+
+/// Maps AVFAudio's record permission onto [`MicrophoneAccess`].
+fn access_of(permission: AVAudioApplicationRecordPermission) -> MicrophoneAccess {
+    match permission {
+        AVAudioApplicationRecordPermission::Granted => MicrophoneAccess::Granted,
+        AVAudioApplicationRecordPermission::Denied => MicrophoneAccess::Denied,
+        AVAudioApplicationRecordPermission::Undetermined => MicrophoneAccess::Undetermined,
+        _ => MicrophoneAccess::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,5 +72,21 @@ mod tests {
         assert_eq!(default_virtual_device(), "BlackHole");
         assert_eq!(virtual_input_exclusions("BlackHole"), ["BlackHole"]);
         assert!(virtual_mic_hint().contains("BlackHole"));
+    }
+
+    #[test]
+    fn record_permission_maps_to_access() {
+        use AVAudioApplicationRecordPermission as P;
+        assert_eq!(access_of(P::Granted), MicrophoneAccess::Granted);
+        assert_eq!(access_of(P::Denied), MicrophoneAccess::Denied);
+        assert_eq!(access_of(P::Undetermined), MicrophoneAccess::Undetermined);
+        assert_eq!(access_of(P(0)), MicrophoneAccess::Unknown);
+    }
+
+    #[test]
+    fn microphone_access_reads_without_prompting() {
+        // Only reads the recorded permission: no prompt, no audio. Any
+        // answer is fine, as long as the lookup itself works.
+        let _ = microphone_access();
     }
 }

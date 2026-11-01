@@ -18,15 +18,13 @@ use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::actions::{
-    self, Action, ActionMap, MENU_OPEN_CONFIG, MENU_QUIT, MENU_RELOAD, MENU_STOP_ALL, Soundboard,
+    self, Action, ActionMap, CaptureGate, MENU_OPEN_CONFIG, MENU_QUIT, MENU_RELOAD, MENU_STOP_ALL,
+    Soundboard,
 };
 use crate::{paths, platform};
 
 /// Tooltip of the tray icon.
 const TOOLTIP: &str = "Sound-Babound";
-
-/// Whether an enabled mic path also captures the microphone.
-const MIC_CAPTURE: bool = true;
 
 /// Events forwarded into the event loop.
 #[derive(Debug)]
@@ -53,7 +51,9 @@ pub fn run() -> Result<()> {
     };
     let board = actions::startup_board(config_path.as_deref())?;
     let mut engine = Engine::start().context("failed to start the audio engine")?;
-    actions::apply_config(&mut engine, board.map(), MIC_CAPTURE);
+    let mut capture_gate = CaptureGate::default();
+    let capture = capture_gate.capture(platform::microphone_access(), board.map().mic());
+    actions::apply_config(&mut engine, board.map(), capture);
 
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     platform::prepare_event_loop(&mut event_loop);
@@ -65,6 +65,7 @@ pub fn run() -> Result<()> {
         config_path,
         hotkeys: Hotkeys::disabled(),
         tray: None,
+        capture_gate,
     };
     event_loop.run(move |event, _target, control_flow| match event {
         Event::NewEvents(StartCause::Init) => {
@@ -239,6 +240,8 @@ struct TrayApp {
     hotkeys: Hotkeys,
     /// Kept alive for as long as the icon should be shown.
     tray: Option<TrayIcon>,
+    /// Turns the microphone permission into the mic path's capture flag.
+    capture_gate: CaptureGate,
 }
 
 impl TrayApp {
@@ -296,7 +299,9 @@ impl TrayApp {
         };
         let hotkeys = &mut self.hotkeys;
         let tray = &self.tray;
-        let result = actions::reload(engine, &path, MIC_CAPTURE, |board| {
+        let capture_gate = &mut self.capture_gate;
+        let capture = |mic: &_| capture_gate.capture(platform::microphone_access(), mic);
+        let result = actions::reload(engine, &path, capture, |board| {
             let menu = build_menu(board.map())?;
             hotkeys.replace(board.map().hotkeys());
             if let Some(tray) = tray {

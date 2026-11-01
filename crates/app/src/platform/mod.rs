@@ -18,8 +18,8 @@ pub use linux::{
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
-    attach_parent_console, default_virtual_device, prepare_event_loop, virtual_input_exclusions,
-    with_tray_icon,
+    attach_parent_console, default_virtual_device, microphone_access, prepare_event_loop,
+    virtual_input_exclusions, with_tray_icon,
 };
 #[cfg(target_os = "windows")]
 pub use windows::{attach_parent_console, default_virtual_device, virtual_input_exclusions};
@@ -60,6 +60,35 @@ pub enum VirtualMic {}
 #[allow(dead_code)] // For the tray mic toggle.
 pub fn create_virtual_mic() -> anyhow::Result<Option<VirtualMic>> {
     Ok(None)
+}
+
+/// Whether the app may record from the microphone, as the OS reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicrophoneAccess {
+    /// The user allowed it.
+    Granted,
+    /// The user refused it: the capture stays off.
+    Denied,
+    /// The user has not been asked yet; opening the capture asks.
+    #[allow(dead_code)] // Only macOS reports it.
+    Undetermined,
+    /// The OS cannot tell (macOS before 14): the capture is tried.
+    #[allow(dead_code)] // Only macOS reports it.
+    Unknown,
+}
+
+impl MicrophoneAccess {
+    /// Whether the capture may be opened. Only an explicit denial keeps it
+    /// off; the mic sink still plays the sounds then.
+    pub fn allows_capture(self) -> bool {
+        self != MicrophoneAccess::Denied
+    }
+}
+
+/// Everywhere but macOS no microphone permission gates the capture.
+#[cfg(not(target_os = "macos"))]
+pub fn microphone_access() -> MicrophoneAccess {
+    MicrophoneAccess::Granted
 }
 
 /// Everywhere but macOS the tray app needs no event loop tweaks.
@@ -276,6 +305,44 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+
+    #[test]
+    fn only_a_denial_keeps_the_capture_off() {
+        assert!(MicrophoneAccess::Granted.allows_capture());
+        assert!(MicrophoneAccess::Undetermined.allows_capture());
+        assert!(MicrophoneAccess::Unknown.allows_capture());
+        assert!(!MicrophoneAccess::Denied.allows_capture());
+    }
+
+    /// The macOS bundle's Info.plist template (`scripts/bundle-macos.sh`).
+    const INFO_PLIST: &str = include_str!("../../macos/Info.plist");
+
+    /// The element right after `<key>{key}</key>` in [`INFO_PLIST`].
+    fn plist_value(key: &str) -> &'static str {
+        let tag = format!("<key>{key}</key>");
+        let start = INFO_PLIST.find(&tag).unwrap_or_else(|| panic!("no {key}")) + tag.len();
+        let rest = INFO_PLIST[start..].trim_start();
+        let end = rest.find('\n').unwrap_or(rest.len());
+        rest[..end].trim_end()
+    }
+
+    #[test]
+    fn info_plist_has_what_the_microphone_prompt_needs() {
+        assert_eq!(
+            plist_value("CFBundleExecutable"),
+            format!("<string>{}</string>", env!("CARGO_BIN_NAME"))
+        );
+        assert_eq!(plist_value("LSUIElement"), "<true/>");
+        let usage = plist_value("NSMicrophoneUsageDescription");
+        assert!(usage.starts_with("<string>") && usage.ends_with("</string>"));
+        assert!(usage.len() > "<string></string>".len() + 20, "{usage}");
+        assert!(plist_value("CFBundleIdentifier").starts_with("<string>"));
+        assert_eq!(
+            plist_value("CFBundleShortVersionString"),
+            "<string>@VERSION@</string>",
+            "the bundle script substitutes the version"
+        );
+    }
 
     fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
         move |key| {
