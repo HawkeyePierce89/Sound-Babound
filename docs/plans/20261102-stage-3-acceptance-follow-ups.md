@@ -170,21 +170,21 @@ Item 9, `WORKER_FINISH_TIMEOUT`:
 
 `CLAUDE.md`:
 
-- [ ] Passthrough rules: replace "Past the high mark (target + 50 ms)" with the published target plus `max(HIGH_MARK_MARGIN, capture block + BLOCK_MARGIN)`.
-- [ ] Adaptive target: say that before a target is published the writer uses `max(TARGET_FILL, capture block + BLOCK_MARGIN)`, so the first two capture blocks never trim.
-- [ ] Say that `set_sink_rate` re-primes at every call and keeps the controller when the rate is the same.
-- [ ] List the new drift cases in the drift-test sentence.
-- [ ] `platform/` bullet:
+- [x] Passthrough rules: replace "Past the high mark (target + 50 ms)" with the published target plus `max(HIGH_MARK_MARGIN, capture block + BLOCK_MARGIN)`.
+- [x] Adaptive target: say that before a target is published the writer uses `max(TARGET_FILL, capture block + BLOCK_MARGIN)`, so the first two capture blocks never trim.
+- [x] Say that `set_sink_rate` re-primes at every call and keeps the controller when the rate is the same.
+- [x] List the new drift cases in the drift-test sentence.
+- [x] `platform/` bullet:
   - the probe has one deadline over the connect and both messages (at most `PROBE_TIMEOUT` plus one poll);
   - a hold-off made only of failed probes is capped at `PROBE_HOLD_OFF_MAX` (10 s), while a streak with a failed connect keeps doubling to 60 s.
-- [ ] `virtual_mic.rs` bullet:
+- [x] `virtual_mic.rs` bullet:
   - a `Checked(false)` goes through the retire decision (a vanished, retired device is released and created again once the stream ends);
   - `WORKER_FINISH_TIMEOUT` bounds quit and mic-off rather than covering the worst case, and the comment says what a timeout leaves behind.
 
 `README.md`:
 
-- [ ] In the config section, where the two cases are listed, add one sentence: the app also creates a hidden `.config.toml.lock` file next to the config (the edit lock) and never removes it.
-- [ ] Re-read both files against the code for every mechanism touched: high mark, fallback target, re-prime, probe deadline and hold-off, `checked` retire, lock file, worker timeout.
+- [x] In the config section, where the two cases are listed, add one sentence: the app also creates a hidden `.config.toml.lock` file next to the config (the edit lock) and never removes it.
+- [x] Re-read both files against the code for every mechanism touched: high mark, fallback target, re-prime, probe deadline and hold-off, `checked` retire, lock file, worker timeout.
 
 ## Post-Completion
 
