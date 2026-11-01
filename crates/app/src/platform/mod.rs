@@ -11,15 +11,41 @@ mod macos;
 mod windows;
 
 #[cfg(target_os = "linux")]
-pub use linux::{attach_parent_console, global_hotkeys_supported};
+pub use linux::{
+    attach_parent_console, default_virtual_device, global_hotkeys_supported,
+    virtual_input_exclusions,
+};
 #[cfg(target_os = "macos")]
-pub use macos::{attach_parent_console, prepare_event_loop, with_tray_icon};
+pub use macos::{
+    attach_parent_console, default_virtual_device, prepare_event_loop, virtual_input_exclusions,
+    with_tray_icon,
+};
 #[cfg(target_os = "windows")]
-pub use windows::attach_parent_console;
+pub use windows::{attach_parent_console, default_virtual_device, virtual_input_exclusions};
 
 /// Fallback for every other OS: nothing to attach.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn attach_parent_console() {}
+
+/// Fallback for every other OS: no known virtual cable, so the user names
+/// the device in the config. A blank pattern matches no device.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn default_virtual_device() -> &'static str {
+    ""
+}
+
+/// Fallback for every other OS: only the configured pattern is excluded.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub fn virtual_input_exclusions(pattern: &str) -> Vec<String> {
+    vec![pattern.to_string()]
+}
+
+/// Fallback for every other OS.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[allow(dead_code)] // For the tray mic status.
+pub fn virtual_mic_hint() -> &'static str {
+    "set [mic] virtual_device to a virtual audio cable's playback device"
+}
 
 /// Everywhere but macOS the tray app needs no event loop tweaks.
 #[cfg(not(target_os = "macos"))]
@@ -76,6 +102,14 @@ mod tests {
     fn attach_parent_console_is_safe_to_call_twice() {
         attach_parent_console();
         attach_parent_console();
+    }
+
+    #[test]
+    fn virtual_input_exclusions_start_with_the_pattern() {
+        let exclusions = virtual_input_exclusions("My Cable");
+        assert_eq!(exclusions.first().map(String::as_str), Some("My Cable"));
+        let defaults = virtual_input_exclusions(default_virtual_device());
+        assert_eq!(defaults[0], default_virtual_device());
     }
 
     #[test]

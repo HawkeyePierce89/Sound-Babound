@@ -18,3 +18,33 @@ pub fn prepare_event_loop<T: 'static>(event_loop: &mut EventLoop<T>) {
 pub fn with_tray_icon(builder: TrayIconBuilder) -> anyhow::Result<TrayIconBuilder> {
     Ok(builder.with_icon_templated(crate::icon::tray_icon([0, 0, 0])?))
 }
+
+/// The mic sink's device when the config names none: BlackHole, matched by
+/// name, so "BlackHole 2ch" and "BlackHole 16ch" both qualify.
+pub fn default_virtual_device() -> &'static str {
+    "BlackHole"
+}
+
+/// The inputs the capture must never open. BlackHole's input carries the
+/// same name as its output, so the pattern alone covers it.
+pub fn virtual_input_exclusions(pattern: &str) -> Vec<String> {
+    vec![pattern.to_string()]
+}
+
+/// What the user does to get the virtual microphone.
+#[allow(dead_code)] // For the tray mic status.
+pub fn virtual_mic_hint() -> &'static str {
+    "install BlackHole 2ch, then choose \"BlackHole 2ch\" as the microphone in the call app"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mic_defaults_target_blackhole() {
+        assert_eq!(default_virtual_device(), "BlackHole");
+        assert_eq!(virtual_input_exclusions("BlackHole"), ["BlackHole"]);
+        assert!(virtual_mic_hint().contains("BlackHole"));
+    }
+}

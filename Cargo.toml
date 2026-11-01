@@ -39,6 +39,7 @@ tray-icon = "0.26"
 global-hotkey = "0.9"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+toml_edit = "0.25"
 dirs = "7"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

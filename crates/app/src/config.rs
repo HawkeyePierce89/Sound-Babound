@@ -1,13 +1,19 @@
-//! TOML configuration: raw serde model, default template, path resolution and
-//! the validated [`ResolvedConfig`] produced by [`crate::hotkeys::resolve`].
+//! TOML configuration: raw serde model, default template, path resolution,
+//! the validated [`ResolvedConfig`] produced by [`crate::hotkeys::resolve`],
+//! and the comment-preserving [`set_mic_enabled`] writer.
 
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use babound_engine::{LoadError, Sound};
 use global_hotkey::hotkey::HotKey;
 use serde::Deserialize;
+use toml_edit::{DocumentMut, Item, Value};
+
+use crate::platform;
 
 /// Path value that selects the embedded demo chime.
 pub const BUILTIN_DEMO: &str = "builtin:demo";
@@ -44,6 +50,24 @@ master_gain = 1.0
 # Hotkey that stops every sound that is playing. Optional.
 stop_all_hotkey = "CmdOrCtrl+Shift+0"
 
+# Mic to call: send the sounds, mixed with your microphone, into a voice or
+# video call through a virtual audio cable. Off by default. The tray item
+# "Mic to call" turns it on and off and saves the choice here.
+#   enabled        - true or false (default false)
+#   virtual_device - the cable's playback device: the first output whose
+#                    name contains this text, ignoring case. The default is
+#                    "BlackHole" on macOS, "CABLE Input" (VB-CABLE) on
+#                    Windows and "sound_babound_sink" on Linux, where the app
+#                    creates the device itself.
+#   sound_gain     - volume of the sounds in the call, 0.0 to 4.0 (default 1.0)
+#   mic_gain       - volume of your microphone in the call, 0.0 to 4.0
+#                    (default 1.0)
+[mic]
+enabled = false
+# virtual_device = "BlackHole"
+sound_gain = 1.0
+mic_gain = 1.0
+
 # One [[sound]] block per sound.
 #   name   - label shown in the tray menu (required)
 #   path   - audio file (WAV, FLAC, OGG Vorbis or MP3), required. Absolute
@@ -77,6 +101,8 @@ pub struct RawConfig {
     pub stop_all_hotkey: Option<String>,
     #[serde(default, rename = "sound")]
     pub sounds: Vec<RawSound>,
+    #[serde(default)]
+    pub mic: RawMic,
 }
 
 impl Default for RawConfig {
@@ -85,6 +111,32 @@ impl Default for RawConfig {
             master_gain: default_gain(),
             stop_all_hotkey: None,
             sounds: Vec::new(),
+            mic: RawMic::default(),
+        }
+    }
+}
+
+/// The `[mic]` table as written by the user.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RawMic {
+    #[serde(default)]
+    pub enabled: bool,
+    /// `None` selects [`platform::default_virtual_device`].
+    #[serde(default)]
+    pub virtual_device: Option<String>,
+    #[serde(default = "default_gain")]
+    pub sound_gain: f32,
+    #[serde(default = "default_gain")]
+    pub mic_gain: f32,
+}
+
+impl Default for RawMic {
+    fn default() -> Self {
+        RawMic {
+            enabled: false,
+            virtual_device: None,
+            sound_gain: default_gain(),
+            mic_gain: default_gain(),
         }
     }
 }
@@ -177,11 +229,122 @@ pub struct ResolvedConfig {
     pub master_gain: f32,
     pub stop_all_hotkey: Option<HotKey>,
     pub sounds: Vec<ResolvedSound>,
+    pub mic: MicConfig,
+}
+
+/// The validated `[mic]` table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MicConfig {
+    pub enabled: bool,
+    /// The mic sink's device pattern, trimmed and never blank.
+    pub virtual_device: String,
+    /// Clamped to [`crate::hotkeys::MIN_GAIN`, `crate::hotkeys::MAX_GAIN`].
+    pub sound_gain: f32,
+    /// Clamped to [`crate::hotkeys::MIN_GAIN`, `crate::hotkeys::MAX_GAIN`].
+    pub mic_gain: f32,
+}
+
+impl Default for MicConfig {
+    /// Off, on the platform's default virtual device, at unity gains.
+    fn default() -> Self {
+        MicConfig {
+            enabled: false,
+            virtual_device: platform::default_virtual_device().to_string(),
+            sound_gain: default_gain(),
+            mic_gain: default_gain(),
+        }
+    }
+}
+
+/// Sets `[mic] enabled` in the config file at `path`, creating the table if
+/// it is missing. Every other key, comment and blank line is kept. The file
+/// is replaced atomically (a temp file in the same folder, then a rename), so
+/// a crash leaves either the old or the new file. A file that is not valid
+/// TOML is left untouched and reported as an error.
+#[allow(dead_code)] // Called by the tray mic toggle.
+pub fn set_mic_enabled(path: &Path, enabled: bool) -> Result<()> {
+    // Write through a symlink to the file it points at.
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read config {}", path.display()))?;
+    let updated = with_mic_enabled(&text, enabled)
+        .with_context(|| format!("failed to update config {}", path.display()))?;
+    write_atomically(&path, &updated)
+}
+
+/// `text` with `[mic] enabled` set to `enabled`.
+fn with_mic_enabled(text: &str, enabled: bool) -> Result<String> {
+    let mut doc: DocumentMut = text
+        .parse()
+        .map_err(|err| anyhow!("invalid config: {err}"))?;
+    let mic = doc.entry("mic").or_insert_with(toml_edit::table);
+    if let Some(table) = mic.as_table_mut() {
+        // A table only implied by `[mic.x]` headers would not print its keys.
+        table.set_implicit(false);
+    }
+    let Some(mic) = mic.as_table_like_mut() else {
+        bail!("`mic` is not a table");
+    };
+    match mic.get_mut("enabled").and_then(Item::as_value_mut) {
+        Some(value) => {
+            // Keep the spacing and any trailing comment on the line.
+            let decor = value.decor().clone();
+            *value = Value::from(enabled);
+            *value.decor_mut() = decor;
+        }
+        None => {
+            mic.insert("enabled", toml_edit::value(enabled));
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// Replaces `path` with `text` through a temp file and a rename.
+fn write_atomically(path: &Path, text: &str) -> Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("config path {} has no file name", path.display()))?;
+    let mut tmp_name = OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let written = (|| -> std::io::Result<()> {
+        let mut file = File::create(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        if let Ok(meta) = fs::metadata(path) {
+            file.set_permissions(meta.permissions())?;
+        }
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+    if let Err(err) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("failed to write config {}", path.display()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
+
+    fn write_config(dir: &TempDir, text: &str) -> PathBuf {
+        let path = dir.path().join("config.toml");
+        fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// The names of the files in `dir`, sorted.
+    fn files_in(dir: &TempDir) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
 
     #[test]
     fn default_template_parses_and_references_builtin_demo() {
@@ -193,6 +356,134 @@ mod tests {
         assert_eq!(demo.path, BUILTIN_DEMO);
         assert_eq!(demo.hotkey.as_deref(), Some("CmdOrCtrl+Shift+1"));
         assert_eq!(demo.gain, 1.0);
+        assert_eq!(raw.mic, RawMic::default());
+    }
+
+    #[test]
+    fn no_mic_table_means_mic_off() {
+        let raw = parse("master_gain = 0.5\n").unwrap();
+        assert_eq!(
+            raw.mic,
+            RawMic {
+                enabled: false,
+                virtual_device: None,
+                sound_gain: 1.0,
+                mic_gain: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn mic_table_parses_with_partial_keys() {
+        let raw = parse("[mic]\nenabled = true\nvirtual_device = \"Cable\"\n").unwrap();
+        assert!(raw.mic.enabled);
+        assert_eq!(raw.mic.virtual_device.as_deref(), Some("Cable"));
+        assert_eq!(raw.mic.sound_gain, 1.0);
+        assert_eq!(raw.mic.mic_gain, 1.0);
+        let err = parse("[mic]\nenabled = \"yes\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("enabled"), "{err:#}");
+    }
+
+    #[test]
+    fn mic_config_default_uses_the_platform_device() {
+        let mic = MicConfig::default();
+        assert!(!mic.enabled);
+        assert_eq!(mic.virtual_device, platform::default_virtual_device());
+        assert_eq!((mic.sound_gain, mic.mic_gain), (1.0, 1.0));
+    }
+
+    #[test]
+    fn set_mic_enabled_flips_only_the_enabled_value_of_the_template() {
+        let dir = TempDir::new("config-mic-template");
+        let path = write_config(&dir, DEFAULT_CONFIG);
+        assert_eq!(DEFAULT_CONFIG.matches("enabled = false").count(), 1);
+
+        set_mic_enabled(&path, true).unwrap();
+        let on = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            on,
+            DEFAULT_CONFIG.replace("enabled = false", "enabled = true")
+        );
+        assert!(parse(&on).unwrap().mic.enabled);
+
+        set_mic_enabled(&path, false).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT_CONFIG);
+        // No temp file is left behind.
+        assert_eq!(files_in(&dir), ["config.toml"]);
+    }
+
+    #[test]
+    fn set_mic_enabled_keeps_a_trailing_comment_and_other_mic_keys() {
+        let dir = TempDir::new("config-mic-comment");
+        let path = write_config(
+            &dir,
+            "[mic]\nenabled = false # off for now\nmic_gain = 0.5 # quiet\n",
+        );
+        set_mic_enabled(&path, true).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[mic]\nenabled = true # off for now\nmic_gain = 0.5 # quiet\n"
+        );
+    }
+
+    #[test]
+    fn set_mic_enabled_adds_the_table_and_keeps_everything_else() {
+        let dir = TempDir::new("config-mic-add");
+        let text = "# My sounds.\nmaster_gain = 0.5 # a bit quieter\n\n\
+                    # The horn.\n[[sound]]\nname = \"horn\"\npath = \"horn.wav\"\n";
+        let path = write_config(&dir, text);
+        set_mic_enabled(&path, true).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.starts_with(text), "{updated}");
+        let raw = parse(&updated).unwrap();
+        assert!(raw.mic.enabled);
+        assert_eq!(raw.master_gain, 0.5);
+        assert_eq!(raw.sounds.len(), 1);
+        assert_eq!(raw.sounds[0].name, "horn");
+
+        // A [mic] table without `enabled` gets the key.
+        let path = write_config(&dir, "[mic]\nmic_gain = 0.5\n");
+        set_mic_enabled(&path, true).unwrap();
+        let raw = parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw.mic.enabled);
+        assert_eq!(raw.mic.mic_gain, 0.5);
+    }
+
+    #[test]
+    fn set_mic_enabled_handles_inline_and_implicit_tables() {
+        let dir = TempDir::new("config-mic-inline");
+        let path = write_config(&dir, "mic = { enabled = false, mic_gain = 0.5 }\n");
+        set_mic_enabled(&path, true).unwrap();
+        let raw = parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw.mic.enabled);
+        assert_eq!(raw.mic.mic_gain, 0.5);
+
+        let path = write_config(&dir, "[mic.extra]\nx = 1\n");
+        set_mic_enabled(&path, true).unwrap();
+        let raw = parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw.mic.enabled);
+    }
+
+    #[test]
+    fn set_mic_enabled_fails_cleanly_on_a_malformed_file() {
+        let dir = TempDir::new("config-mic-malformed");
+        for text in ["master_gain = [\n", "mic = 5\n"] {
+            let path = write_config(&dir, text);
+            let err = set_mic_enabled(&path, true).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("config.toml"), "{msg}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+            assert_eq!(files_in(&dir), ["config.toml"]);
+        }
+    }
+
+    #[test]
+    fn set_mic_enabled_on_a_missing_file_names_the_path() {
+        let dir = TempDir::new("config-mic-missing");
+        let path = dir.path().join("missing.toml");
+        let err = set_mic_enabled(&path, true).unwrap_err();
+        assert!(format!("{err:#}").contains("missing.toml"), "{err:#}");
+        assert!(!path.exists());
     }
 
     #[test]

@@ -25,6 +25,9 @@ use crate::{paths, platform};
 /// Tooltip of the tray icon.
 const TOOLTIP: &str = "Sound-Babound";
 
+/// Whether an enabled mic path also captures the microphone.
+const MIC_CAPTURE: bool = true;
+
 /// Events forwarded into the event loop.
 #[derive(Debug)]
 enum UserEvent {
@@ -36,7 +39,7 @@ enum UserEvent {
 ///
 /// Startup: create the default config if missing, load it (the built-in
 /// default config is used if the file is unreadable or malformed), start the
-/// engine, apply the config's master gain, then run the event loop. The tray
+/// engine, apply the config's master gain and mic settings, then run the event loop. The tray
 /// and the hotkeys are created once the loop has started. The config path is
 /// kept even after a fallback, so "Reload config" and "Open config folder"
 /// work and a fixed file can be reloaded.
@@ -49,8 +52,8 @@ pub fn run() -> Result<()> {
         }
     };
     let board = actions::startup_board(config_path.as_deref())?;
-    let engine = Engine::start().context("failed to start the audio engine")?;
-    actions::apply_config(&engine, board.map());
+    let mut engine = Engine::start().context("failed to start the audio engine")?;
+    actions::apply_config(&mut engine, board.map(), MIC_CAPTURE);
 
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     platform::prepare_event_loop(&mut event_loop);
@@ -288,12 +291,12 @@ impl TrayApp {
             tracing::warn!("the config file location is unknown; nothing to reload");
             return;
         };
-        let Some(engine) = &self.engine else {
+        let Some(engine) = &mut self.engine else {
             return;
         };
         let hotkeys = &mut self.hotkeys;
         let tray = &self.tray;
-        let result = actions::reload(engine, &path, |board| {
+        let result = actions::reload(engine, &path, MIC_CAPTURE, |board| {
             let menu = build_menu(board.map())?;
             hotkeys.replace(board.map().hotkeys());
             if let Some(tray) = tray {

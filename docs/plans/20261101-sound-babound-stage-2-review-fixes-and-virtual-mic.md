@@ -305,22 +305,23 @@ Each of the three streams (monitor, mic sink, capture) runs under its own instan
 
 - Modify: `crates/app/src/config.rs`, `crates/app/src/hotkeys.rs`, `crates/app/src/actions.rs`, `crates/app/src/platform/{mod,macos,windows,linux}.rs`, `crates/app/Cargo.toml`, `Cargo.toml`
 
-- [ ] `RawMic { enabled = false, virtual_device: Option<String>, sound_gain = 1.0, mic_gain = 1.0 }` under `[mic]`.
-- [ ] Resolve it into `MicConfig`: gains clamped like the existing gains (with a warning); an empty `virtual_device` falls back to the default with a warning.
-- [ ] Per-OS defaults in `platform`:
+- [x] `RawMic { enabled = false, virtual_device: Option<String>, sound_gain = 1.0, mic_gain = 1.0 }` under `[mic]`.
+- [x] Resolve it into `MicConfig`: gains clamped like the existing gains (with a warning); an empty `virtual_device` falls back to the default with a warning.
+- [x] Per-OS defaults in `platform`:
   - `default_virtual_device()`: "BlackHole" on macOS, "CABLE Input" on Windows, "sound_babound_sink" on Linux;
   - `virtual_input_exclusions(pattern)`: the pattern itself plus "CABLE Output" on Windows, and the pattern plus "sound_babound_mic" on Linux;
   - `virtual_mic_hint()`.
-- [ ] Add a commented `[mic]` block to `DEFAULT_CONFIG`.
-- [ ] `config::set_mic_enabled(path, bool)` uses `toml_edit`. It keeps comments, creates `[mic]` if missing and writes atomically (temp file and rename).
-- [ ] `AudioControl` gains `set_mic`. `apply_config` sends it, built from `MicConfig`, the platform exclusions and a capture flag.
-- [ ] Tests:
+- [x] Add a commented `[mic]` block to `DEFAULT_CONFIG`.
+- [x] `config::set_mic_enabled(path, bool)` uses `toml_edit`. It keeps comments, creates `[mic]` if missing and writes atomically (temp file and rename).
+- [x] `AudioControl` gains `set_mic`. `apply_config` sends it, built from `MicConfig`, the platform exclusions and a capture flag.
+  (`set_mic` takes `&mut self`, like `Engine::set_mic`, so `apply_config` and `reload` take `&mut impl AudioControl` and a `capture: bool`; the tray passes `true` until Task 12 reads the permission. `virtual_mic_hint` and `set_mic_enabled` carry a dead-code allow until Task 13 uses them, and the hint is not yet re-exported from `platform`.)
+- [x] Tests:
   - parse defaults with no `[mic]`;
   - clamping;
   - the per-OS default;
   - `set_mic_enabled` keeps comments and other keys, adds the table, and fails cleanly on a malformed file;
   - `apply_config` sends the mic settings to the recording fake.
-- [ ] Run the verification gates plus the Linux stub clippy. All must pass before Task 11.
+- [x] Run the verification gates plus the Linux stub clippy. All must pass before Task 11.
 
 ### Task 11: Linux virtual device through pactl
 

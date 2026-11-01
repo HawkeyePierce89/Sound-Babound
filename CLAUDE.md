@@ -23,8 +23,8 @@ A Rust tray soundboard. Plans live in `docs/plans/`.
   - `main.rs`: the Windows GUI subsystem, plus attaching to the parent console when any argument is given.
   - `logging.rs`: `tracing` to stderr, with an `EnvFilter` read from `RUST_LOG` (default `info`).
   - `cli.rs`: the clap CLI and headless `play`.
-  - `config.rs`, `paths.rs`, `hotkeys.rs`: the TOML model, the default template, path resolution, hotkey parsing and validation.
-  - `actions.rs`: a pure `ActionMap`, the `AudioControl` trait and `apply_config`.
+  - `config.rs`, `paths.rs`, `hotkeys.rs`: the TOML model, the default template, path resolution, hotkey parsing and validation. The `[mic]` table resolves into `MicConfig` (gains clamped; a missing or blank `virtual_device` takes `platform::default_virtual_device()`). `config::set_mic_enabled` rewrites only `[mic] enabled` through `toml_edit`, keeping comments, and replaces the file atomically (temp file and rename).
+  - `actions.rs`: a pure `ActionMap`, the `AudioControl` trait (`play`, `set_master_gain`, `set_mic`) and `apply_config(control, map, capture)`, which sends the master gain and `mic_settings` (`None` when the mic is off; exclusions from `platform::virtual_input_exclusions`).
   - `tray_app.rs`: the tao event loop, the tray, hotkey registration and reload. `Hotkeys` goes through a small `HotkeyBackend` trait, so registration and reload can be tested with a fake.
   - `test_support.rs` (`#[cfg(test)]`): `TempDir`.
   - `icon.rs`: the generated tray icon.

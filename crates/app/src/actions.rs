@@ -9,11 +9,11 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use babound_engine::{Engine, Sound};
+use babound_engine::{Engine, MicSettings, Sound};
 use global_hotkey::hotkey::HotKey;
 
-use crate::config::{self, DEFAULT_CONFIG, RawConfig, ResolvedConfig};
-use crate::hotkeys;
+use crate::config::{self, DEFAULT_CONFIG, MicConfig, RawConfig, ResolvedConfig};
+use crate::{hotkeys, platform};
 
 /// Something the tray can do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +55,7 @@ pub struct ActionMap {
     hotkeys: HashMap<u32, Action>,
     hotkey_list: Vec<HotKey>,
     master_gain: f32,
+    mic: MicConfig,
 }
 
 impl ActionMap {
@@ -98,6 +99,7 @@ impl ActionMap {
             hotkeys,
             hotkey_list,
             master_gain: config.master_gain,
+            mic: config.mic.clone(),
         }
     }
 
@@ -125,6 +127,11 @@ impl ActionMap {
     pub fn master_gain(&self) -> f32 {
         self.master_gain
     }
+
+    /// The validated `[mic]` table.
+    pub fn mic(&self) -> &MicConfig {
+        &self.mic
+    }
 }
 
 /// The audio controls the tray needs from the engine.
@@ -134,6 +141,9 @@ pub trait AudioControl {
     fn play(&self, sound: &Sound, gain: f32) -> bool;
     /// Queues a master gain change. Returns false if the engine rejected it.
     fn set_master_gain(&self, gain: f32) -> bool;
+    /// Turns the mic path on (`Some`), off (`None`) or changes it. Fails if
+    /// the mic path cannot be started; it is then off.
+    fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<()>;
 }
 
 impl AudioControl for Engine {
@@ -144,16 +154,39 @@ impl AudioControl for Engine {
     fn set_master_gain(&self, gain: f32) -> bool {
         Engine::set_master_gain(self, gain)
     }
+
+    fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<()> {
+        Engine::set_mic(self, settings).context("failed to start the mic path")
+    }
 }
 
-/// Applies the engine-wide parts of a config: the master gain. Called at
-/// startup and after every successful reload.
-pub fn apply_config(control: &impl AudioControl, map: &ActionMap) {
+/// The engine's mic settings for `mic`: `None` when the mic is off.
+/// The capture refuses the platform's virtual inputs for the configured
+/// device. `capture` is false when the microphone may not be opened, so the
+/// mic sink carries the sounds only.
+pub fn mic_settings(mic: &MicConfig, capture: bool) -> Option<MicSettings> {
+    mic.enabled.then(|| MicSettings {
+        device_match: mic.virtual_device.clone(),
+        excluded_inputs: platform::virtual_input_exclusions(&mic.virtual_device),
+        sound_gain: mic.sound_gain,
+        mic_gain: mic.mic_gain,
+        capture,
+    })
+}
+
+/// Applies the engine-wide parts of a config: the master gain and the mic
+/// path (see [`mic_settings`] for `capture`). Called at startup and after
+/// every successful reload. A mic path that fails to start is logged, and
+/// the app runs without it.
+pub fn apply_config(control: &mut impl AudioControl, map: &ActionMap, capture: bool) {
     if !control.set_master_gain(map.master_gain()) {
         tracing::warn!(
             master_gain = map.master_gain(),
             "engine command queue is full; master gain not applied"
         );
+    }
+    if let Err(err) = control.set_mic(mic_settings(map.mic(), capture)) {
+        tracing::error!("{err:#}; running without the mic path");
     }
 }
 
@@ -280,17 +313,18 @@ pub fn startup_board(path: Option<&Path>) -> Result<Soundboard> {
 /// Reloads the config at `path`.
 ///
 /// On success `install` receives the new board (to swap hotkeys and the
-/// menu), then [`apply_config`] sends the new master gain to `control`, and
-/// the board is returned for the caller to keep. If loading or `install`
-/// fails, `control` is not touched and the error is returned.
+/// menu), then [`apply_config`] sends the new master gain and mic settings to
+/// `control`, and the board is returned for the caller to keep. If loading or
+/// `install` fails, `control` is not touched and the error is returned.
 pub fn reload(
-    control: &impl AudioControl,
+    control: &mut impl AudioControl,
     path: &Path,
+    capture: bool,
     install: impl FnOnce(&Soundboard) -> Result<()>,
 ) -> Result<Soundboard> {
     let board = load_board(path)?;
     install(&board)?;
-    apply_config(control, board.map());
+    apply_config(control, board.map(), capture);
     Ok(board)
 }
 
@@ -305,11 +339,14 @@ mod tests {
     use crate::config::{ResolvedSound, SoundSource};
     use crate::test_support::TempDir;
 
-    /// Records every call; `accept` decides the return value.
+    /// Records every call; `accept` decides the return value of the queue
+    /// pushes and `fail_mic` makes `set_mic` fail.
     struct FakeAudio {
         plays: RefCell<Vec<(String, f32)>>,
         gains: RefCell<Vec<f32>>,
+        mics: Vec<Option<MicSettings>>,
         accept: bool,
+        fail_mic: bool,
     }
 
     impl FakeAudio {
@@ -317,7 +354,9 @@ mod tests {
             FakeAudio {
                 plays: RefCell::new(Vec::new()),
                 gains: RefCell::new(Vec::new()),
+                mics: Vec::new(),
                 accept: true,
+                fail_mic: false,
             }
         }
     }
@@ -333,6 +372,14 @@ mod tests {
         fn set_master_gain(&self, gain: f32) -> bool {
             self.gains.borrow_mut().push(gain);
             self.accept
+        }
+
+        fn set_mic(&mut self, settings: Option<MicSettings>) -> Result<()> {
+            self.mics.push(settings);
+            if self.fail_mic {
+                anyhow::bail!("no thread for you");
+            }
+            Ok(())
         }
     }
 
@@ -359,6 +406,16 @@ mod tests {
                 entry("no hotkey", None),
                 entry("three", Some(hk(Code::Digit3))),
             ],
+            mic: MicConfig::default(),
+        }
+    }
+
+    fn mic_on(device: &str) -> MicConfig {
+        MicConfig {
+            enabled: true,
+            virtual_device: device.into(),
+            sound_gain: 0.5,
+            mic_gain: 2.0,
         }
     }
 
@@ -412,6 +469,7 @@ mod tests {
             master_gain: 1.0,
             stop_all_hotkey: None,
             sounds: Vec::new(),
+            mic: MicConfig::default(),
         });
         assert!(map.sound_items().is_empty());
         assert!(map.hotkeys().is_empty());
@@ -432,19 +490,19 @@ mod tests {
 
     #[test]
     fn apply_config_sets_master_gain() {
-        let fake = FakeAudio::new();
-        apply_config(&fake, &ActionMap::new(&sample_config()));
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, &ActionMap::new(&sample_config()), true);
         assert_eq!(*fake.gains.borrow(), [0.75]);
         assert!(fake.plays.borrow().is_empty());
     }
 
     #[test]
     fn apply_config_survives_a_full_queue() {
-        let fake = FakeAudio {
+        let mut fake = FakeAudio {
             accept: false,
             ..FakeAudio::new()
         };
-        apply_config(&fake, &ActionMap::new(&sample_config()));
+        apply_config(&mut fake, &ActionMap::new(&sample_config()), true);
         assert_eq!(*fake.gains.borrow(), [0.75]);
     }
 
@@ -453,8 +511,8 @@ mod tests {
         let dir = TempDir::new("actions-startup");
         let path = write_config(&dir, "master_gain = 0.5\n");
         let board = startup_board(Some(&path)).unwrap();
-        let fake = FakeAudio::new();
-        apply_config(&fake, board.map());
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, board.map(), true);
         assert_eq!(*fake.gains.borrow(), [0.5]);
     }
 
@@ -480,8 +538,8 @@ mod tests {
         let labels: Vec<_> = board.map().sound_items().iter().map(|i| &i.label).collect();
         assert_eq!(labels, ["Demo chime"]);
         assert_eq!(board.map().master_gain(), 1.0);
-        let fake = FakeAudio::new();
-        apply_config(&fake, board.map());
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, board.map(), true);
         assert_eq!(*fake.gains.borrow(), [1.0]);
     }
 
@@ -489,8 +547,8 @@ mod tests {
     fn reload_after_a_malformed_startup_installs_the_fixed_file() {
         let dir = TempDir::new("actions-malformed-fixed");
         let path = write_config(&dir, "master_gain = [\n");
-        let fake = FakeAudio::new();
-        apply_config(&fake, startup_board(Some(&path)).unwrap().map());
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, startup_board(Some(&path)).unwrap().map(), true);
 
         fs::write(
             &path,
@@ -498,7 +556,7 @@ mod tests {
         )
         .unwrap();
         let mut installed = Vec::new();
-        let board = reload(&fake, &path, |board| {
+        let board = reload(&mut fake, &path, true, |board| {
             installed.extend(board.map().sound_items().iter().map(|i| i.label.clone()));
             Ok(())
         })
@@ -512,8 +570,8 @@ mod tests {
     fn successful_reload_installs_and_applies_the_new_gain() {
         let dir = TempDir::new("actions-reload");
         let path = write_config(&dir, "master_gain = 1.0\n");
-        let fake = FakeAudio::new();
-        apply_config(&fake, startup_board(Some(&path)).unwrap().map());
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, startup_board(Some(&path)).unwrap().map(), true);
 
         fs::write(
             &path,
@@ -521,7 +579,7 @@ mod tests {
         )
         .unwrap();
         let mut installed = Vec::new();
-        let board = reload(&fake, &path, |board| {
+        let board = reload(&mut fake, &path, true, |board| {
             installed.push(board.map().sound_items().len());
             Ok(())
         })
@@ -535,9 +593,9 @@ mod tests {
     fn failed_reload_leaves_the_engine_untouched() {
         let dir = TempDir::new("actions-reload-bad");
         let path = write_config(&dir, "master_gain = [\n");
-        let fake = FakeAudio::new();
+        let mut fake = FakeAudio::new();
         let mut installed = false;
-        let err = reload(&fake, &path, |_| {
+        let err = reload(&mut fake, &path, true, |_| {
             installed = true;
             Ok(())
         })
@@ -550,7 +608,7 @@ mod tests {
         // A missing file is a failed reload too.
         fs::remove_file(&path).unwrap();
         assert!(
-            reload(&fake, &path, |_| {
+            reload(&mut fake, &path, true, |_| {
                 installed = true;
                 Ok(())
             })
@@ -558,16 +616,18 @@ mod tests {
         );
         assert!(!installed);
         assert!(fake.gains.borrow().is_empty());
+        assert!(fake.mics.is_empty());
     }
 
     #[test]
     fn failed_install_does_not_apply_the_config() {
         let dir = TempDir::new("actions-install-bad");
         let path = write_config(&dir, "master_gain = 0.25\n");
-        let fake = FakeAudio::new();
-        let err = reload(&fake, &path, |_| anyhow::bail!("menu failed")).unwrap_err();
+        let mut fake = FakeAudio::new();
+        let err = reload(&mut fake, &path, true, |_| anyhow::bail!("menu failed")).unwrap_err();
         assert!(err.to_string().contains("menu failed"));
         assert!(fake.gains.borrow().is_empty());
+        assert!(fake.mics.is_empty());
     }
 
     #[test]
@@ -604,5 +664,87 @@ mod tests {
         };
         board.play(0, &fake);
         assert_eq!(fake.plays.borrow().len(), 1);
+    }
+
+    #[test]
+    fn apply_config_turns_the_mic_off_when_disabled() {
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, &ActionMap::new(&sample_config()), true);
+        assert_eq!(fake.mics, [None]);
+    }
+
+    #[test]
+    fn mic_settings_follow_the_config_and_the_platform_exclusions() {
+        assert_eq!(mic_settings(&MicConfig::default(), true), None);
+        for capture in [true, false] {
+            assert_eq!(
+                mic_settings(&mic_on("My Cable"), capture),
+                Some(MicSettings {
+                    device_match: "My Cable".into(),
+                    excluded_inputs: platform::virtual_input_exclusions("My Cable"),
+                    sound_gain: 0.5,
+                    mic_gain: 2.0,
+                    capture,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn apply_config_sends_the_mic_settings() {
+        let config = ResolvedConfig {
+            mic: mic_on("My Cable"),
+            ..sample_config()
+        };
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, &ActionMap::new(&config), false);
+        assert_eq!(*fake.gains.borrow(), [0.75]);
+        assert_eq!(fake.mics, [mic_settings(&config.mic, false)]);
+        let sent = fake.mics[0].as_ref().unwrap();
+        assert!(!sent.capture);
+        assert_eq!(sent.device_match, "My Cable");
+    }
+
+    #[test]
+    fn apply_config_survives_a_mic_that_fails_to_start() {
+        let config = ResolvedConfig {
+            mic: mic_on("My Cable"),
+            ..sample_config()
+        };
+        let mut fake = FakeAudio {
+            fail_mic: true,
+            ..FakeAudio::new()
+        };
+        apply_config(&mut fake, &ActionMap::new(&config), true);
+        assert_eq!(*fake.gains.borrow(), [0.75]);
+        assert_eq!(fake.mics.len(), 1);
+    }
+
+    #[test]
+    fn reload_applies_the_mic_table() {
+        let dir = TempDir::new("actions-reload-mic");
+        let path = write_config(&dir, "master_gain = 1.0\n");
+        let mut fake = FakeAudio::new();
+        apply_config(&mut fake, startup_board(Some(&path)).unwrap().map(), true);
+
+        fs::write(
+            &path,
+            "[mic]\nenabled = true\nvirtual_device = \"Cable\"\nmic_gain = 0.25\n",
+        )
+        .unwrap();
+        let board = reload(&mut fake, &path, true, |_| Ok(())).unwrap();
+        assert!(board.map().mic().enabled);
+        assert_eq!(fake.mics.len(), 2);
+        assert_eq!(fake.mics[0], None);
+        let sent = fake.mics[1].as_ref().unwrap();
+        assert_eq!(sent.device_match, "Cable");
+        assert_eq!(sent.mic_gain, 0.25);
+        assert_eq!(sent.sound_gain, 1.0);
+        assert!(sent.capture);
+
+        // Turning it off again in the file turns the mic path off.
+        fs::write(&path, "[mic]\nenabled = false\n").unwrap();
+        reload(&mut fake, &path, true, |_| Ok(())).unwrap();
+        assert_eq!(fake.mics.last(), Some(&None));
     }
 }
