@@ -59,10 +59,10 @@ This plan closes the ten minor findings from the stage 3 acceptance review (PR #
 
 Item 1, fallback target:
 
-- [ ] Add a pure, integer-only helper `fallback_target(rate, capture_block)`. It returns `max(target_samples(rate), capture_block + samples_for(rate, BLOCK_MARGIN))`, at most `MAX_TARGET`.
-- [ ] In `write`, use the helper in place of `target_samples(rate)` when no target is published (`target == 0`). It sets both the high mark and the trim-back level. Invariant: with a fallback target `T ≥ B + M`, the high mark `T + max(H, B + M)` is at least `2B + 2M`, so two writes of `B` frames never trim. Once the reader publishes a target, it stands as now.
-- [ ] Update the docs of `write` and of the module ("the published target, or the fallback target before the reader published one"). Update the "Before any target is published" comment in `the_high_mark_follows_the_published_target` if it describes the write path.
-- [ ] Tests:
+- [x] Add a pure, integer-only helper `fallback_target(rate, capture_block)`. It returns `max(target_samples(rate), capture_block + samples_for(rate, BLOCK_MARGIN))`, at most `MAX_TARGET`.
+- [x] In `write`, use the helper in place of `target_samples(rate)` when no target is published (`target == 0`). It sets both the high mark and the trim-back level. Invariant: with a fallback target `T ≥ B + M`, the high mark `T + max(H, B + M)` is at least `2B + 2M`, so two writes of `B` frames never trim. Once the reader publishes a target, it stands as now.
+- [x] Update the docs of `write` and of the module ("the published target, or the fallback target before the reader published one"). Update the "Before any target is published" comment in `the_high_mark_follows_the_published_target` if it describes the write path.
+- [x] Tests:
   - on a fresh capture at 48 kHz, write two 2048-sample blocks with no read: `overruns() == 0` and `fill() == 4096`;
   - the same with two 4096-sample blocks: `fill() == 8192`;
   - unit asserts on `fallback_target`: 1440 for 480 frames, 2288 for 2048, 4336 for 4096;
@@ -70,23 +70,23 @@ Item 1, fallback target:
 
 Item 2, same-rate re-prime:
 
-- [ ] `set_sink_rate` drops `primed` at every call. When the rate is unchanged, it keeps `correction`, `integral` and `fill_error`, so the learned clock ratio survives; re-priming sets `fresh`, which only re-seeds the EMA. A rate change still calls `reset()`. Update the method doc.
-- [ ] Test: prime with 512-frame reads at 48k/48k while 480-frame capture blocks are written; note the correction; call `set_sink_rate(48_000)`; `note_block(2048)` and read 2048 frames; assert no underrun, the correction kept, and `!is_primed()` while the fill is below the new target; write until the fill reaches the published target, read again, and assert `is_primed()` and still zero underruns.
-- [ ] Update `a_sink_rate_change_resets` (same rate now re-primes but keeps the correction) and `mixer.rs::configure_passes_the_sink_rate_to_the_reader` ("the same rate re-primes").
+- [x] `set_sink_rate` drops `primed` at every call. When the rate is unchanged, it keeps `correction`, `integral` and `fill_error`, so the learned clock ratio survives; re-priming sets `fresh`, which only re-seeds the EMA. A rate change still calls `reset()`. Update the method doc.
+- [x] Test: prime with 512-frame reads at 48k/48k while 480-frame capture blocks are written; note the correction; call `set_sink_rate(48_000)`; `note_block(2048)` and read 2048 frames; assert no underrun, the correction kept, and `!is_primed()` while the fill is below the new target; write until the fill reaches the published target, read again, and assert `is_primed()` and still zero underruns.
+- [x] Update `a_sink_rate_change_resets` (same rate now re-primes but keeps the correction) and `mixer.rs::configure_passes_the_sink_rate_to_the_reader` ("the same rate re-primes").
 
 Item 3, drift test gaps:
 
-- [ ] Add `drift_with_4096_frame_blocks_holds_the_target`: 48k/48k, 4096/4096, `SINK_CLOCKS`, `CorrectionCheck::Settled`. Here `capture block + BLOCK_MARGIN` (90.3 ms) is more than `HIGH_MARK_MARGIN` (50 ms), so the high mark's capture-block branch is exercised.
-- [ ] Add `drift_48k_to_44k1_with_a_2048_frame_sink_block_holds_the_target`: capture 48k with 480 frames, sink 44.1k with 2048 frames, sink clocks `SINK_CLOCKS × 44100/48000`, `CorrectionCheck::Late`.
-- [ ] Both use the existing long-block tolerances, unchanged. If either case fails, stop and report the numbers. Do not loosen a tolerance or tune a constant.
+- [x] Add `drift_with_4096_frame_blocks_holds_the_target`: 48k/48k, 4096/4096, `SINK_CLOCKS`, `CorrectionCheck::Settled`. Here `capture block + BLOCK_MARGIN` (90.3 ms) is more than `HIGH_MARK_MARGIN` (50 ms), so the high mark's capture-block branch is exercised.
+- [x] Add `drift_48k_to_44k1_with_a_2048_frame_sink_block_holds_the_target`: capture 48k with 480 frames, sink 44.1k with 2048 frames, sink clocks `SINK_CLOCKS × 44100/48000`, `CorrectionCheck::Late`.
+- [x] Both use the existing long-block tolerances, unchanged. If either case fails, stop and report the numbers. Do not loosen a tolerance or tune a constant.
 
 Item 4, the `Settled` note:
 
-- [ ] Extend the `CorrectionCheck::Settled` doc comment, with no check changes:
+- [x] Extend the `CorrectionCheck::Settled` doc comment, with no check changes:
   - for a 2048-frame capture block at 48 kHz, the tolerance is 20 ppm plus one capture block over the 540 s span, about 99 ppm;
   - the ±200 ppm sink clocks prove the controller alive: without a correction the fill would drift 9.6 samples/s, past one block in about 3.5 minutes, and the deviation and overrun/underrun asserts would fail;
   - the 48000.5 Hz variant (about 10 ppm, about 300 samples in 10 minutes) passes even with a dead controller; it only proves the controller harmless: no runaway, no underrun or overrun, the fill inside the bound.
-- [ ] Run `cargo test -p babound-engine`; it must pass before Task 2.
+- [x] Run `cargo test -p babound-engine`; it must pass before Task 2.
 
 ### Task 2: PulseAudio probe: one deadline, and a 10 s ceiling for a probe-only hold-off
 

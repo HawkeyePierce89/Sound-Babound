@@ -1423,7 +1423,7 @@ mod tests {
         render(&mut m, 16);
         assert!(reader(&m).is_primed());
         m.configure(48_000, 1);
-        assert!(reader(&m).is_primed(), "the same rate keeps the reader");
+        assert!(!reader(&m).is_primed(), "the same rate re-primes");
         m.configure(44_100, 2);
         assert!(!reader(&m).is_primed(), "a new rate re-primes");
 
