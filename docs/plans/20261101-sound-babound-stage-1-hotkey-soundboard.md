@@ -234,11 +234,11 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
 - Create: `crates/engine/src/watcher/macos.rs`, `crates/engine/src/watcher/windows.rs`, `crates/engine/src/watcher/linux.rs`
 - Modify: `crates/engine/src/watcher/mod.rs`, `crates/engine/Cargo.toml`
 
-- [ ] macOS:
+- [x] macOS:
   - Call `AudioObjectAddPropertyListener` on `kAudioObjectSystemObject` for `DefaultOutputDevice`, `DefaultInputDevice` and `Devices`.
   - The client data is a boxed `Sender`; the `extern "C"` listener maps the selector to a `DeviceEvent` (`Devices` → `DeviceListChanged`, which goes through the identity check from Task 4).
   - The guard removes all three listeners and then frees the box.
-- [ ] Windows:
+- [x] Windows:
   - A dedicated thread does `CoInitializeEx(COINIT_MULTITHREADED)`, creates `IMMDeviceEnumerator` and registers an `IMMNotificationClient` implemented with `#[implement]`.
   - Event mapping:
     - `OnDefaultDeviceChanged`: eRender to `DefaultOutputChanged`, eCapture to `DefaultInputChanged`; react only to the eConsole role to avoid duplicates.
@@ -248,12 +248,12 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
     - `OnPropertyValueChanged` is ignored.
   - Removal, state and add events are not filtered here; the supervisor's identity check (Task 4) decides whether they rebuild.
   - The guard signals the thread to unregister, then `CoUninitialize` and join.
-- [ ] Linux: a no-op watcher with a doc comment. ALSA `default` routes through PipeWire/PulseAudio, which follows default-sink changes; stream errors still reach the supervisor.
-- [ ] `mod.rs`: `platform_watcher()` dispatches by `cfg(target_os)`; the no-op is also the fallback for other OSes.
-- [ ] Write tests:
+- [x] Linux: a no-op watcher with a doc comment. ALSA `default` routes through PipeWire/PulseAudio, which follows default-sink changes; stream errors still reach the supervisor.
+- [x] `mod.rs`: `platform_watcher()` dispatches by `cfg(target_os)`; the no-op is also the fallback for other OSes.
+- [x] Write tests:
   - macOS: start the watcher and drop the guard without error or leak (`cfg(target_os = "macos")`)
   - shared: extend the Task 4 classification tests so every event variant the platform watchers emit is covered by a `rebuild_policy()` assertion
-- [ ] Run the test suite and `cargo check --target x86_64-pc-windows-msvc`. They must pass before Task 7.
+- [x] Run the test suite and `cargo check --target x86_64-pc-windows-msvc`. They must pass before Task 7.
 
 ### Task 7: Public engine API
 

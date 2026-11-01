@@ -19,7 +19,7 @@ thiserror = "2"
 tracing = "0.1"
 
 # Engine, macOS
-objc2-core-audio = "0.3"
+objc2-core-audio = { version = "0.3", default-features = false }
 objc2-core-foundation = "0.3"
 
 # Engine, Windows

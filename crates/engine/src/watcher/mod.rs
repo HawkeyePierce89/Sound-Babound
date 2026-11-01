@@ -5,13 +5,30 @@
 //! what each event means through [`DeviceEvent::rebuild_policy`].
 //!
 //! Platform watchers live in this module's platform submodules and are picked
-//! by [`platform_watcher`]. Until they exist, every platform uses the no-op
-//! watcher; stream errors still reach the supervisor through the sink.
+//! by [`platform_watcher`]: CoreAudio property listeners on macOS, an
+//! `IMMNotificationClient` on Windows, and the no-op watcher on Linux and every
+//! other OS. Stream errors reach the supervisor through the sink either way.
 
 use std::sync::mpsc::Sender;
 
 use crate::error::WatcherError;
 use crate::supervisor::SupervisorMsg;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+use NoopWatcher as PlatformWatcher;
+#[cfg(target_os = "linux")]
+use linux::PlatformWatcher;
+#[cfg(target_os = "macos")]
+use macos::CoreAudioWatcher as PlatformWatcher;
+#[cfg(target_os = "windows")]
+use windows::MmDeviceWatcher as PlatformWatcher;
 
 /// An audio device change reported by the OS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -110,12 +127,85 @@ impl DeviceWatcher for NoopWatcher {
 
 /// The watcher for the current platform.
 pub fn platform_watcher() -> Box<dyn DeviceWatcher> {
-    Box::new(NoopWatcher)
+    Box::new(PlatformWatcher)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every OS notification the platform watchers translate, the event it
+    /// becomes and the policy that event must have. (Windows'
+    /// `OnPropertyValueChanged` is ignored and so emits nothing.) Platform test modules
+    /// check their own mapping against this table.
+    pub(crate) const PLATFORM_EVENT_TABLE: [(&str, DeviceEvent, RebuildPolicy); 8] = [
+        (
+            "macos:DefaultOutputDevice",
+            DeviceEvent::DefaultOutputChanged,
+            RebuildPolicy::Always,
+        ),
+        (
+            "macos:DefaultInputDevice",
+            DeviceEvent::DefaultInputChanged,
+            RebuildPolicy::Ignore,
+        ),
+        (
+            "macos:Devices",
+            DeviceEvent::DeviceListChanged,
+            RebuildPolicy::IfDefaultOutputChanged,
+        ),
+        (
+            "windows:OnDefaultDeviceChanged(eRender)",
+            DeviceEvent::DefaultOutputChanged,
+            RebuildPolicy::Always,
+        ),
+        (
+            "windows:OnDefaultDeviceChanged(eCapture)",
+            DeviceEvent::DefaultInputChanged,
+            RebuildPolicy::Ignore,
+        ),
+        (
+            "windows:OnDeviceRemoved",
+            DeviceEvent::DeviceRemoved,
+            RebuildPolicy::IfDefaultOutputChanged,
+        ),
+        (
+            "windows:OnDeviceStateChanged",
+            DeviceEvent::DeviceStateChanged,
+            RebuildPolicy::IfDefaultOutputChanged,
+        ),
+        (
+            "windows:OnDeviceAdded",
+            DeviceEvent::DeviceListChanged,
+            RebuildPolicy::IfDefaultOutputChanged,
+        ),
+    ];
+
+    /// The event a platform notification maps to, according to the table.
+    pub(crate) fn table_event(source: &str) -> DeviceEvent {
+        PLATFORM_EVENT_TABLE
+            .iter()
+            .find(|(name, _, _)| *name == source)
+            .map(|(_, event, _)| *event)
+            .unwrap_or_else(|| panic!("{source} is not in the platform event table"))
+    }
+
+    #[test]
+    fn every_platform_event_has_its_policy() {
+        for (source, event, policy) in PLATFORM_EVENT_TABLE {
+            assert_eq!(event.rebuild_policy(), policy, "{source} -> {event:?}");
+        }
+    }
+
+    #[test]
+    fn platform_watchers_emit_every_event_variant() {
+        for event in DeviceEvent::ALL {
+            assert!(
+                PLATFORM_EVENT_TABLE.iter().any(|(_, e, _)| *e == event),
+                "{event:?} is never emitted"
+            );
+        }
+    }
 
     #[test]
     fn every_event_maps_to_its_policy() {

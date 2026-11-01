@@ -101,9 +101,12 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "crossbeam-queue",
+ "objc2-core-audio",
  "symphonia",
  "thiserror 2.0.21",
  "tracing",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]
