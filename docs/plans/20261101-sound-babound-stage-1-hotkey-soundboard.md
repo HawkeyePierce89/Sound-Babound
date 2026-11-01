@@ -278,19 +278,19 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
 **Files:**
 - Create: `crates/app/src/config.rs`, `crates/app/src/paths.rs`, `crates/app/src/hotkeys.rs`
 
-- [ ] `paths.rs`: `config_dir()` is `dirs::config_dir()/sound-babound`; `config_file()` is `config.toml` inside it; `ensure_default_config()` writes the commented template if the file is missing.
-- [ ] `config.rs`, raw serde model:
+- [x] `paths.rs`: `config_dir()` is `dirs::config_dir()/sound-babound`; `config_file()` is `config.toml` inside it; `ensure_default_config()` writes the commented template if the file is missing.
+- [x] `config.rs`, raw serde model:
   - `master_gain`, default 1.0
   - `stop_all_hotkey`
   - `[[sound]]` entries with `name`, `path`, `hotkey` and optional `gain` (default 1.0)
-- [ ] `config.rs`, template and path resolution:
+- [x] `config.rs`, template and path resolution:
   - The `DEFAULT_CONFIG` template binds `path = "builtin:demo"` to `CmdOrCtrl+Shift+1`, sets stop-all to `CmdOrCtrl+Shift+0`, and explains every field and the hotkey syntax in comments.
   - Path resolution: `builtin:demo` maps to the embedded asset; absolute paths are used as-is; relative paths are joined to the config dir.
-- [ ] `hotkeys.rs`:
+- [x] `hotkeys.rs`:
   - Parse via `global_hotkey::hotkey::HotKey::from_str`.
   - If the parser rejects a documented spelling (`Ctrl+Shift+1`, `Alt+F5`, `Cmd+Shift+A`), add a small alias-normalization step before parsing.
   - Validation returns a `ResolvedConfig` plus a list of warnings. Unparsable hotkeys and duplicate hotkeys (the second one onward) are skipped with a warning, the sound stays playable from the tray, and gains (per-sound and master) are clamped to [0, 4].
-- [ ] Write tests:
+- [x] Write tests:
   - the default template parses and references `builtin:demo`
   - each example hotkey parses
   - garbage hotkeys produce a warning and no crash
@@ -299,7 +299,7 @@ Stage 2 (virtual mic) is out of scope. The engine is shaped so that a second sin
   - missing optional fields take their defaults
   - malformed TOML gives an error with a readable message
   - `ensure_default_config` in a temp dir creates the file once and does not overwrite it
-- [ ] Run the test suite. It must pass before Task 9.
+- [x] Run the test suite. It must pass before Task 9.
 
 ### Task 9: Headless `play` CLI
 

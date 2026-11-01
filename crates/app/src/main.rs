@@ -1,7 +1,12 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod cli;
+mod config;
+mod hotkeys;
 mod logging;
+mod paths;
+#[cfg(test)]
+mod test_support;
 
 use clap::Parser;
 
@@ -18,9 +23,34 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Tray mode. Stub until the tray application is implemented.
+/// Tray mode. Until the tray application is implemented this only creates,
+/// loads and validates the config, decodes its sounds and logs the result.
 fn run_tray() -> anyhow::Result<()> {
-    tracing::info!("tray mode is not implemented yet");
+    let path = paths::ensure_default_config()?;
+    let raw = config::load(&path)?;
+    let config_dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let (resolved, warnings) = hotkeys::resolve(&raw, config_dir);
+    for warning in &warnings {
+        tracing::warn!("{warning}");
+    }
+    for entry in &resolved.sounds {
+        match entry.source.load() {
+            Ok(sound) => tracing::info!(
+                name = %entry.name,
+                hotkey = ?entry.hotkey.map(|h| h.to_string()),
+                gain = entry.gain,
+                frames = sound.frames(),
+                "sound ready"
+            ),
+            Err(err) => tracing::warn!(name = %entry.name, "{err}"),
+        }
+    }
+    tracing::info!(
+        sounds = resolved.sounds.len(),
+        master_gain = resolved.master_gain,
+        stop_all = ?resolved.stop_all_hotkey.map(|h| h.to_string()),
+        "config loaded; tray mode is not implemented yet"
+    );
     Ok(())
 }
 
