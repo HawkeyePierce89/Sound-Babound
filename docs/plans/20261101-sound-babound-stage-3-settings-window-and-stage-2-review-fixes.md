@@ -204,27 +204,27 @@ Part B fixes the five findings from the stage 2 acceptance review:
 - Create: `crates/app/src/virtual_mic.rs`
 - Modify: `crates/app/src/actions.rs` (move `WithVirtualMic`, `VirtualDevice`, `DEVICE_CHECK_INTERVAL` and their tests out), `crates/app/src/main.rs`
 
-- [ ] Move `WithVirtualMic` and its tests into `virtual_mic.rs` unchanged first, and run the tests.
-- [ ] Device worker: a thread that owns the device (`Option<G>`, `G: VirtualDevice + Send`) and the `create` function, and handles requests FIFO from a channel:
+- [x] Move `WithVirtualMic` and its tests into `virtual_mic.rs` unchanged first, and run the tests.
+- [x] Device worker: a thread that owns the device (`Option<G>`, `G: VirtualDevice + Send`) and the `create` function, and handles requests FIFO from a channel:
   - `Create { epoch }`: reuse the held device, or call `create`.
   - `Check { epoch }`: `is_present`.
   - `Release`: drop the device, which unloads it.
   - `Forget`: `mem::forget` it, for a shutdown whose stop timed out.
   - Every reply (`Created { epoch, result: Result<bool> }` where the bool says whether a device exists, `Checked { epoch, present }`, `Released`) goes to an injected `Fn(DeviceReply) + Send` callback.
   - `finish(timeout)` closes the channel and joins for at most the timeout. Three `pactl` calls at 3 s each bound the unload, so 10 s.
-- [ ] `WithVirtualMic<C, R>` keeps the mic path state on the event loop thread and sends requests through a small `DeviceRequests` trait (the worker in production, a recording fake in tests). The device state is one of absent, creating (with an epoch), present or retired.
-- [ ] Ordering invariants, unchanged in meaning:
+- [x] `WithVirtualMic<C, R>` keeps the mic path state on the event loop thread and sends requests through a small `DeviceRequests` trait (the worker in production, a recording fake in tests). The device state is one of absent, creating (with an epoch), present or retired.
+- [x] Ordering invariants, unchanged in meaning:
   - The mic path starts only after a current `Created(Ok)` arrives.
   - Mic off stops the engine path (synchronously, bounded by the engine's 3 s stop timeout) before it sends `Release`. If `mic_stopped()` is false it keeps the device retired instead, and `release_retired` sends `Release` once the stream ended or takes the device back.
   - A vanished device (`Checked { present: false }`) stops the path, then sends `Release` and `Create`.
   - The lock and `pactl` code that never unloads another instance's sink is untouched.
-- [ ] Stale replies:
+- [x] Stale replies:
   - every mic-on bumps the epoch, and a reply with an old epoch is ignored;
   - a mic-off while creating sends `Release` right away, which the FIFO runs after the pending create.
-- [ ] `create_failed` logging (first failure at error, repeats at debug) and the `DEVICE_CHECK_INTERVAL` throttle move with the state machine. `restore_device` now sends `Check` or `Create` instead of calling them.
-- [ ] `waiting_for_device` distinguishes "creating" (shown as `MicStatus::Starting`) from "create failed" (shown as not found).
-- [ ] `shutdown(stop)`: stop the engine, then send `Release` (or `Forget` if a stream did not stop), then `finish`.
-- [ ] Tests (fakes only, no `pactl`):
+- [x] `create_failed` logging (first failure at error, repeats at debug) and the `DEVICE_CHECK_INTERVAL` throttle move with the state machine. `restore_device` now sends `Check` or `Create` instead of calling them.
+- [x] `waiting_for_device` distinguishes "creating" (shown as `MicStatus::Starting`) from "create failed" (shown as not found).
+- [x] `shutdown(stop)`: stop the engine, then send `Release` (or `Forget` if a stream did not stop), then `finish`.
+- [x] Tests (fakes only, no `pactl`):
   - every existing `WithVirtualMic` test, adapted to deliver replies explicitly;
   - the path never starts before `Created(Ok)`;
   - `Created` arriving after the mic was turned off: no path start, and `Release` follows the create;
@@ -233,7 +233,9 @@ Part B fixes the five findings from the stage 2 acceptance review:
   - on/off/on with replies in order starts the path once, with the latest settings;
   - retired-device handling with async releases;
   - the worker thread with a fake `create`: FIFO order, `Release` drops (a drop counter), `Forget` does not, and `finish` returns within its bound when a fake `create` blocks.
-- [ ] Run the verification gates plus the Linux cross clippy. All must pass before Task 6.
+- [x] Run the verification gates plus the Linux cross clippy. All must pass before Task 6.
+  - Note: to keep the tray building, this task wired it minimally: `TrayAudio` is `WithVirtualMic<Engine, DeviceWorker>`, the worker's reply callback sends into an `mpsc` channel that the event loop drains on every event and mic poll (`handle_device_replies`), and `DeviceWait::Pending` shows as `MicStatus::Starting`. Task 6 replaces the channel with `UserEvent::Device` through the `EventLoopProxy` and adds the pure mapping test. `shutdown` keeps its signature, so `quit` is unchanged.
+  - Note: the inherent bounded join is `DeviceWorker::finish_within(timeout)`; the `DeviceRequests::finish` trait method calls it with `WORKER_FINISH_TIMEOUT` (10 s). `restore_device` also sends at most one `Check` at a time, so checks never pile up behind a slow worker, and a retried create keeps showing as not found (no flicker to starting every 5 s).
 
 ### Task 6: Tray wiring for the device worker (B.3, part 2)
 

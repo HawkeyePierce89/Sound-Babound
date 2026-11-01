@@ -11,6 +11,7 @@ mod platform;
 #[cfg(test)]
 mod test_support;
 mod tray_app;
+mod virtual_mic;
 
 use std::process::ExitCode;
 

@@ -6,7 +6,7 @@
 //! [`EventLoopProxy`]; what they do is decided by [`actions`].
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -20,8 +20,9 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::actions::{
     self, Action, ActionMap, AudioControl, CaptureGate, MENU_OPEN_CONFIG, MENU_QUIT, MENU_RELOAD,
-    MENU_STOP_ALL, MENU_TOGGLE_MIC, Soundboard, WithVirtualMic,
+    MENU_STOP_ALL, MENU_TOGGLE_MIC, Soundboard,
 };
+use crate::virtual_mic::{DeviceReply, DeviceWait, DeviceWorker, WithVirtualMic};
 use crate::{paths, platform};
 
 /// Tooltip of the tray icon.
@@ -30,9 +31,9 @@ const TOOLTIP: &str = "Sound-Babound";
 /// How often the mic status line is refreshed while the mic is enabled.
 const MIC_POLL: Duration = Duration::from_secs(1);
 
-/// The engine, with the virtual device the app creates itself on Linux.
-type TrayAudio =
-    WithVirtualMic<Engine, platform::VirtualMic, fn() -> Result<Option<platform::VirtualMic>>>;
+/// The engine, with the virtual device the app creates itself on Linux,
+/// which a worker thread creates and unloads.
+type TrayAudio = WithVirtualMic<Engine, DeviceWorker>;
 
 /// Events forwarded into the event loop.
 #[derive(Debug)]
@@ -60,8 +61,12 @@ pub fn run() -> Result<()> {
     };
     let board = actions::startup_board(config_path.as_deref())?;
     let engine = Engine::start().context("failed to start the audio engine")?;
-    let create_device: fn() -> Result<Option<platform::VirtualMic>> = platform::create_virtual_mic;
-    let mut audio: TrayAudio = WithVirtualMic::new(engine, create_device);
+    let (reply_sender, device_replies) = mpsc::channel();
+    let worker = DeviceWorker::spawn(platform::create_virtual_mic, move |reply| {
+        // The receiver is gone only once the event loop has ended.
+        let _ = reply_sender.send(reply);
+    })?;
+    let mut audio: TrayAudio = WithVirtualMic::new(engine, worker);
     let mut capture_gate = CaptureGate::default();
     let capture = capture_gate.capture(platform::microphone_access(), board.map().mic());
     actions::apply_config(&mut audio, board.map(), capture);
@@ -80,6 +85,7 @@ pub fn run() -> Result<()> {
         mic_label: String::new(),
         next_mic_poll: None,
         capture_gate,
+        device_replies,
     };
     app.mic_label = app.current_mic_label();
     event_loop.run(move |event, _target, control_flow| {
@@ -307,6 +313,9 @@ struct TrayApp {
     next_mic_poll: Option<Instant>,
     /// Turns the microphone permission into the mic path's capture flag.
     capture_gate: CaptureGate,
+    /// The virtual mic worker's replies, handed to the audio on every event
+    /// and mic poll.
+    device_replies: mpsc::Receiver<DeviceReply>,
 }
 
 impl TrayApp {
@@ -447,7 +456,8 @@ impl TrayApp {
         self.audio
             .as_ref()
             .map_or(MicStatus::Off, |audio| match audio.waiting_for_device() {
-                Some(pattern) => MicStatus::NotFound(pattern.to_string()),
+                Some(DeviceWait::Unavailable(pattern)) => MicStatus::NotFound(pattern.to_string()),
+                Some(DeviceWait::Pending) => MicStatus::Starting,
                 None => audio.control().mic_status(),
             })
     }
@@ -480,12 +490,13 @@ impl TrayApp {
     /// virtual device waits for a mic stream that did not stop in time.
     /// Leaves an exit alone.
     fn schedule_mic_poll(&mut self, control_flow: &mut ControlFlow) {
+        if self.audio.is_none() || matches!(control_flow, ControlFlow::ExitWithCode(_)) {
+            return;
+        }
+        self.handle_device_replies();
         let Some(audio) = &self.audio else {
             return;
         };
-        if matches!(control_flow, ControlFlow::ExitWithCode(_)) {
-            return;
-        }
         let (refresh, next) = mic_poll(
             self.board.map().mic().enabled || audio.has_retired_device(),
             self.next_mic_poll,
@@ -504,6 +515,22 @@ impl TrayApp {
         }
         self.next_mic_poll = next;
         *control_flow = control_flow_for(next);
+    }
+
+    /// Hands the virtual mic worker's replies to the audio, which starts the
+    /// mic path once its device exists.
+    fn handle_device_replies(&mut self) {
+        let Some(audio) = &mut self.audio else {
+            return;
+        };
+        let mut any = false;
+        while let Ok(reply) = self.device_replies.try_recv() {
+            audio.on_reply(reply);
+            any = true;
+        }
+        if any {
+            self.refresh_mic_status();
+        }
     }
 
     /// Unregisters the hotkeys, shuts the engine down and then drops the
