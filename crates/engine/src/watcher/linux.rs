@@ -1,10 +1,19 @@
-//! Linux device watcher: a default-input poller for the capture, nothing for
-//! the outputs.
+//! Linux device watcher: a default-input poller for the capture, an
+//! output-list poller for the mic sink, nothing for the monitor.
 //!
 //! The monitor opens ALSA's `default` PCM, which on current desktops routes
 //! through PipeWire or PulseAudio. Those servers move the stream when the
 //! default sink changes, so there is nothing to rebuild on a default switch.
-//! The mic sink targets a named device and ignores default changes anyway.
+//!
+//! The mic sink targets a named device and ignores default changes. But when
+//! that device goes away while the sound server keeps running (its module is
+//! unloaded), the server moves the mic sink's stream to the default sink
+//! without an error, so the call mix, live microphone included, would play
+//! on the user's speakers. So the mic sink's watcher asks the PulseAudio
+//! host for the output list every [`POLL_INTERVAL`] and reports a change as
+//! [`DeviceEvent::DeviceListChanged`]: the supervisor finds the device gone,
+//! drops the stream and reports it not found, which lets the app create the
+//! device again.
 //!
 //! The capture is different: cpal's PulseAudio host resolves the default
 //! source when the stream is built and stays on it. So the capture's watcher
@@ -18,7 +27,7 @@
 //! error). When a device really goes away, the stream may also report an
 //! error, which still reaches the supervisor through the error callback.
 //!
-//! The poller asks the process-wide PulseAudio host of
+//! Each poller asks the process-wide PulseAudio host of
 //! [`platform::mic_host`] afresh on every poll, so no device is cached. It
 //! never opens a host of its own: the pinned PulseAudio client's reactor
 //! thread blocks on its socket and is not woken when the client drops, so
@@ -34,7 +43,7 @@ use std::time::Duration;
 use cpal::HostId;
 use cpal::traits::HostTrait;
 
-use super::inputs::{InputHost, InputsQuery, InputsSnapshot, change_event};
+use super::inputs::{InputHost, InputsQuery, InputsSnapshot, change_event, list_change_event};
 use super::{DeviceWatcher, EventSender, NoopWatcher, WatcherGuard, poll};
 use crate::cpal_sink::identity_of;
 use crate::error::WatcherError;
@@ -55,12 +64,17 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// connection: hung pollers never pile up across mic restarts.
 static QUERY_GATE: Mutex<()> = Mutex::new(());
 
-/// The watcher of `role`: the input poller for the capture, the no-op
-/// watcher for the monitor and the mic sink.
+/// The same for every output poller. A gate of its own, so the two pollers
+/// running side by side never make each other skip a poll.
+static OUTPUT_QUERY_GATE: Mutex<()> = Mutex::new(());
+
+/// The watcher of `role`: the input poller for the capture, the output
+/// poller for the mic sink and the no-op watcher for the monitor.
 pub fn platform_watcher(role: StreamRole) -> Box<dyn DeviceWatcher> {
     match role {
         StreamRole::Capture => Box::new(InputPoller),
-        StreamRole::Monitor | StreamRole::MicSink => Box::new(NoopWatcher),
+        StreamRole::MicSink => Box::new(OutputPoller),
+        StreamRole::Monitor => Box::new(NoopWatcher),
     }
 }
 
@@ -100,5 +114,45 @@ impl InputHost for Arc<cpal::Host> {
             .default_input_device()
             .map(|device| identity_of(&device));
         Some(InputsSnapshot::new(default, inputs))
+    }
+}
+
+/// Polls the mic host's output list.
+#[derive(Debug, Default, Clone, Copy)]
+struct OutputPoller;
+
+impl DeviceWatcher for OutputPoller {
+    fn start(&mut self, events: EventSender) -> Result<Box<dyn WatcherGuard>, WatcherError> {
+        let mut query = InputsQuery::new(|| OutputList(platform::mic_host()));
+        poll::start(
+            POLL_INTERVAL,
+            STOP_TIMEOUT,
+            &OUTPUT_QUERY_GATE,
+            move || query.poll(),
+            list_change_event,
+            events,
+        )
+    }
+}
+
+/// The mic host asked for its outputs: a snapshot with no default whose list
+/// holds the outputs.
+struct OutputList(Arc<cpal::Host>);
+
+impl InputHost for OutputList {
+    /// Only the shared PulseAudio host is kept, as for the inputs.
+    fn keep(&self) -> bool {
+        self.0.keep()
+    }
+
+    /// A failed output list means the connection is gone.
+    fn inputs(&self) -> Option<InputsSnapshot> {
+        let outputs = self
+            .0
+            .output_devices()
+            .ok()?
+            .map(|device| identity_of(&device))
+            .collect();
+        Some(InputsSnapshot::new(None, outputs))
     }
 }

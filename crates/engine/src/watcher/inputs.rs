@@ -9,6 +9,9 @@
 //! reported as [`DeviceEvent::DeviceListChanged`], so the supervisor checks
 //! the identity a build would pick now and refuses the excluded default.
 //!
+//! The Linux mic sink's watcher runs the same query over the output list,
+//! with no default (see [`list_change_event`]).
+//!
 //! The host is kept while it answers. When its connection fails, a fresh one
 //! is asked in the same poll, so a reconnect to the same default input reads
 //! as no change rather than as a change there and back.
@@ -29,6 +32,16 @@ impl InputsSnapshot {
         inputs.sort();
         InputsSnapshot { default, inputs }
     }
+}
+
+/// The event for any change to a list polled without a default (the mic
+/// sink's outputs): the supervisor checks the identity a build would pick
+/// now. A first answer that came late reads the same way.
+pub(crate) fn list_change_event(
+    _previous: Option<&InputsSnapshot>,
+    _current: &InputsSnapshot,
+) -> DeviceEvent {
+    DeviceEvent::DeviceListChanged
 }
 
 /// The event for a change from `previous` to `current`: a new default input
@@ -178,6 +191,17 @@ mod tests {
         );
         // A late first answer has nothing to compare with.
         assert_eq!(change_event(None, &before), default_changed);
+    }
+
+    #[test]
+    fn an_output_list_change_checks_the_identity() {
+        let before = snapshot(None, &["sink", "speakers"]);
+        let output_changed = table_event("linux:output list changed");
+        assert_eq!(
+            list_change_event(Some(&before), &snapshot(None, &["speakers"])),
+            output_changed
+        );
+        assert_eq!(list_change_event(None, &before), output_changed);
     }
 
     #[test]

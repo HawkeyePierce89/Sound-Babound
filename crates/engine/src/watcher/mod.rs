@@ -8,7 +8,8 @@
 //! Platform watchers live in this module's platform submodules and are picked
 //! by [`platform_watcher`]: CoreAudio property listeners on macOS, an
 //! `IMMNotificationClient` on Windows, a default-input poller for the Linux
-//! capture (see [`poll`]; the other Linux roles need none), and the no-op
+//! capture and an output-list poller for the Linux mic sink (see [`poll`];
+//! the Linux monitor needs none), and the no-op
 //! watcher on every other OS. Stream errors reach the supervisor through the
 //! sink either way.
 
@@ -146,7 +147,7 @@ impl<W: DeviceWatcher + ?Sized> DeviceWatcher for Box<W> {
 }
 
 /// A watcher that never reports anything. The platform watcher everywhere
-/// except macOS and Windows, and on Linux for every role but the capture.
+/// except macOS and Windows, and on Linux for the monitor.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopWatcher;
@@ -188,7 +189,7 @@ mod tests {
     /// becomes and the policy that event must have for each role. (Windows'
     /// `OnPropertyValueChanged` is ignored and so emits nothing.) Platform
     /// test modules check their own mapping against this table.
-    pub(crate) const PLATFORM_EVENT_TABLE: [(&str, DeviceEvent, RolePolicies); 10] = [
+    pub(crate) const PLATFORM_EVENT_TABLE: [(&str, DeviceEvent, RolePolicies); 11] = [
         (
             "macos:DefaultOutputDevice",
             DeviceEvent::DefaultOutputChanged,
@@ -232,6 +233,11 @@ mod tests {
         ),
         (
             "linux:input list changed",
+            DeviceEvent::DeviceListChanged,
+            IDENTITY,
+        ),
+        (
+            "linux:output list changed",
             DeviceEvent::DeviceListChanged,
             IDENTITY,
         ),
