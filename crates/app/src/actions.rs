@@ -450,7 +450,7 @@ pub fn load_board(path: &Path) -> Result<Soundboard> {
     Ok(board_from_raw(&raw, config_dir_of(path)))
 }
 
-/// The board of the built-in default config (the embedded demo only).
+/// The board of the built-in default config (the built-in sound set).
 pub fn fallback_board() -> Result<Soundboard> {
     board_from_text(DEFAULT_CONFIG, Path::new(".")).context("built-in default config is invalid")
 }
@@ -568,7 +568,7 @@ mod tests {
     fn entry(name: &str, hotkey: Option<HotKey>) -> ResolvedSound {
         ResolvedSound {
             name: name.into(),
-            source: SoundSource::BuiltinDemo,
+            source: SoundSource::Builtin(crate::config::DEMO),
             hotkey,
             gain: 1.0,
         }
@@ -696,16 +696,45 @@ mod tests {
         assert_eq!(*fake.gains.borrow(), [0.5]);
     }
 
+    fn item_labels(board: &Soundboard) -> Vec<String> {
+        board
+            .map()
+            .sound_items()
+            .iter()
+            .map(|item| item.label.clone())
+            .collect()
+    }
+
+    /// The labels of the built-in sounds except the demo, in registry order.
+    fn template_labels() -> Vec<String> {
+        crate::config::BUILTIN_SOUNDS
+            .iter()
+            .skip(1)
+            .map(|entry| entry.label.to_owned())
+            .collect()
+    }
+
     #[test]
-    fn startup_falls_back_to_demo_when_unreadable() {
+    fn the_default_template_puts_every_builtin_in_the_menu_with_only_stop_all_bound() {
+        let board = fallback_board().unwrap();
+        let map = board.map();
+        assert_eq!(item_labels(&board), template_labels());
+        for (index, item) in map.sound_items().iter().enumerate() {
+            assert_eq!(map.for_menu_id(&item.menu_id), Some(Action::Play(index)));
+        }
+        assert_eq!(map.hotkeys().len(), 1);
+        assert_eq!(map.for_hotkey(map.hotkeys()[0].id()), Some(Action::StopAll));
+    }
+
+    #[test]
+    fn startup_falls_back_to_the_default_template_when_unreadable() {
         let dir = TempDir::new("actions-unreadable");
         let missing = dir.path().join("missing.toml");
         for board in [
             startup_board(Some(&missing)).unwrap(),
             startup_board(None).unwrap(),
         ] {
-            let labels: Vec<_> = board.map().sound_items().iter().map(|i| &i.label).collect();
-            assert_eq!(labels, ["Demo chime"]);
+            assert_eq!(item_labels(&board), template_labels());
             assert_eq!(board.map().master_gain(), 1.0);
         }
     }
@@ -715,8 +744,7 @@ mod tests {
         let dir = TempDir::new("actions-malformed");
         let path = write_config(&dir, "master_gain = [\n");
         let board = startup_board(Some(&path)).unwrap();
-        let labels: Vec<_> = board.map().sound_items().iter().map(|i| &i.label).collect();
-        assert_eq!(labels, ["Demo chime"]);
+        assert_eq!(item_labels(&board), template_labels());
         assert_eq!(board.map().master_gain(), 1.0);
         let mut fake = FakeAudio::new();
         apply_config(&mut fake, board.map(), true);
@@ -851,7 +879,7 @@ mod tests {
         board.play(7, &fake);
         assert_eq!(
             *fake.plays.borrow(),
-            [(crate::config::DEMO_LABEL.to_string(), 0.5)]
+            [(crate::config::DEMO.path.to_string(), 0.5)]
         );
     }
 

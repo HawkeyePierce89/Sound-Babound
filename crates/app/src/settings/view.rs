@@ -3,14 +3,17 @@
 //! `form.rs`, the key mapping in `keys.rs` and the file writing in
 //! `save.rs`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
+use std::sync::mpsc::Receiver;
 
 use eframe::egui;
 
+use crate::config;
 use crate::hotkeys;
 use crate::platform;
 use crate::settings::StatusText;
+use crate::settings::audition::{Auditions, ExitReport, ProcessAudition};
 use crate::settings::form::{AUDIO_EXTENSIONS, SettingsForm};
 use crate::settings::keys::{self, KeyCapture, Mods};
 use crate::settings::save;
@@ -20,6 +23,7 @@ enum Edit {
     Rename(usize, String),
     Remove(usize),
     Capture(usize),
+    Audition(usize),
 }
 
 pub struct SettingsApp {
@@ -33,17 +37,56 @@ pub struct SettingsApp {
     /// Whether the window has asked for focus (once, at start: the macOS
     /// bundle is an agent app, which the OS does not bring to the front).
     focused: bool,
+    /// The running audition, if any (a child process on the default output).
+    auditions: Auditions<ProcessAudition>,
+    /// The exits of audition children, reported by their waiter threads.
+    exits: Receiver<(u64, ExitReport)>,
 }
 
 impl SettingsApp {
-    pub fn new(path: PathBuf, form: SettingsForm, status: StatusText) -> SettingsApp {
+    pub fn new(
+        path: PathBuf,
+        form: SettingsForm,
+        status: StatusText,
+        auditions: Auditions<ProcessAudition>,
+        exits: Receiver<(u64, ExitReport)>,
+    ) -> SettingsApp {
         SettingsApp {
             path,
             form,
             status,
+            auditions,
+            exits,
             capturing: None,
             message: None,
             focused: false,
+        }
+    }
+
+    /// Takes the exits the waiter threads have reported and shows a failed
+    /// audition's message.
+    fn drain_exits(&mut self) {
+        while let Ok((id, report)) = self.exits.try_recv() {
+            if let Some(message) = self.auditions.exited(id, report) {
+                self.message = Some(message);
+            }
+        }
+    }
+
+    /// Stops the playing row, or plays row `index` (stopping another one).
+    fn toggle_audition(&mut self, index: usize) {
+        let Some(row) = self.form.rows().get(index) else {
+            return;
+        };
+        let config_dir = self.path.parent().unwrap_or(Path::new(""));
+        match self
+            .auditions
+            .toggle(index, &row.name, &row.path, config_dir)
+        {
+            // A sound that plays makes an earlier message stale.
+            Ok(()) if self.auditions.playing().is_some() => self.message = None,
+            Ok(()) => {}
+            Err(message) => self.message = Some(message),
         }
     }
 
@@ -128,7 +171,7 @@ impl SettingsApp {
         let problems = self.form.validate();
         let mut edits = Vec::new();
         egui::Grid::new("sounds")
-            .num_columns(4)
+            .num_columns(5)
             .striped(true)
             .show(ui, |ui| {
                 ui.strong("Name");
@@ -153,6 +196,14 @@ impl SettingsApp {
                     {
                         edits.push(Edit::Capture(index));
                     }
+                    let playing = self.auditions.playing() == Some(index);
+                    if ui
+                        .button(if playing { "Stop" } else { "Play" })
+                        .on_hover_text("Plays the sound on the default output, never in the call")
+                        .clicked()
+                    {
+                        edits.push(Edit::Audition(index));
+                    }
                     if ui.button("Remove").clicked() {
                         edits.push(Edit::Remove(index));
                     }
@@ -169,16 +220,30 @@ impl SettingsApp {
                 Edit::Rename(index, name) => self.form.set_name(index, &name),
                 Edit::Remove(index) => {
                     self.form.remove(index);
+                    self.auditions.row_removed(index);
                     self.capturing = None;
                 }
                 Edit::Capture(index) => {
                     self.capturing = (self.capturing != Some(index)).then_some(index);
                 }
+                Edit::Audition(index) => self.toggle_audition(index),
             }
         }
-        if ui.button("Add sound…").clicked() {
-            self.add_sounds();
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Add sound…").clicked() {
+                self.add_sounds();
+            }
+            ui.menu_button("Add built-in…", |ui| {
+                for entry in config::BUILTIN_SOUNDS {
+                    if ui.button(entry.label).clicked() {
+                        if let Err(err) = self.form.add_builtin(entry.name) {
+                            self.message = Some(format!("{err:#}"));
+                        }
+                        ui.close();
+                    }
+                }
+            });
+        });
         if let Some(hotkey) = hotkeys::hotkey_spec(self.form.stop_all_hotkey()) {
             ui.weak(format!(
                 "\"Stop all\" hotkey: {hotkey} (set in the config file)"
@@ -226,6 +291,7 @@ impl eframe::App for SettingsApp {
             self.focused = true;
             ui.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
+        self.drain_exits();
         self.capture_key(ui.ctx());
         egui::Panel::bottom("actions").show(ui, |ui| {
             ui.add_space(4.0);
@@ -239,6 +305,12 @@ impl eframe::App for SettingsApp {
                 self.sounds_section(ui);
             });
         });
+    }
+
+    /// Save, Cancel and the close button all end here: a playing audition
+    /// is cut off.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.auditions.close();
     }
 }
 

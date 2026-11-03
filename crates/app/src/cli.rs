@@ -1,7 +1,8 @@
 //! Command-line interface.
 //!
 //! With no subcommand the app runs in tray mode. `play [FILE]` plays a single
-//! sound headlessly and exits; without `FILE` it plays the embedded demo.
+//! sound headlessly and exits; `FILE` is a path or `builtin:<name>`, and
+//! without it `play` plays the embedded demo.
 //! `mic-check` reports whether the virtual microphone can work, without
 //! opening a stream. `settings` opens the settings window.
 
@@ -32,9 +33,15 @@ pub enum Command {
     /// Play a sound through the default output device and exit. With
     /// `[mic] enabled = true` in the config it also plays on the virtual mic.
     Play {
-        /// Audio file to play (WAV, FLAC, OGG Vorbis, MP3). Omit it to play
-        /// the embedded demo chime.
+        /// Audio file to play (WAV, FLAC, OGG Vorbis, MP3), or a sound built
+        /// into the app as `builtin:<name>` (for example `builtin:airhorn`;
+        /// the names are in `SOURCES.md`, and an unknown one lists them).
+        /// Omit it to play the embedded demo chime.
         file: Option<PathBuf>,
+        /// Play on the default output only, never into the virtual mic,
+        /// whatever `[mic] enabled` says.
+        #[arg(long)]
+        output_only: bool,
     },
     /// Check the virtual mic setup: the virtual device, the microphone input
     /// and the microphone permission. Opens no stream and plays nothing;
@@ -73,14 +80,15 @@ const FINISH_MARGIN: Duration = Duration::from_secs(10);
 
 /// Plays `file` (or the embedded demo) through the default output device and
 /// returns once it has finished. With the mic enabled in the config, it also
-/// plays on the virtual mic.
+/// plays on the virtual mic, unless `output_only` is set.
 ///
 /// The sound is decoded before any audio starts, so a bad file fails fast
 /// with an error that names it. Ctrl+C terminates the process the default
 /// way.
-pub fn run_play(file: Option<PathBuf>) -> Result<()> {
+pub fn run_play(file: Option<PathBuf>, output_only: bool) -> Result<()> {
     let sound = load_play_sound(file.as_deref())?;
     let (_, mic, notes) = cli_mic_config();
+    let mic = play_mic_config(mic, output_only);
     for note in &notes {
         tracing::info!("{note}");
     }
@@ -151,6 +159,16 @@ fn play_to_end(engine: &mut Engine, sound: &Sound, mic: &MicConfig) -> Result<()
     Ok(())
 }
 
+/// The `[mic]` table a `play` runs with: with `output_only` the mic is off,
+/// whatever the config says, so neither the mic sink nor the wait for it
+/// starts.
+fn play_mic_config(mic: MicConfig, output_only: bool) -> MicConfig {
+    MicConfig {
+        enabled: mic.enabled && !output_only,
+        ..mic
+    }
+}
+
 /// The mic settings of a headless play: `None` with the mic off, and never
 /// a capture, so `play` does not open the microphone.
 fn headless_mic_settings(mic: &MicConfig) -> Option<MicSettings> {
@@ -204,16 +222,29 @@ fn output_drain(latency: Duration) -> Duration {
 }
 
 /// Decodes the sound `play` should play: `file` if given, otherwise the
-/// embedded demo. This is the same decode path the tray uses.
+/// embedded demo. A UTF-8 argument goes through the same resolver as the
+/// config, so `builtin:<name>` names an embedded sound and any other text is a
+/// file path relative to the working directory. This is the same decode path
+/// the tray uses.
 pub fn load_play_sound(file: Option<&Path>) -> Result<Sound> {
-    let source = match file {
-        Some(path) => SoundSource::File(path.to_path_buf()),
-        None => SoundSource::BuiltinDemo,
-    };
-    source.load().with_context(|| match file {
+    play_source(file)?.load().with_context(|| match file {
         Some(path) => format!("cannot play {}", path.display()),
         None => "cannot decode the embedded demo".to_string(),
     })
+}
+
+/// The sound `play` names: the demo without an argument, a UTF-8 argument
+/// through the config's resolver (relative to the working directory), and a
+/// non-UTF-8 one always as a file.
+fn play_source(file: Option<&Path>) -> Result<SoundSource> {
+    match file {
+        Some(path) => match path.to_str() {
+            Some(text) => SoundSource::resolve(text, Path::new(""))
+                .map_err(|err| anyhow::anyhow!("cannot play {}: {err}", path.display())),
+            None => Ok(SoundSource::File(path.to_path_buf())),
+        },
+        None => Ok(SoundSource::Builtin(crate::config::DEMO)),
+    }
 }
 
 /// How long `sound` plays at its own sample rate.
@@ -308,7 +339,51 @@ mod tests {
     #[test]
     fn play_without_file_uses_demo() {
         let cli = Cli::try_parse_from(["sound-babound", "play"]).unwrap();
-        assert_eq!(cli.command, Some(Command::Play { file: None }));
+        assert_eq!(
+            cli.command,
+            Some(Command::Play {
+                file: None,
+                output_only: false
+            })
+        );
+    }
+
+    #[test]
+    fn play_output_only_flag() {
+        let cli = Cli::try_parse_from(["sound-babound", "play", "--output-only"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Play {
+                file: None,
+                output_only: true
+            })
+        );
+    }
+
+    #[test]
+    fn play_output_only_with_builtin() {
+        let cli =
+            Cli::try_parse_from(["sound-babound", "play", "--output-only", "builtin:airhorn"])
+                .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Play {
+                file: Some(PathBuf::from("builtin:airhorn")),
+                output_only: true
+            })
+        );
+    }
+
+    #[test]
+    fn play_accepts_a_dash_led_file_after_the_separator() {
+        let cli = Cli::try_parse_from(["sound-babound", "play", "--", "-odd.wav"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Play {
+                file: Some(PathBuf::from("-odd.wav")),
+                output_only: false
+            })
+        );
     }
 
     #[test]
@@ -317,7 +392,8 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Command::Play {
-                file: Some(PathBuf::from("path.wav"))
+                file: Some(PathBuf::from("path.wav")),
+                output_only: false
             })
         );
     }
@@ -338,7 +414,7 @@ mod tests {
         let path = dir.path().join("not-audio.wav");
         std::fs::write(&path, b"this is definitely not a wav file").unwrap();
         // Decoding fails before the engine starts, so no audio is touched.
-        let err = run_play(Some(path.clone())).unwrap_err();
+        let err = run_play(Some(path.clone()), false).unwrap_err();
         let message = format!("{err:#}");
         assert!(
             message.contains(&path.display().to_string()),
@@ -350,23 +426,94 @@ mod tests {
     fn run_play_on_missing_file_names_the_file() {
         let dir = TempDir::new("play-missing");
         let path = dir.path().join("missing.flac");
-        let message = format!("{:#}", run_play(Some(path.clone())).unwrap_err());
+        let message = format!("{:#}", run_play(Some(path.clone()), false).unwrap_err());
         assert!(message.contains(&path.display().to_string()), "{message}");
     }
 
     #[test]
     fn embedded_demo_decodes_through_cli_path() {
         let sound = load_play_sound(None).unwrap();
-        assert_eq!(sound.label(), crate::config::DEMO_LABEL);
+        assert_eq!(sound.label(), crate::config::DEMO.path);
         assert_eq!(sound.sample_rate(), 44_100);
         assert!(sound.frames() > 0);
+    }
+
+    #[test]
+    fn builtin_argument_decodes_through_cli_path() {
+        let sound = load_play_sound(Some(Path::new("builtin:airhorn"))).unwrap();
+        assert_eq!(sound.label(), "builtin:airhorn");
+        assert!(sound.frames() > 0);
+    }
+
+    #[test]
+    fn unknown_builtin_argument_names_the_available_sounds() {
+        let message = format!(
+            "{:#}",
+            load_play_sound(Some(Path::new("builtin:nope"))).unwrap_err()
+        );
+        assert!(message.contains("builtin:nope"), "{message}");
+        assert!(message.contains("available:"), "{message}");
+        assert!(message.contains("builtin:airhorn"), "{message}");
+    }
+
+    #[test]
+    fn a_relative_argument_stays_relative_to_the_working_directory() {
+        assert_eq!(
+            play_source(Some(Path::new("sounds/a.wav"))).unwrap(),
+            SoundSource::File(PathBuf::from("sounds/a.wav"))
+        );
+    }
+
+    #[test]
+    fn no_argument_is_the_demo() {
+        assert_eq!(
+            play_source(None).unwrap(),
+            SoundSource::Builtin(crate::config::DEMO)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_argument_is_always_a_file() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(OsStr::from_bytes(b"builtin:\xff"));
+        assert_eq!(
+            play_source(Some(path)).unwrap(),
+            SoundSource::File(path.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn output_only_turns_the_mic_off() {
+        let mic = MicConfig {
+            enabled: true,
+            ..MicConfig::default()
+        };
+        assert!(headless_mic_settings(&mic).is_some());
+        let mic = play_mic_config(mic, true);
+        assert!(!mic.enabled);
+        assert_eq!(headless_mic_settings(&mic), None);
+    }
+
+    #[test]
+    fn without_output_only_the_mic_is_kept() {
+        let mic = MicConfig {
+            enabled: true,
+            ..MicConfig::default()
+        };
+        let kept = play_mic_config(mic.clone(), false);
+        assert_eq!(kept, mic);
+        assert!(headless_mic_settings(&kept).is_some());
+        let off = MicConfig::default();
+        assert_eq!(play_mic_config(off.clone(), false), off);
     }
 
     #[test]
     fn demo_file_on_disk_decodes_through_cli_path() {
         let dir = TempDir::new("play-demo-file");
         let path = dir.path().join("demo.wav");
-        std::fs::write(&path, crate::config::DEMO_WAV).unwrap();
+        std::fs::write(&path, crate::config::DEMO.bytes).unwrap();
         let from_file = load_play_sound(Some(&path)).unwrap();
         let embedded = load_play_sound(None).unwrap();
         assert_eq!(from_file.frames(), embedded.frames());

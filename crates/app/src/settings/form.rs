@@ -135,6 +135,23 @@ impl SettingsForm {
         Ok(())
     }
 
+    /// Adds a row for the built-in sound `name` (the part after `builtin:`),
+    /// with its label as the name and no hotkey. An unknown name is an error.
+    pub fn add_builtin(&mut self, name: &str) -> Result<()> {
+        let entry =
+            config::builtin(name).ok_or_else(|| anyhow!("unknown built-in sound {name:?}"))?;
+        if !self.editable() {
+            return Ok(());
+        }
+        self.rows.push(SoundRow {
+            name: entry.label.to_owned(),
+            path: entry.path.to_owned(),
+            hotkey: None,
+            original: None,
+        });
+        Ok(())
+    }
+
     /// Removes row `index`; an index past the end does nothing.
     pub fn remove(&mut self, index: usize) {
         if index < self.rows.len() {
@@ -295,7 +312,9 @@ path = "sounds/airhorn.mp3"
     #[test]
     fn the_default_template_is_valid() {
         let form = SettingsForm::from_text(config::DEFAULT_CONFIG);
-        assert_eq!(form.rows().len(), 1);
+        assert!(form.editable(), "{:?}", form.error());
+        assert_eq!(form.rows().len(), config::BUILTIN_SOUNDS.len() - 1);
+        assert!(form.rows().iter().all(|row| row.hotkey.is_none()));
         assert!(form.can_save());
     }
 
@@ -314,6 +333,32 @@ path = "sounds/airhorn.mp3"
             }
         );
         assert!(form.can_save());
+    }
+
+    #[test]
+    fn adding_a_builtin_uses_its_label() {
+        let mut form = form();
+        form.add_builtin("airhorn").unwrap();
+        form.add_builtin("Rimshot").unwrap();
+        assert_eq!(
+            form.rows()[2],
+            SoundRow {
+                name: "Air horn".to_owned(),
+                path: "builtin:airhorn".to_owned(),
+                hotkey: None,
+                original: None,
+            }
+        );
+        assert_eq!(form.rows()[3].path, "builtin:rimshot");
+        assert!(form.can_save());
+    }
+
+    #[test]
+    fn an_unknown_builtin_is_refused() {
+        let mut form = form();
+        let err = form.add_builtin("nope").unwrap_err();
+        assert!(err.to_string().contains("nope"), "{err}");
+        assert_eq!(form.rows().len(), 2);
     }
 
     #[cfg(unix)]
@@ -503,6 +548,8 @@ hotkey = "Ctrl+Bogus"
         assert!(!form.can_save());
         // Editing is off.
         form.add(Path::new("/s/a.wav")).unwrap();
+        assert!(form.rows().is_empty());
+        form.add_builtin("airhorn").unwrap();
         assert!(form.rows().is_empty());
 
         let wrong_type = SettingsForm::from_text("[[sound]]\nname = 3\npath = \"x\"\n");

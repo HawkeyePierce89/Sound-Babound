@@ -1,6 +1,7 @@
 //! The settings window (`sound-babound settings`). Only `view.rs` knows the
 //! UI library; the form state, key mapping and file writing are plain Rust.
 
+pub mod audition;
 pub mod form;
 pub mod keys;
 pub mod save;
@@ -9,7 +10,7 @@ mod view;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use eframe::egui;
 use crate::mic_report::{format_mic_check, status_check};
 use crate::paths;
 use crate::platform;
+use crate::settings::audition::{Auditions, ProcessAudition};
 use crate::settings::form::SettingsForm;
 
 /// The window title.
@@ -62,7 +64,16 @@ fn run_window() -> Result<()> {
         options,
         Box::new(move |cc| {
             spawn_status_thread(path.clone(), Arc::downgrade(&status), cc.egui_ctx.clone())?;
-            Ok(Box::new(view::SettingsApp::new(path, form, status)))
+            let (exits, reports) = mpsc::channel();
+            let ctx = cc.egui_ctx.clone();
+            let spawner = ProcessAudition::new(exits, Arc::new(move || ctx.request_repaint()));
+            Ok(Box::new(view::SettingsApp::new(
+                path,
+                form,
+                status,
+                Auditions::new(spawner),
+                reports,
+            )))
         }),
     )
     .map_err(|err| anyhow!("{err}"))
